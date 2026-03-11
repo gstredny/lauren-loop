@@ -1,0 +1,31 @@
+# Lauren Loop Configuration
+# Rename to .lauren-loop.conf and customize.
+# This file is sourced by lauren-loop.sh and lauren-loop-v2.sh.
+
+# Maximum cost ceiling (USD) before Lauren Loop stops
+# LAUREN_LOOP_MAX_COST=100
+
+# Project name (default: directory name; used in prompt $PROJECT_NAME substitution)
+# LAUREN_LOOP_PROJECT_NAME=MyProject
+
+# Agent model (default: opus)
+# LAUREN_LOOP_MODEL=opus
+
+# Timeout limits per agent role
+# LEAD_TIMEOUT=120m
+# EXECUTOR_TIMEOUT=120m
+# CRITIC_TIMEOUT=15m
+# REVIEWER_TIMEOUT=30m
+# FIX_TIMEOUT=45m
+
+# Test command (default: pytest tests/ -x -q)
+# TEST_CMD=pytest
+
+# Lint command (default: flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics)
+# LINT_CMD=flake8
+
+# V2 competitive pipeline engine assignments
+# ENGINE_PLANNER_A=claude
+# ENGINE_PLANNER_B=codex
+# ENGINE_REVIEWER_A=claude
+# ENGINE_REVIEWER_B=codex

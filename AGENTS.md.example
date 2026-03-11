@@ -1,0 +1,45 @@
+# AGENTS.md
+
+<!-- Rename this file to AGENTS.md and customize for your project. -->
+<!-- This file is read by Claude Code agents spawned by Lauren Loop. -->
+
+## Project Overview
+<!-- Brief description of your project and its purpose -->
+
+## Stack
+<!-- Technology stack description -->
+<!-- Example: Python/FastAPI | React/TypeScript | PostgreSQL -->
+
+## Key Directories
+<!-- Map of important directories and what they contain -->
+
+## Critical Rules
+<!-- Project-specific rules all agents must follow -->
+<!-- These are also defined in prompts/project-rules.md for runtime injection -->
+
+## Task Management
+- Check `docs/tasks/open/` first for matching work before starting substantive changes
+- If a matching task exists, resume from `Left Off At` and use `Attempts` to avoid retrying failed approaches
+- If no task exists for substantive work, create one from `docs/tasks/TEMPLATE.md`
+- Keep `Attempts` append-only
+- End implementation in `needs verification`, not `done`
+- Follow `docs/WORKFLOW.md` for full task lifecycle
+
+## Constraints
+<!-- Additional constraints for agent behavior -->
+- Read code before proposing edits
+- Fix root causes, not symptoms
+- Execute in small verifiable steps; stop on failed verification
+
+## Git Workflow
+<!-- Define your branching and commit strategy -->
+- Work directly on the current branch unless explicitly asked to create worktrees
+
+## Skills Reference
+<!-- Skills available in .claude/skills/ and .codex/skills/ -->
+- `workflow` — 7-phase development workflow
+- `task-manager` — Task file management
+- `retro` — Retrospective entry generation
+- `plan-review` — Pre-execution plan validation
+- `tdd-planning` — Test-driven development planning
+- `stop` — Session-end summary generation

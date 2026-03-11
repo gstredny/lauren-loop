@@ -1,0 +1,17 @@
+# Project Rules
+
+<!-- These rules are prepended to all agent system prompts by Lauren Loop. -->
+<!-- Rename this file to project-rules.md and customize for your project. -->
+
+## Critical Rules
+
+1. **No mock data.** If external services fail, return error messages. Never generate fake responses.
+2. **`.env` is read-only.** Never modify without explicit approval.
+3. **No new endpoints.** Modify existing endpoints and scripts. Maintain backward compatibility.
+
+## Stack
+<!-- Describe your project's technology stack here -->
+<!-- Example: Python/FastAPI | React/TypeScript | PostgreSQL -->
+
+## Architecture Notes
+<!-- Key architectural decisions and constraints -->
