@@ -50,7 +50,7 @@ source "$SCRIPT_DIR/lib/lauren-loop-utils.sh"
 [[ -f "$SCRIPT_DIR/.lauren-loop.conf" ]] && source "$SCRIPT_DIR/.lauren-loop.conf"
 
 # Config-driven project values (fallback defaults if conf doesn't set them)
-PROJECT_NAME="${PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
+PROJECT_NAME="${PROJECT_NAME:-$(basename "${LAUREN_LOOP_PROJECT_DIR:-$SCRIPT_DIR}")}"
 TEST_CMD="${TEST_CMD:-pytest tests/ -x -q}"
 LINT_CMD="${LINT_CMD:-flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
 

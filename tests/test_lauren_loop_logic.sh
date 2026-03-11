@@ -1274,7 +1274,7 @@ TEST_CMD="python -m pytest"
 LINT_CMD="python -m flake8"
 EOF
     source "$conf_root/.lauren-loop.conf"
-    PROJECT_NAME="${PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
+    PROJECT_NAME="${PROJECT_NAME:-$(basename "${LAUREN_LOOP_PROJECT_DIR:-$SCRIPT_DIR}")}"
     TEST_CMD="${TEST_CMD:-pytest tests/ -x -q}"
     LINT_CMD="${LINT_CMD:-flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
     [ "$PROJECT_NAME" = "TestProject" ]
@@ -1285,7 +1285,7 @@ EOF
 
 (
     PROJECT_NAME="" TEST_CMD="" LINT_CMD=""
-    PROJECT_NAME="${PROJECT_NAME:-$(basename "$PROJECT_DIR")}"
+    PROJECT_NAME="${PROJECT_NAME:-$(basename "${LAUREN_LOOP_PROJECT_DIR:-$SCRIPT_DIR}")}"
     TEST_CMD="${TEST_CMD:-pytest tests/ -x -q}"
     LINT_CMD="${LINT_CMD:-flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
     [ -n "$PROJECT_NAME" ]
