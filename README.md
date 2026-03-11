@@ -58,12 +58,47 @@ mv AGENTS.md.example AGENTS.md
 # Edit with your project-specific agent instructions
 ```
 
+## First Run
+
+Lauren Loop works from task files in the active `docs/tasks/open/` workspace used by the scripts you run.
+
+- If open task files already exist, start with:
+
+```bash
+./lauren-loop.sh pick
+```
+
+This ranks existing open tasks, lets you choose one by number, and reuses the selected task file's existing `## Goal:`. You do not retype the goal when you use `pick`.
+
+- If you are starting from a brand-new idea, either create a task from your task template first or launch directly with:
+
+```bash
+./lauren-loop.sh auto fix-auth-timeout "Fix Azure auth timeout during startup"
+```
+
+Quick definitions:
+
+- `task`: one markdown file in `docs/tasks/open/` that stores the goal, status, context, and done criteria for a unit of work
+- `slug`: a short kebab-case identifier used in filenames and commands, such as `fix-auth-timeout`
+- `goal`: a one-sentence description of the work, such as `"Fix Azure auth timeout during startup"`
+
+For the fuller workflow, task model, and troubleshooting, see [docs/user-guide.md](docs/user-guide.md) and [docs/WORKFLOW.md](docs/WORKFLOW.md).
+
 ## Usage
 
 ### V1 Pipeline
 
 ```bash
-# Start a new task
+# Interactively rank and launch an existing open task
+./lauren-loop.sh pick
+
+# Read-only recommendation for the next open task
+./lauren-loop.sh next
+
+# Start from a brand-new idea and let Lauren Loop classify it
+./lauren-loop.sh auto <slug> "<goal>"
+
+# Start V1 directly
 ./lauren-loop.sh <slug> "<goal>"
 
 # Resume an existing task
@@ -72,11 +107,6 @@ mv AGENTS.md.example AGENTS.md
 # Dry run (no actual agent calls)
 ./lauren-loop.sh <slug> "<goal>" --dry-run
 
-# Auto-select next task from docs/tasks/open/
-./lauren-loop.sh auto
-
-# Pick a specific task interactively
-./lauren-loop.sh pick
 ```
 
 ### V2 Competitive Pipeline

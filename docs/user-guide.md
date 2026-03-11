@@ -2,16 +2,65 @@
 
 A CLI that classifies tasks by complexity and routes them to the right pipeline — a fast single-agent pipeline (V1) for simple tasks, or a competitive multi-agent pipeline (V2) for complex ones. You provide the goal; Lauren Loop handles the back-and-forth.
 
-## Quick Start
+This guide assumes Lauren Loop is being used inside a working project. References to `docs/tasks/open/` describe the active task workspace used by the scripts you launch.
+
+## Before You Start
+
+Lauren Loop works from task files in `docs/tasks/open/` within that task workspace.
+
+- `pick` and `next` only rank task files that already exist there. They do not invent tasks from scratch.
+- `auto <slug> "goal"` is the direct path when you already know the task you want to run.
+- If you want to write context and done criteria yourself before launching, create a task from your task template first.
+
+## Quick Glossary
+
+- `task` — one markdown file under `docs/tasks/open/` that stores the goal, status, context, done criteria, and progress for one unit of work
+- `slug` — a short kebab-case task identifier used in filenames and commands, for example `fix-auth-timeout`
+- `goal` — a one-sentence description of the work, for example `"Fix Azure auth timeout during startup"`
+
+## Choose Your Starting Path
+
+### Path 1 — Existing Open Tasks (Recommended)
 
 ```bash
 ./lauren-loop.sh pick
-# → See a ranked list of open tasks
-# → Type a number to select a task
-# → "Launch pipeline? (y/n)" → y
-# → "Route: (1) Auto-classify  (2) Simple (V1)  (3) Complex (V2)" → 1
-# → Walk away; terminal notification when done
 ```
+
+What happens:
+
+- Lauren Loop reads the open task files already in `docs/tasks/open/`
+- It ranks them using the roadmap, retro, and git context
+- You choose a task by number
+- Lauren Loop reuses that task file's existing `## Goal:` automatically, so you do not retype the goal
+
+If you only want a recommendation without launching anything, use:
+
+```bash
+./lauren-loop.sh next
+```
+
+### Path 2 — Brand-New Idea
+
+If no suitable task exists yet, start directly from a slug and goal:
+
+```bash
+./lauren-loop.sh auto fix-auth-timeout "Fix Azure auth timeout during startup"
+```
+
+What happens:
+
+- If Lauren Loop finds a matching task in `docs/tasks/open/`, it reuses it
+- If no task matches, it creates a new task file and routes to V1 or V2
+- If you want richer context up front, create the task yourself from your task template before launching
+
+## How Tasks Are Set Up
+
+- Installed projects get a scaffolded `docs/tasks/` structure, including `open/`, `closed/`, `deferred/`, `RETRO.md`, and `TEMPLATE.md`
+- Canonical task files usually live as `docs/tasks/open/<slug>.md` or `docs/tasks/open/<slug>/task.md`
+- A direct V1 start for a brand-new slug usually creates `docs/tasks/open/pilot-<slug>.md`
+- A V2 run stores runtime artifacts under `docs/tasks/open/<slug>/competitive/` and `docs/tasks/open/<slug>/logs/`
+- `pick` and `next` work from the open task files that already exist; they are not task-creation commands
+- For the full task lifecycle, verification flow, and closeout rules, see `docs/WORKFLOW.md`
 
 ## How It Works
 
@@ -34,13 +83,15 @@ A single Lead agent runs in one long session:
 4. If Critic says FAIL → Lead revises the plan and re-spawns Critic (up to 3 rounds)
 5. If Critic says PASS → Lead **executes the plan** using TDD (same session, full context)
 6. **Auto-reviews** the diff via Reviewer + Review Critic
-7. If review passes → **auto-closes** the task (moves to `closed/`, runs retro)
+7. If review passes → a direct V1 run can **auto-close** the task (moves to `closed/`, runs retro)
 
 The key insight: the Lead keeps full context from exploration through execution. It never re-reads the codebase. The Critic gets fresh eyes (separate context window) so it can't be anchored by the planner's reasoning.
 
 Post-fix reviews receive both the original execution diff and the fix diff, with focus on the fix changes. This lets the reviewer understand the full context without re-evaluating already-approved code.
 
-Use `--no-review` to skip auto-review, `--no-close` to skip auto-close. Up to 2 fix cycles before stopping.
+Direct `./lauren-loop.sh <slug> "goal"` runs use auto-review by default and auto-close unless you pass `--no-close`. The `auto` wrapper used by `pick` keeps routed V1 tasks open for human verification by always adding `--no-close`.
+
+Use `--no-review` to skip auto-review, `--no-close` to stop after a `review-passed` handoff. Up to 2 fix cycles before stopping.
 
 ### V2 — Complex Tasks
 
@@ -54,9 +105,9 @@ Seven phases, each with purpose-built agents:
 6. **Synthesize** — Review evaluator merges findings, writes fix plan if needed
 7. **Fix** — Fix executor applies fixes (loops to step 5, max 2 cycles)
 
-V2 ends at `needs verification`. Review the diff, then close manually.
+V2 ends at `needs verification`. Review the diff, then close manually with `./lauren-loop.sh close <slug> --force` after your verification.
 
-See `docs/lauren-loop-v2.md` for the V2 technical reference (contracts, signals, parsing, hardening).
+See `docs/v2-reference.md` for the V2 technical reference (contracts, signals, parsing, hardening).
 
 ### The Complexity Classifier
 
@@ -93,7 +144,7 @@ The classifier scores five dimensions as LOW or HIGH:
 ./lauren-loop.sh pick
 ```
 
-Reads your open task files, roadmap, and retro. Outputs a ranked list with complexity color-coding (green/yellow/red). Pick a number.
+Reads your existing open task files, roadmap, and retro. Outputs a ranked list with complexity color-coding (green/yellow/red). Pick a number. Lauren Loop then extracts the selected task file's existing `## Goal:` automatically.
 
 Two-step confirmation:
 
@@ -121,8 +172,9 @@ tail -f logs/pilot/pilot-<slug>-lead.log          # V1
 
 ### Step 3 — Review results
 
-- **V1:** Auto-reviews and auto-closes by default. Use `--no-review` / `--no-close` for manual control. Up to 2 fix cycles before stopping.
-- **V2:** Ends at `needs verification`. Review the diff, close manually.
+- **Auto-routed V1 (`pick` / `auto`)** — Auto-reviews, but keeps the task open for human verification instead of auto-closing.
+- **Direct V1 (`./lauren-loop.sh <slug> "goal"`)** — Auto-reviews and auto-closes by default unless you use `--no-review` or `--no-close`.
+- **V2** — Ends at `needs verification`. Review the diff, then close manually after your own verification.
 
 ### Step 4 — Close the task
 
@@ -130,16 +182,16 @@ tail -f logs/pilot/pilot-<slug>-lead.log          # V1
 ./lauren-loop.sh close <slug>
 ```
 
-Moves the task to `docs/tasks/closed/`, runs the retro agent, and generates an entry in `docs/tasks/RETRO.md`. Use `--force` for stuck tasks (status is not `review-passed`).
+Moves the task to `docs/tasks/closed/`, runs the retro agent, and generates an entry in `docs/tasks/RETRO.md`. Use plain `close <slug>` for `review-passed` tasks. Use `--force` after manually verifying a task that still sits in `needs verification` (common for V2).
 
 ## Alternative Entry Points
 
-For users who skip `pick` and know what they want:
+For users who skip `pick` and know what they want, especially when starting from a brand-new idea:
 
 | Command | What it does |
 |---------|-------------|
-| `./lauren-loop.sh next` | Read-only ranking (top 3, no launch prompt) |
-| `./lauren-loop.sh auto <slug> "goal"` | Classify complexity, then route to V1 or V2 |
+| `./lauren-loop.sh next` | Read-only ranking of existing open task files (top 3, no launch prompt) |
+| `./lauren-loop.sh auto <slug> "goal"` | Reuse a matching task or create one from the slug/goal pair, then route to V1 or V2 |
 | `./lauren-loop.sh auto <slug> "goal" --simple` | Force V1 routing |
 | `./lauren-loop.sh auto <slug> "goal" --thorough` | Force V2 routing |
 | `./lauren-loop.sh <slug> "goal"` | V1 directly (legacy, still works) |
@@ -266,11 +318,11 @@ Lauren Loop optionally sources `~/.claude/scripts/context-guard.sh` and calls `s
 
 | Command | What it does |
 |---------|-------------|
-| `pick` | Interactively pick a task (ranked list with numbered selection + launch) |
-| `next` | Recommend which open task to work on next (read-only) |
-| `auto <slug> "goal"` | Classify once and route to V1 or V2 |
-| `classify <slug>` | Classify task complexity as simple or complex (no execution) |
-| `close <slug>` | Move a review-passed task to `closed/` and write retro |
+| `pick` | Interactively pick an existing open task (ranked list with numbered selection + launch) |
+| `next` | Recommend which existing open task to work on next (read-only) |
+| `auto <slug> "goal"` | Reuse a matching task or create one from the slug/goal pair, then route to V1 or V2 |
+| `classify <slug>` | Classify task complexity as simple or complex; use `--goal` if no task file exists yet |
+| `close <slug>` | Move a `review-passed` task to `closed/`; use `--force` for a manually verified handoff still in `needs verification` |
 | `execute <slug>` | Execute a plan-approved task via TDD executor |
 | `review <slug>` | Review an executed task's diff via reviewer + critic loop |
 | `fix <slug>` | Apply fixes for review findings, then re-review |
@@ -287,16 +339,16 @@ Lauren Loop optionally sources `~/.claude/scripts/context-guard.sh` and calls `s
 
 | Flag | Applies to | What it does |
 |------|-----------|-------------|
-| `--simple` | `auto`, `pick` | Force V1 routing |
-| `--thorough` | `auto`, `pick` | Force V2 routing |
+| `--simple` | `auto` | Force V1 routing |
+| `--thorough` | `auto` | Force V2 routing |
 | `--force` | `auto`, `close` | Force rerun of V2 phases / close stuck tasks |
 | `--fresh` | `pick` | Re-rank tasks, skip 10-minute cache |
-| `--no-review` | `auto`, `<slug>` (V1) | Skip auto-review after execution |
-| `--no-close` | `auto`, `<slug>` (V1) | Skip auto-close after review-passed |
-| `--resume` | `auto`, `<slug>` | Require an existing task match, then resume it. Works with V2 via checkpoint-based resumption. |
+| `--no-review` | `auto` (V1 route only), `<slug>` (V1) | Skip auto-review after execution |
+| `--no-close` | `auto` (V1 route only), `<slug>` (V1) | Skip auto-close after `review-passed` |
+| `--resume` | `auto`, `<slug>` | On direct V1 commands, require an existing task match. On V2 work, resume from saved checkpoint state when a task already exists. |
 | `--legacy` | `<slug>` | Use legacy planner-critic loop + separate executor |
-| `--dry-run` | `auto`, `<slug>` | Create task file only, skip agent runs |
-| `--model <name>` | all | Override model (default: opus) |
+| `--dry-run` | `auto`, `<slug>` | Skip live agent execution; V1 creates or reuses the task file only, V2 prints planned phases |
+| `--model <name>` | `pick`, `next`, `auto`, `classify`, `execute`, `review`, `fix`, `chaos`, `verify`, `<slug>` | Override model (default: opus) |
 
 ## Agent Architecture
 
@@ -348,7 +400,7 @@ See `docs/autonomous-pilot-architecture.md` for agent prompts and status state m
 | Retro prompt | `prompts/retro-hook.md` |
 | Next-task prompt | `prompts/next-task.md` |
 | Task files | V1 slug-based commands resolve `docs/tasks/open/<slug>/task.md`, `docs/tasks/open/<slug>.md`, or `docs/tasks/open/pilot-<slug>.md` when exactly one canonical match exists |
-| V2 task directory | `docs/tasks/open/<slug>/task.md` + `competitive/` + `logs/` |
+| V2 runtime artifacts | `docs/tasks/open/<slug>/competitive/` + `docs/tasks/open/<slug>/logs/`; the task file may be `docs/tasks/open/<slug>.md` or an existing `docs/tasks/open/<slug>/task.md` |
 | Closed tasks | `docs/tasks/closed/` |
 | Retro entries | `docs/tasks/RETRO.md` |
 | V1 logs | `logs/pilot/pilot-<slug>-*.log` |
@@ -361,7 +413,7 @@ See `docs/autonomous-pilot-architecture.md` for agent prompts and status state m
 | Configuration | `.lauren-loop.conf` |
 | Context guard | `~/.claude/scripts/context-guard.sh` |
 
-Lauren Loop rejects mixed slug representations. If both `docs/tasks/open/<slug>/task.md` and `docs/tasks/open/<slug>.md` exist, it emits `ERROR: ambiguous task slug` and stops. Clean up one form before running any slug-based command.
+V1 slug-based commands reject mixed slug representations. If both `docs/tasks/open/<slug>/task.md` and `docs/tasks/open/<slug>.md` exist, they emit `ERROR: ambiguous task slug` and stop. Clean up one form before running those commands.
 
 ## Configuration
 
@@ -430,7 +482,13 @@ tail -f logs/pilot/pilot-<slug>-lead.log           # V1
 
 ### Classifier parse error
 
-If the classifier output can't be parsed (no `CLASSIFICATION:` line), the system defaults to complex (V2). Check `logs/pilot/pilot-<slug>-classify.log` for the raw output.
+If the classifier output can't be parsed, `auto` exits with a parse error instead of guessing. Re-run the classifier directly to inspect the raw output:
+
+```bash
+./lauren-loop.sh classify <slug> --goal "your goal"
+```
+
+If the task file already exists, omit `--goal`.
 
 ### Cost ceiling reached
 
