@@ -19,6 +19,45 @@ Dual-engine competitive pipeline: two planners (Claude + Codex) generate indepen
 
 ## Quick Start
 
+> Already installed? Jump to [Usage](#usage). Need to install first? See [Installation](#installation).
+
+### Try it (sample task)
+
+A sample task ships with the install. Run the full plan-critique-execute-review cycle:
+
+```bash
+./lauren-loop.sh pick
+# Select "sample-hello-world" → auto-classify → walk away
+```
+
+Or launch it directly:
+
+```bash
+./lauren-loop.sh auto sample-hello-world "Add a CONTRIBUTING.md with setup instructions and PR guidelines"
+```
+
+Expect 15-30 minutes of autonomous work. When it finishes, review the diff and inspect `docs/tasks/open/sample-hello-world.md` to see how plans and reviews were recorded.
+
+### Use your own tasks
+
+Point Lauren Loop at your own work:
+
+```bash
+# Create and run a new task
+./lauren-loop.sh auto my-feature "Add rate limiting to the /api/health endpoint"
+
+# Or pick from existing tasks in docs/tasks/open/
+./lauren-loop.sh pick
+```
+
+Tasks are markdown files in `docs/tasks/open/` with a `## Goal:` and `## Status:` header. See [docs/tasks/TEMPLATE.md](docs/tasks/TEMPLATE.md) for the full format.
+
+## Structured Workflows
+
+Lauren Loop executes individual tasks with adversarial quality checks. It doesn't plan your project or structure your work. For a full context engineering methodology — project init, phase planning, research, and multi-task orchestration — see [GSD (Get Shit Done)](https://github.com/gsd-build/get-shit-done). For a lighter starting point, Lauren Loop includes a task template at `docs/tasks/TEMPLATE.md`.
+
+## Installation
+
 ### Install as a git submodule (recommended)
 
 ```bash
@@ -57,32 +96,6 @@ mv .lauren-loop.conf.example .lauren-loop.conf
 mv AGENTS.md.example AGENTS.md
 # Edit with your project-specific agent instructions
 ```
-
-## First Run
-
-Lauren Loop works from task files in the active `docs/tasks/open/` workspace used by the scripts you run.
-
-- If open task files already exist, start with:
-
-```bash
-./lauren-loop.sh pick
-```
-
-This ranks existing open tasks, lets you choose one by number, and reuses the selected task file's existing `## Goal:`. You do not retype the goal when you use `pick`.
-
-- If you are starting from a brand-new idea, either create a task from your task template first or launch directly with:
-
-```bash
-./lauren-loop.sh auto fix-auth-timeout "Fix Azure auth timeout during startup"
-```
-
-Quick definitions:
-
-- `task`: one markdown file in `docs/tasks/open/` that stores the goal, status, context, and done criteria for a unit of work
-- `slug`: a short kebab-case identifier used in filenames and commands, such as `fix-auth-timeout`
-- `goal`: a one-sentence description of the work, such as `"Fix Azure auth timeout during startup"`
-
-For the fuller workflow, task model, and troubleshooting, see [docs/user-guide.md](docs/user-guide.md) and [docs/WORKFLOW.md](docs/WORKFLOW.md).
 
 ## Usage
 
