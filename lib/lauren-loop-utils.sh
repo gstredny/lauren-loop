@@ -4,6 +4,7 @@
 # Uses only a minimal helper-state global (_NOTIFIED), plus functions. No traps, no exit calls.
 
 _NOTIFIED="${_NOTIFIED:-0}"
+LAUREN_LOOP_UTILS_DIR="${LAUREN_LOOP_UTILS_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)}"
 
 # ============================================================
 # Platform shims
@@ -27,6 +28,24 @@ _iso_timestamp() {
     else
         date -u +"%Y-%m-%dT%H:%M:%S%z"
     fi
+}
+
+_duration_to_seconds() {
+    local duration="$1"
+    case "$duration" in
+        *m) printf '%s\n' $(( ${duration%m} * 60 )) ;;
+        *h) printf '%s\n' $(( ${duration%h} * 3600 )) ;;
+        *s) printf '%s\n' "${duration%s}" ;;
+        *)  printf '%s\n' "$duration" ;;
+    esac
+}
+
+_agent_poll_interval_seconds() {
+    printf '%s\n' "${LAUREN_LOOP_AGENT_POLL_INTERVAL_SEC:-5}"
+}
+
+_agent_terminate_grace_seconds() {
+    printf '%s\n' "${LAUREN_LOOP_AGENT_KILL_GRACE_SEC:-5}"
 }
 
 # Cross-platform timeout wrapper that works for shell functions and piped stdin.
@@ -130,32 +149,82 @@ notify_terminal_state() {
 _check_cross_version_lock() {
     local my_version="$1"  # "v1" or "v2"
     local my_slug="$2"
-    local other_lock other_slug_file other_pid other_slug
 
     if [[ "$my_version" == "v1" ]]; then
+        # v1 checking v2: per-slug lock dirs under v2_dir/<slug>/pid
         local v2_dir="${_V2_LOCK_DIR:-/tmp/lauren-loop-v2.lock.d}"
-        other_lock="$v2_dir/pid"
-        other_slug_file="$v2_dir/slug"
-    else
-        local v1_file="${_V1_LOCK_FILE:-/tmp/lauren-loop-pilot.lock}"
-        other_lock="$v1_file"
-        other_slug_file="${v1_file}.slug"
-    fi
-
-    [[ -f "$other_lock" ]] || return 0
-    other_pid=$(cat "$other_lock" 2>/dev/null)
-    kill -0 "$other_pid" 2>/dev/null || return 0
-
-    other_slug=""
-    [[ -f "$other_slug_file" ]] && other_slug=$(cat "$other_slug_file" 2>/dev/null)
-    [[ -z "$other_slug" ]] && return 0
-
-    if [[ "$other_slug" == "$my_slug" ]]; then
-        echo -e "${YELLOW:-}Warning: ${my_version} and the other pipeline are both operating on '${my_slug}' (PID ${other_pid})${NC:-}" >&2
+        local v2_slug_pid_file="$v2_dir/$my_slug/pid"
+        [[ -f "$v2_slug_pid_file" ]] || return 0
+        local other_pid
+        other_pid=$(tr -d '[:space:]' < "$v2_slug_pid_file" 2>/dev/null) || return 0
+        [[ -n "$other_pid" ]] || return 0
+        kill -0 "$other_pid" 2>/dev/null || return 0
+        echo -e "${YELLOW:-}Warning: v1 and V2 are both operating on '${my_slug}' (V2 PID ${other_pid})${NC:-}" >&2
         echo -e "${YELLOW:-}Concurrent modifications to the same task file may cause corruption.${NC:-}" >&2
         return 1
+    else
+        # v2 checking v1: unchanged (v1's lock structure is not changing)
+        local v1_file="${_V1_LOCK_FILE:-/tmp/lauren-loop-pilot.lock}"
+        local other_slug_file="${v1_file}.slug"
+        [[ -f "$v1_file" ]] || return 0
+        local other_pid
+        other_pid=$(cat "$v1_file" 2>/dev/null)
+        kill -0 "$other_pid" 2>/dev/null || return 0
+        local other_slug=""
+        [[ -f "$other_slug_file" ]] && other_slug=$(cat "$other_slug_file" 2>/dev/null)
+        [[ -z "$other_slug" ]] && return 0
+        if [[ "$other_slug" == "$my_slug" ]]; then
+            echo -e "${YELLOW:-}Warning: V2 and v1 are both operating on '${my_slug}' (v1 PID ${other_pid})${NC:-}" >&2
+            echo -e "${YELLOW:-}Concurrent modifications to the same task file may cause corruption.${NC:-}" >&2
+            return 1
+        fi
+        return 0
     fi
-    return 0
+}
+
+# ============================================================
+# Process / lock helpers (shared across v1 and v2)
+# ============================================================
+
+_process_alive() {
+    local pid="$1"
+    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+    if [[ -d "/proc/$pid" ]]; then
+        return 0
+    fi
+    kill -0 "$pid" 2>/dev/null
+}
+
+# List all running V2 instances by scanning per-slug lock subdirectories.
+# Output: one line per alive instance — "<slug> <pid> <goal>"
+# Uses _V2_LOCK_DIR env var override for testability.
+_list_running_v2_instances() {
+    local lock_dir="${_V2_LOCK_DIR:-/tmp/lauren-loop-v2.lock.d}"
+    local slug pid goal pid_file
+    [[ -d "$lock_dir" ]] || return 0
+    for pid_file in "$lock_dir"/*/pid; do
+        [[ -f "$pid_file" ]] || continue
+        pid=$(tr -d '[:space:]' < "$pid_file" 2>/dev/null) || continue
+        [[ -n "$pid" ]] || continue
+        _process_alive "$pid" || continue
+        slug=$(basename "$(dirname "$pid_file")")
+        goal=""
+        [[ -f "$(dirname "$pid_file")/goal" ]] && goal=$(cat "$(dirname "$pid_file")/goal" 2>/dev/null)
+        printf '%s\t%s\t%s\n' "$slug" "$pid" "$goal"
+    done
+}
+
+# Check if a specific slug is currently running under V2.
+# Returns 0 if running, 1 otherwise.
+_is_slug_running_v2() {
+    local slug="$1"
+    local lock_dir="${_V2_LOCK_DIR:-/tmp/lauren-loop-v2.lock.d}"
+    local pid_file="$lock_dir/$slug/pid"
+    [[ -f "$pid_file" ]] || return 1
+    local pid
+    pid=$(tr -d '[:space:]' < "$pid_file" 2>/dev/null) || return 1
+    [[ -n "$pid" ]] || return 1
+    _process_alive "$pid"
 }
 
 # ============================================================
@@ -191,6 +260,17 @@ _atomic_write() {
     mv "$tmp" "$target"
 }
 
+_atomic_promote_file() {
+    local source_file="$1"
+    local target_file="$2"
+    local tmp
+
+    [[ -f "$source_file" ]] || return 1
+    tmp=$(same_dir_temp_file "$target_file") || return 1
+    cp "$source_file" "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$target_file"
+}
+
 # Validate agent output: checks file exists, non-empty, valid UTF-8.
 # Returns 1 + stderr warning on failure.
 _validate_agent_output() {
@@ -211,6 +291,258 @@ _validate_agent_output() {
             return 1
         fi
     fi
+    return 0
+}
+
+_agent_output_requires_semantic_validation() {
+    case "$1" in
+        planner-b|reviewer-b*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_codex_role_uses_tool_written_artifact() {
+    case "$1" in
+        planner-b|reviewer-b*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_repo_root_for_lauren_loop_utils() {
+    if [[ -n "${SCRIPT_DIR:-}" && -d "${SCRIPT_DIR}/prompts" ]]; then
+        printf '%s\n' "$SCRIPT_DIR"
+    else
+        printf '%s\n' "${LAUREN_LOOP_UTILS_DIR%/lib}"
+    fi
+}
+
+_regex_escape_ere() {
+    printf '%s' "$1" | sed -e 's/[][(){}.^$+*?|\\/-]/\\&/g'
+}
+
+_markdown_section_body() {
+    local file="$1"
+    local heading_regex="$2"
+    awk -v heading="$heading_regex" '
+        BEGIN { in_section=0 }
+        $0 ~ heading {
+            in_section=1
+            next
+        }
+        in_section && /^##[[:space:]]+/ {
+            exit 0
+        }
+        in_section {
+            print
+        }
+    ' "$file"
+}
+
+_markdown_section_has_nonblank_body() {
+    local file="$1"
+    local heading_regex="$2"
+    awk -v heading="$heading_regex" '
+        BEGIN { in_section=0; saw_body=0 }
+        $0 ~ heading {
+            in_section=1
+            next
+        }
+        in_section && /^##[[:space:]]+/ {
+            exit(saw_body ? 0 : 1)
+        }
+        in_section && $0 ~ /[^[:space:]]/ {
+            saw_body=1
+        }
+        END {
+            if (in_section) {
+                exit(saw_body ? 0 : 1)
+            }
+            exit 1
+        }
+    ' "$file"
+}
+
+_markdown_fences_are_balanced() {
+    local file="$1"
+    local fence_count
+    fence_count=$(grep -Ec '^[[:space:]]*```' "$file" || true)
+    (( fence_count % 2 == 0 ))
+}
+
+_planner_contract_tags_balanced() {
+    local file="$1"
+    local section_body=""
+    local wave_open wave_close task_open task_close task_typed
+    local task_required_tags=0
+    section_body=$(_markdown_section_body "$file" '^#{2,3}[[:space:]]+Implementation Tasks[[:space:]]*$')
+    [[ -n "$section_body" ]] || return 1
+
+    wave_open=$(printf '%s\n' "$section_body" | { grep -Eo '<wave[[:space:]][^>]*>' || true; } | wc -l | tr -d ' ')
+    wave_close=$(printf '%s\n' "$section_body" | { grep -Eo '</wave>' || true; } | wc -l | tr -d ' ')
+    task_open=$(printf '%s\n' "$section_body" | { grep -Eo '<task[[:space:]][^>]*>' || true; } | wc -l | tr -d ' ')
+    task_close=$(printf '%s\n' "$section_body" | { grep -Eo '</task>' || true; } | wc -l | tr -d ' ')
+    task_typed=$(printf '%s\n' "$section_body" | { grep -Eo '<task[[:space:]][^>]*type="(auto|verify)"[^>]*>' || true; } | wc -l | tr -d ' ')
+
+    (( wave_open > 0 && wave_open == wave_close )) || return 1
+    (( task_open > 0 && task_open == task_close )) || return 1
+    (( task_typed == task_open )) || return 1
+
+    for required_tag in name files action verify done; do
+        local tag_count
+        tag_count=$(printf '%s\n' "$section_body" | { grep -Eo "<${required_tag}>" || true; } | wc -l | tr -d ' ')
+        (( tag_count >= task_open )) || return 1
+        task_required_tags=$((task_required_tags + 1))
+    done
+
+    (( task_required_tags == 5 ))
+}
+
+_planner_artifact_has_required_sections() {
+    local file="$1"
+    grep -Eq '^#{2,3}[[:space:]]+Files to Modify[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^#{2,3}[[:space:]]+Files to Modify[[:space:]]*$' \
+        && grep -Eq '^#{2,3}[[:space:]]+Implementation Tasks[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^#{2,3}[[:space:]]+Implementation Tasks[[:space:]]*$' \
+        && grep -Eq '^#{2,3}[[:space:]]+Testability Design[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^#{2,3}[[:space:]]+Testability Design[[:space:]]*$' \
+        && grep -Eq '^#{2,3}[[:space:]]+Test Strategy[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^#{2,3}[[:space:]]+Test Strategy[[:space:]]*$' \
+        && grep -Eq '^#{2,3}[[:space:]]+Risk Assessment[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^#{2,3}[[:space:]]+Risk Assessment[[:space:]]*$' \
+        && grep -Eq '^#{2,3}[[:space:]]+Dependencies[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^#{2,3}[[:space:]]+Dependencies[[:space:]]*$' \
+        && _markdown_fences_are_balanced "$file" \
+        && _planner_contract_tags_balanced "$file"
+}
+
+_reviewer_b_prompt_path() {
+    printf '%s/prompts/reviewer-b.md\n' "$(_repo_root_for_lauren_loop_utils)"
+}
+
+_reviewer_b_dimension_specs() {
+    local prompt_file
+    prompt_file=$(_reviewer_b_prompt_path)
+    [[ -f "$prompt_file" ]] || return 1
+
+    sed -n '/^## Dimension Coverage$/,/^## Verdict$/p' "$prompt_file" \
+        | sed -nE 's/^\*\*([0-9][0-9]*)\.[[:space:]]+([^*]+):\*\*.*/\1|\2/p'
+}
+
+_reviewer_b_artifact_has_required_sections() {
+    local file="$1"
+    local spec_count=0
+    local number="" label="" label_pattern=""
+
+    grep -Eq '^#[[:space:]]+Review B[[:space:]]*$' "$file" \
+        && grep -Eq '^##[[:space:]]+Findings[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Findings[[:space:]]*$' \
+        && grep -Eq '^##[[:space:]]+Done-Criteria Check[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Done-Criteria Check[[:space:]]*$' \
+        && grep -Eq '^##[[:space:]]+Dimension Coverage[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Dimension Coverage[[:space:]]*$' \
+        && grep -Eq '^##[[:space:]]+Verdict[[:space:]]*$' "$file" \
+        && _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Verdict[[:space:]]*$' \
+        || return 1
+
+    while IFS='|' read -r number label; do
+        [[ -n "$number" && -n "$label" ]] || continue
+        label_pattern=$(_regex_escape_ere "$label")
+        grep -Eq "^\\*\\*${number}\\.[[:space:]]+${label_pattern}:\\*\\*[[:space:]]+.+$" "$file" || return 1
+        spec_count=$((spec_count + 1))
+    done < <(_reviewer_b_dimension_specs)
+
+    (( spec_count > 0 )) \
+        && grep -Eq '^\*\*VERDICT:[[:space:]]*(PASS|FAIL|CONDITIONAL)\*\*$' "$file"
+}
+
+_reviewer_a_artifact_has_required_sections() {
+    local file="$1"
+    grep -Eq '\*\*VERDICT:[[:space:]]*(PASS|FAIL|CONDITIONAL)\*\*' "$file"
+}
+
+_validate_agent_output_for_role() {
+    local role="$1" file="$2"
+    _validate_agent_output "$file" || return 1
+
+    case "$role" in
+        planner-a|planner-b)
+            _planner_artifact_has_required_sections "$file"
+            ;;
+        reviewer-a*)
+            _reviewer_a_artifact_has_required_sections "$file"
+            ;;
+        reviewer-b*)
+            _reviewer_b_artifact_has_required_sections "$file"
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
+_terminate_pid_tree() {
+    local pid="$1" grace="${2:-$(_agent_terminate_grace_seconds)}"
+    kill -0 "$pid" 2>/dev/null || return 0
+
+    # Snapshot descendants BEFORE TERM — they may reparent if parent exits
+    local descendants=""
+    descendants=$(pgrep -P "$pid" 2>/dev/null || true)
+
+    # TERM pass
+    pkill -P "$pid" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+    sleep "$grace"
+
+    # KILL pass — always fire on all recorded PIDs, even if parent exited
+    local dpid
+    for dpid in $pid $descendants; do
+        if kill -0 "$dpid" 2>/dev/null; then
+            kill -9 "$dpid" 2>/dev/null || true
+        fi
+    done
+}
+
+_watch_codex_artifact_for_static_invalid() {
+    local role="$1" artifact_file="$2" cmd_pid="$3" marker_file="$4" log_file="$5"
+    _agent_output_requires_semantic_validation "$role" || return 0
+
+    local poll_interval last_size="" current_size="" unchanged_polls=0
+    poll_interval=$(_agent_poll_interval_seconds)
+
+    while kill -0 "$cmd_pid" 2>/dev/null; do
+        if [[ -f "$artifact_file" && -s "$artifact_file" ]]; then
+            if _validate_agent_output_for_role "$role" "$artifact_file" >/dev/null 2>&1; then
+                return 0
+            fi
+
+            current_size=$(wc -c < "$artifact_file" | tr -d ' ')
+            if [[ "$current_size" == "$last_size" ]]; then
+                unchanged_polls=$((unchanged_polls + 1))
+            else
+                unchanged_polls=0
+            fi
+            last_size="$current_size"
+
+            if (( unchanged_polls >= 2 )); then
+                printf '[codex-watcher] role=%s static_invalid_artifact bytes=%s unchanged_polls=%s\n' \
+                    "$role" "$current_size" "$unchanged_polls" >> "$log_file"
+                : > "$marker_file"
+                _terminate_pid_tree "$cmd_pid"
+                return 1
+            fi
+        fi
+
+        sleep "$poll_interval"
+    done
+
     return 0
 }
 
@@ -362,7 +694,7 @@ log_execution() {
     local entry="- [$timestamp] $message"
 
     # Prefer an explicit Execution Log section, but fall back to Attempts for
-    # canonical task files that do not carry V1/V2 sidecar sections.
+    # canonical AskGeorge task files that do not carry V1/V2 sidecar sections.
     local log_start
     log_start=$(grep -n '^## Execution Log' "$task_file" | head -1 | cut -d: -f1)
     if [ -z "$log_start" ]; then
@@ -410,6 +742,26 @@ latest_execution_log_entry() {
     else
         section_body "$task_file" "## Attempts:" 2>/dev/null | sed -n '/^- \[/ { p; q; }'
     fi
+}
+
+latest_execution_test_signal() {
+    local task_file="$1"
+    local signal
+
+    signal=$(section_body "$task_file" "## Execution Log" 2>/dev/null \
+        | sed -n '/^- \[.*\] \(GREEN\|VERIFY\|REFACTOR\):/ { s/^- \[[^]]*\] //; p; q; }')
+
+    if [ -n "$signal" ]; then
+        printf '%s\n' "$signal"
+        return 0
+    fi
+
+    signal=$(latest_execution_log_entry "$task_file" | sed 's/^- \[[^]]*\] //')
+    if [ -n "$signal" ]; then
+        printf '%s\n' "$signal"
+    fi
+
+    return 0
 }
 
 prepare_attempt_log() {
@@ -727,6 +1079,121 @@ ensure_sections() {
             printf '\n%s\n' "$section" >> "$task_file"
         fi
     done
+}
+
+ensure_task_workflow_sections() {
+    local task_file="$1"
+    local managed_sections=("## Left Off At:" "## Attempts:")
+    local missing_sections=()
+    local section count
+
+    for section in "${managed_sections[@]}" "## Execution Log"; do
+        count=$(grep -n -F -x "$section" "$task_file" | wc -l | tr -d ' ')
+        if [ "$count" -gt 1 ]; then
+            echo "Expected exactly one section: $section" >&2
+            return 1
+        fi
+        if [ "$count" -eq 0 ] && [ "$section" = "## Execution Log" ]; then
+            printf '\n## Execution Log\n' >> "$task_file"
+        fi
+        if [ "$count" -eq 0 ] && [ "$section" != "## Execution Log" ]; then
+            missing_sections+=("$section")
+        fi
+    done
+
+    if [ "${#missing_sections[@]}" -eq 0 ]; then
+        return 0
+    fi
+
+    local exec_start tmp_file missing_left_off missing_attempts
+    exec_start=$(grep -n -F -x '## Execution Log' "$task_file" | cut -d: -f1)
+    missing_left_off=0
+    missing_attempts=0
+    for section in "${missing_sections[@]}"; do
+        case "$section" in
+            "## Left Off At:") missing_left_off=1 ;;
+            "## Attempts:") missing_attempts=1 ;;
+        esac
+    done
+    tmp_file=$(same_dir_temp_file "$task_file")
+
+    awk -v exec_start="$exec_start" \
+        -v missing_left_off="$missing_left_off" \
+        -v missing_attempts="$missing_attempts" '
+        NR == exec_start {
+            if (missing_left_off == 1) {
+                print "## Left Off At:"
+                print "Not started."
+                print ""
+            }
+            if (missing_attempts == 1) {
+                print "## Attempts:"
+                print "(none yet)"
+                print ""
+            }
+        }
+        { print }
+    ' "$task_file" > "$tmp_file"
+
+    mv "$tmp_file" "$task_file"
+}
+
+set_task_left_off_at() {
+    local task_file="$1"
+    local message="$2"
+    local replacement_file=""
+
+    ensure_task_workflow_sections "$task_file" || return 1
+
+    replacement_file=$(mktemp)
+    printf '%s\n' "$message" > "$replacement_file"
+    rewrite_section "$task_file" "## Left Off At:" "$replacement_file"
+    rm -f "$replacement_file"
+}
+
+append_task_attempt() {
+    local task_file="$1"
+    local entry="$2"
+    local current_body="" replacement_file=""
+
+    ensure_task_workflow_sections "$task_file" || return 1
+    current_body=$(section_body "$task_file" "## Attempts:" 2>/dev/null || true)
+
+    replacement_file=$(mktemp)
+    if [ -n "$current_body" ]; then
+        printf '%s\n' "$current_body" \
+            | awk '
+                { lines[++count] = $0 }
+                END {
+                    while (count > 0 && (lines[count] == "" || lines[count] == "(none yet)" || lines[count] == "(none)")) {
+                        count--
+                    }
+                    for (i = 1; i <= count; i++) {
+                        print lines[i]
+                    }
+                }
+            ' > "$replacement_file"
+    fi
+
+    if [ -s "$replacement_file" ]; then
+        printf '%s\n' "$entry" >> "$replacement_file"
+    else
+        printf '%s\n' "$entry" > "$replacement_file"
+    fi
+
+    rewrite_section "$task_file" "## Attempts:" "$replacement_file"
+    rm -f "$replacement_file"
+}
+
+finalize_v1_verification_handoff() {
+    local task_file="$1"
+    local left_off_message="$2"
+    local attempt_entry="$3"
+
+    ensure_task_workflow_sections "$task_file" || return 1
+    set_task_status "$task_file" "needs verification" || return 1
+    set_task_left_off_at "$task_file" "$left_off_message" || return 1
+    append_task_attempt "$task_file" "$attempt_entry" || return 1
 }
 
 ensure_review_sections() {
@@ -1128,7 +1595,7 @@ extract_agent_signal() {
 }
 
 _strict_contract_mode() {
-    [[ "${LAUREN_LOOP_STRICT:-false}" == "true" ]]
+    [[ "${LAUREN_LOOP_EFFECTIVE_STRICT:-${LAUREN_LOOP_STRICT:-false}}" == "true" ]]
 }
 
 _contract_token_is_allowed() {
@@ -1401,14 +1868,16 @@ move_task_to_closed() {
 
         if [ -d "$src_dir/competitive" ]; then
             local v2_lock_dir="/tmp/lauren-loop-v2.lock.d"
+            local task_slug
+            task_slug=$(basename "$src_dir")
             local v2_lock_pid=""
-            if [ -f "$v2_lock_dir/pid" ]; then
-                v2_lock_pid=$(tr -d '[:space:]' < "$v2_lock_dir/pid" 2>/dev/null || true)
+            if [ -f "$v2_lock_dir/$task_slug/pid" ]; then
+                v2_lock_pid=$(tr -d '[:space:]' < "$v2_lock_dir/$task_slug/pid" 2>/dev/null || true)
             fi
             if [[ -n "$v2_lock_pid" ]] && kill -0 "$v2_lock_pid" 2>/dev/null; then
-                echo "WARN: closing $src_dir will relocate competitive/ artifacts while lauren-loop-v2.sh PID $v2_lock_pid is active. Verify it is not using this task before continuing." >&2
+                echo "WARN: closing $src_dir will relocate competitive/ artifacts while lauren-loop-v2.sh PID $v2_lock_pid is active on '$task_slug'. Verify it is not using this task before continuing." >&2
             else
-                echo "WARN: closing $src_dir will relocate competitive/ artifacts to docs/tasks/closed. Verify no V2 session is active before continuing." >&2
+                echo "WARN: closing $src_dir will relocate competitive/ artifacts to docs/tasks/closed. Verify no V2 session is active on '$task_slug' before continuing." >&2
             fi
         fi
 
@@ -2083,4 +2552,41 @@ read_v2_total_cost() {
     fi
     _ensure_cost_csv_header "$cost_csv"
     awk -F',' 'NR > 1 && $11 != "" { sum += $11; found = 1 } END { if (found) printf "%.4f", sum + 0; else print "N/A" }' "$cost_csv" 2>/dev/null || echo "N/A"
+}
+
+compute_cocomo_estimate() {
+    local before_sha="${1:-}"
+    if [[ -z "$before_sha" ]]; then echo "N/A"; return 0; fi
+
+    local sloc_rate="${COCOMO_SLOC_PER_HOUR:-20}"
+    local hourly_rate="${COCOMO_OFFSHORE_RATE:-55}"
+    local sdlc_mult="${COCOMO_SDLC_MULTIPLIER:-1}"
+
+    # Count insertions and deletions: committed + staged + unstaged (skip binary files where numstat shows "-")
+    # Each awk prints "insertions deletions" in one pass
+    local committed staged unstaged
+    committed=$(git diff --numstat "${before_sha}..HEAD" 2>/dev/null | awk '$1!="-"{i+=$1; d+=$2}END{print i+0, d+0}') || committed="0 0"
+    staged=$(git diff --cached --numstat 2>/dev/null | awk '$1!="-"{i+=$1; d+=$2}END{print i+0, d+0}') || staged="0 0"
+    unstaged=$(git diff --numstat 2>/dev/null | awk '$1!="-"{i+=$1; d+=$2}END{print i+0, d+0}') || unstaged="0 0"
+    local total_ins=$(( ${committed%% *} + ${staged%% *} + ${unstaged%% *} ))
+    local total_del=$(( ${committed##* } + ${staged##* } + ${unstaged##* } ))
+
+    if [[ "$total_ins" -eq 0 && "$total_del" -eq 0 ]]; then echo "N/A  (no code changes)"; return 0; fi
+
+    # Use net SLOC (insertions minus deletions, floored at 0) — deleted code isn't written production code
+    local net_sloc=$(( total_ins - total_del ))
+    if [[ "$net_sloc" -le 0 ]]; then
+        printf 'N/A  (net deletion: +%d/-%d)' "$total_ins" "$total_del"
+        return 0
+    fi
+
+    local hours cost
+    hours=$(echo "scale=2; $net_sloc / $sloc_rate * $sdlc_mult" | bc 2>/dev/null) || { echo "N/A"; return 0; }
+    cost=$(echo "scale=2; $hours * $hourly_rate" | bc 2>/dev/null) || { echo "N/A"; return 0; }
+    [[ "$hours" == .* ]] && hours="0$hours"
+    [[ "$cost" == .* ]] && cost="0$cost"
+
+    local breakdown="net ${net_sloc} lines (+${total_ins}/-${total_del}) / ${sloc_rate} SLOC/hr × \$${hourly_rate}/hr"
+    [[ "$sdlc_mult" != "1" ]] && breakdown="${breakdown} × ${sdlc_mult}x SDLC"
+    printf '$%s  (%s)' "$cost" "$breakdown"
 }

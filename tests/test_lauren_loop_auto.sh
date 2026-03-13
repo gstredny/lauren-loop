@@ -61,6 +61,27 @@ exit 99
 EOF
     chmod +x "$root/bin/claude"
 
+    cat > "$root/bin/date" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ "${1:-}" = "+%s" ] && [ -n "${FAKE_DATE_SEQUENCE_FILE:-}" ] && [ -s "${FAKE_DATE_SEQUENCE_FILE}" ]; then
+    read -r first rest < "${FAKE_DATE_SEQUENCE_FILE}"
+    printf '%s\n' "$first"
+    if [ -n "${rest:-}" ]; then
+        printf '%s\n' "$rest" > "${FAKE_DATE_SEQUENCE_FILE}"
+    else
+        : > "${FAKE_DATE_SEQUENCE_FILE}"
+    fi
+    exit 0
+fi
+if [ "${1:-}" = "-Iseconds" ] && [ -n "${FAKE_DATE_ISO:-}" ]; then
+    printf '%s\n' "$FAKE_DATE_ISO"
+    exit 0
+fi
+/bin/date "$@"
+EOF
+    chmod +x "$root/bin/date"
+
     cat > "$root/lauren-loop-v2.sh" <<'EOF'
 #!/bin/bash
 set -euo pipefail
@@ -128,6 +149,12 @@ ${plan_body}
 ## Plan History
 (Archived plan+critique rounds)
 
+## Left Off At:
+Not started.
+
+## Attempts:
+(none yet)
+
 ## Execution Log
 (Timestamped round results)
 EOF
@@ -143,6 +170,48 @@ init_fixture_git() {
         git add .
         git commit -q -m "fixture"
     )
+}
+
+install_v1_auto_success_claude() {
+    local fixture="$1"
+    cat > "$fixture/bin/claude" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ -n "${CLAUDE_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$CLAUDE_LOG"
+fi
+if [ -n "${FAKE_CLASSIFY_OUTPUT:-}" ]; then
+    printf '%s\n' "$FAKE_CLASSIFY_OUTPUT"
+    exit "${FAKE_CLASSIFY_EXIT:-0}"
+fi
+
+task_instruction=""
+previous=""
+for arg in "$@"; do
+    if [ "$previous" = "-p" ]; then
+        task_instruction="$arg"
+        break
+    fi
+    previous="$arg"
+done
+
+task_file=$(printf '%s\n' "$task_instruction" | sed -n 's/.*Read the task file at \([^[:space:]]*\.md\)\..*/\1/p')
+[ -n "$task_file" ] || task_file=$(printf '%s\n' "$task_instruction" | sed -n 's/.*Read the task file at \([^[:space:]]*\.md\).*/\1/p')
+[ -n "$task_file" ] || { echo "missing task file path in lead stub" >&2; exit 98; }
+
+perl -0pi -e 's/^## Current Plan\n.*?(?=^## Critique)/## Current Plan\n\n### Files to Modify\n- src\/example.py - fixture-owned change\n\n### Implementation Tasks\n- Simulate a successful routed V1 execution.\n\n/sm' "$task_file"
+perl -0pi -e 's/^## Execution Log\n.*\z/## Execution Log\n- [2026-03-12 12:00:00] GREEN: v1_auto_success_path - PASS (3 total)\n- [2026-03-12 12:00:01] REFACTOR: tighten shell handoff - 3 pass, 0 fail\n/sm' "$task_file"
+perl -0pi -e 's/^## Status: .*/## Status: executed/m' "$task_file"
+exit 0
+EOF
+    chmod +x "$fixture/bin/claude"
+}
+
+run_v1_auto_success_case() {
+    local fixture="$1" slug="$2" goal="$3"
+    install_v1_auto_success_claude "$fixture"
+    init_fixture_git "$fixture"
+    CLAUDE_LOG="$fixture/claude.log" run_auto "$fixture" auto "$slug" "$goal" --simple --model sonnet > "$fixture/output.txt" 2>&1
 }
 
 (
@@ -409,9 +478,48 @@ EOF
 
     grep -q "Pipeline: V1" "$output"
     [ -f "$fixture/child-args.log" ]
+    grep -q -- '--no-review' "$fixture/child-args.log"
     grep -q -- '--no-close' "$fixture/child-args.log"
-) && pass "16. V1 child receives --no-close from auto caller" \
-  || fail "16. V1 child receives --no-close from auto caller"
+) && pass "16. V1 child receives --no-review and --no-close from auto caller" \
+  || fail "16. V1 child receives --no-review and --no-close from auto caller"
+
+(
+    fixture=$(setup_fixture "v1-auto-final-status")
+    task_file="$fixture/docs/tasks/open/pilot-v1-auto-final-status.md"
+
+    run_v1_auto_success_case "$fixture" "v1-auto-final-status" "V1 auto final status"
+
+    grep -q '^## Status: needs verification$' "$task_file"
+    ! grep -q '^## Status: executed$' "$task_file"
+) && pass "16a. routed V1 auto success ends at needs verification" \
+  || fail "16a. routed V1 auto success ends at needs verification"
+
+(
+    fixture=$(setup_fixture "v1-auto-attempts")
+    task_file="$fixture/docs/tasks/open/pilot-v1-auto-attempts.md"
+
+    run_v1_auto_success_case "$fixture" "v1-auto-attempts" "V1 auto attempts"
+
+    grep -q '^## Attempts:$' "$task_file"
+    grep -q 'Routed V1 auto execution completed via lead pipeline' "$task_file"
+    grep -q 'Latest execution evidence: GREEN: v1_auto_success_path - PASS (3 total)' "$task_file"
+) && pass "16b. routed V1 auto success appends an Attempts entry" \
+  || fail "16b. routed V1 auto success appends an Attempts entry"
+
+(
+    fixture=$(setup_fixture "v1-auto-left-off")
+    task_file="$fixture/docs/tasks/open/pilot-v1-auto-left-off.md"
+
+    run_v1_auto_success_case "$fixture" "v1-auto-left-off" "V1 auto left off"
+
+    grep -q '^## Left Off At:$' "$task_file"
+    grep -q 'Automated V1 lead execution completed\.' "$task_file"
+    grep -q 'Task is ready for human verification\.' "$task_file"
+    ! awk '
+        /^## Left Off At:$/ { getline; print; exit }
+    ' "$task_file" | grep -qx 'Not started\.'
+) && pass "16c. routed V1 auto success updates Left Off At" \
+  || fail "16c. routed V1 auto success updates Left Off At"
 
 (
     fixture=$(setup_fixture "override-complexity-writeback")
@@ -708,6 +816,34 @@ EOF
     ! grep -q "V1-only flags" "$output"
 ) && pass "29. --resume alone does not force V1 routing — classifier decides" \
   || fail "29. --resume alone does not force V1 routing — classifier decides"
+
+(
+    fixture=$(setup_fixture "duration-long-format")
+    output="$fixture/output.txt"
+    v2_log="$fixture/v2.log"
+    fake_date_seq="$fixture/date-seq.txt"
+    printf '1000 5785\n' > "$fake_date_seq"
+
+    FAKE_DATE_SEQUENCE_FILE="$fake_date_seq" V2_LOG="$v2_log" run_auto "$fixture" auto duration-long "Long duration" --thorough --dry-run --model sonnet > "$output" 2>&1
+
+    grep -q "Pipeline: V2" "$output"
+    grep -q "Duration: 1h 19m" "$output"
+) && pass "30. auto summary renders long durations as compact hours and minutes" \
+  || fail "30. auto summary renders long durations as compact hours and minutes"
+
+(
+    fixture=$(setup_fixture "duration-short-format")
+    output="$fixture/output.txt"
+    v2_log="$fixture/v2.log"
+    fake_date_seq="$fixture/date-seq.txt"
+    printf '1000 1059\n' > "$fake_date_seq"
+
+    FAKE_DATE_SEQUENCE_FILE="$fake_date_seq" V2_LOG="$v2_log" run_auto "$fixture" auto duration-short "Short duration" --thorough --dry-run --model sonnet > "$output" 2>&1
+
+    grep -q "Pipeline: V2" "$output"
+    grep -q "Duration: <1m" "$output"
+) && pass "31. auto summary renders sub-minute durations as less than one minute" \
+  || fail "31. auto summary renders sub-minute durations as less than one minute"
 
 echo ""
 echo "============================="

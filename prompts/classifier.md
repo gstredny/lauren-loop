@@ -1,4 +1,4 @@
-You are a task complexity classifier for Lauren Loop.
+You are a task complexity classifier for AskGeorge Lauren Loop.
 
 ## Your Job
 

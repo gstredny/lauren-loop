@@ -2,15 +2,13 @@
 
 A CLI that classifies tasks by complexity and routes them to the right pipeline — a fast single-agent pipeline (V1) for simple tasks, or a competitive multi-agent pipeline (V2) for complex ones. You provide the goal; Lauren Loop handles the back-and-forth.
 
-This guide assumes Lauren Loop is being used inside a working project. References to `docs/tasks/open/` describe the active task workspace used by the scripts you launch.
-
 ## Before You Start
 
-Lauren Loop works from task files in `docs/tasks/open/` within that task workspace.
+Lauren Loop works from task files in `docs/tasks/open/`.
 
 - `pick` and `next` only rank task files that already exist there. They do not invent tasks from scratch.
 - `auto <slug> "goal"` is the direct path when you already know the task you want to run.
-- If you want to write context and done criteria yourself before launching, create a task from your task template first.
+- If you want to write context and done criteria yourself before launching, create a task from `docs/tasks/TEMPLATE.md` first.
 
 ## Quick Glossary
 
@@ -51,16 +49,15 @@ What happens:
 
 - If Lauren Loop finds a matching task in `docs/tasks/open/`, it reuses it
 - If no task matches, it creates a new task file and routes to V1 or V2
-- If you want richer context up front, create the task yourself from your task template before launching
+- If you want richer context up front, create the task yourself from `docs/tasks/TEMPLATE.md` before launching
 
 ## How Tasks Are Set Up
 
-- Installed projects get a scaffolded `docs/tasks/` structure, including `open/`, `closed/`, `deferred/`, `RETRO.md`, and `TEMPLATE.md`
-- Canonical task files usually live as `docs/tasks/open/<slug>.md` or `docs/tasks/open/<slug>/task.md`
+- Canonical repo task files live under `docs/tasks/open/`, usually as `docs/tasks/open/<slug>.md` or `docs/tasks/open/<slug>/task.md`
 - A direct V1 start for a brand-new slug usually creates `docs/tasks/open/pilot-<slug>.md`
 - A V2 run stores runtime artifacts under `docs/tasks/open/<slug>/competitive/` and `docs/tasks/open/<slug>/logs/`
 - `pick` and `next` work from the open task files that already exist; they are not task-creation commands
-- For the full task lifecycle, verification flow, and closeout rules, see `docs/WORKFLOW.md`
+- For the full repo task lifecycle, verification flow, and closeout rules, see `docs/WORKFLOW.md`
 
 ## How It Works
 
@@ -89,7 +86,7 @@ The key insight: the Lead keeps full context from exploration through execution.
 
 Post-fix reviews receive both the original execution diff and the fix diff, with focus on the fix changes. This lets the reviewer understand the full context without re-evaluating already-approved code.
 
-Direct `./lauren-loop.sh <slug> "goal"` runs use auto-review by default and auto-close unless you pass `--no-close`. The `auto` wrapper used by `pick` keeps routed V1 tasks open for human verification by always adding `--no-close`.
+Direct `./lauren-loop.sh <slug> "goal"` runs use auto-review by default and auto-close unless you pass `--no-close`. The `auto` wrapper used by `pick` keeps routed V1 tasks open for human verification by forcing `--no-review` and `--no-close`, so the routed V1 path stops after execution handoff at `needs verification`.
 
 Use `--no-review` to skip auto-review, `--no-close` to stop after a `review-passed` handoff. Up to 2 fix cycles before stopping.
 
@@ -107,7 +104,7 @@ Seven phases, each with purpose-built agents:
 
 V2 ends at `needs verification`. Review the diff, then close manually with `./lauren-loop.sh close <slug> --force` after your verification.
 
-See `docs/v2-reference.md` for the V2 technical reference (contracts, signals, parsing, hardening).
+See `docs/lauren-loop-v2.md` for the V2 technical reference (contracts, signals, parsing, hardening).
 
 ### The Complexity Classifier
 
@@ -172,7 +169,7 @@ tail -f logs/pilot/pilot-<slug>-lead.log          # V1
 
 ### Step 3 — Review results
 
-- **Auto-routed V1 (`pick` / `auto`)** — Auto-reviews, but keeps the task open for human verification instead of auto-closing.
+- **Auto-routed V1 (`pick` / `auto`)** — Stops after execution handoff at `needs verification`, leaving review/verify/close as human-driven follow-up.
 - **Direct V1 (`./lauren-loop.sh <slug> "goal"`)** — Auto-reviews and auto-closes by default unless you use `--no-review` or `--no-close`.
 - **V2** — Ends at `needs verification`. Review the diff, then close manually after your own verification.
 
@@ -207,7 +204,7 @@ Override with the `LAUREN_LOOP_MAX_COST` environment variable or edit `.lauren-l
 
 ### Token Pricing
 
-The pipeline uses Claude and Codex. Rates per 1M tokens:
+The pipeline uses Claude (via Azure Foundry) and Codex. Rates per 1M tokens:
 
 | Engine | Token Type | Rate per 1M tokens |
 |--------|-----------|---------------------|
@@ -308,9 +305,9 @@ At every step there's a safety net. If something breaks later, the tests catch i
 
 **Critical rule: Zero file overlap.** Lauren Loop's task file lists "Files to Modify." If your manual work touches any of those files, pick a different Lauren Loop task.
 
-## Context Guard Integration
+## Azure Foundry Integration
 
-Lauren Loop optionally sources `~/.claude/scripts/context-guard.sh` and calls `setup_azure_context` at startup. If the context guard is absent, fallback stubs ensure all Claude calls work normally via the default API.
+Lauren Loop automatically routes through Azure Foundry for proprietary data security. It sources `~/.claude/scripts/context-guard.sh` and calls `setup_azure_context` at startup. All Claude calls go through your Azure endpoint — nothing touches the Anthropic API directly.
 
 ## CLI Reference
 
@@ -341,10 +338,10 @@ Lauren Loop optionally sources `~/.claude/scripts/context-guard.sh` and calls `s
 |------|-----------|-------------|
 | `--simple` | `auto` | Force V1 routing |
 | `--thorough` | `auto` | Force V2 routing |
-| `--force` | `auto`, `close` | Force rerun of V2 phases / close stuck tasks |
+| `--force` | `auto` (V2 only), `close` | Force rerun of V2 phases / close a manually verified non-`review-passed` task |
 | `--fresh` | `pick` | Re-rank tasks, skip 10-minute cache |
-| `--no-review` | `auto` (V1 route only), `<slug>` (V1) | Skip auto-review after execution |
-| `--no-close` | `auto` (V1 route only), `<slug>` (V1) | Skip auto-close after `review-passed` |
+| `--no-review` | `auto` (V1 route only), `<slug>` (V1) | Skip auto-review after execution; routed V1 auto now always uses this internally |
+| `--no-close` | `auto` (V1 route only), `<slug>` (V1) | Skip auto-close after `review-passed`; routed V1 auto still forwards this for consistency |
 | `--resume` | `auto`, `<slug>` | On direct V1 commands, require an existing task match. On V2 work, resume from saved checkpoint state when a task already exists. |
 | `--legacy` | `<slug>` | Use legacy planner-critic loop + separate executor |
 | `--dry-run` | `auto`, `<slug>` | Skip live agent execution; V1 creates or reuses the task file only, V2 prints planned phases |
@@ -426,9 +423,9 @@ Place an `.lauren-loop.conf` file in the project root to override defaults:
 # LAUREN_LOOP_MODEL="${LAUREN_LOOP_MODEL:-opus}"         # Default model
 # LAUREN_LOOP_STRICT="${LAUREN_LOOP_STRICT:-false}"       # Strict mode
 LAUREN_LOOP_MAX_COST="${LAUREN_LOOP_MAX_COST:-100}"       # Cost ceiling ($)
-PROJECT_NAME="${PROJECT_NAME:-myproject}"                   # Project name injected into prompts
-TEST_CMD="${TEST_CMD:-pytest tests/ -x -q}"                      # Test command (V1)
-LINT_CMD="${LINT_CMD:-flake8 src/ ...}"                           # Lint command (V1)
+PROJECT_NAME="${PROJECT_NAME:-AskGeorge}"                  # Project name injected into prompts
+TEST_CMD="${TEST_CMD:-.venv/bin/python -m pytest tests/ -x -q}"  # Test command (V1)
+LINT_CMD="${LINT_CMD:-.venv/bin/python -m flake8 src/ ...}"      # Lint command (V1)
 # EXPLORE_TIMEOUT="${EXPLORE_TIMEOUT:-15m}"               # Explorer phase timeout
 # PLANNER_TIMEOUT="${PLANNER_TIMEOUT:-10m}"               # Planner phase timeout
 # EXECUTOR_TIMEOUT="${EXECUTOR_TIMEOUT:-120m}"            # Executor phase timeout
@@ -502,16 +499,31 @@ If a slug already has a V2 task directory (`docs/tasks/open/<slug>/competitive/`
 
 If `resume` fails because `.planning/<slug>.json` is missing, the pause snapshot was lost. Start fresh with `auto <slug> "goal"`.
 
-### Lock contention
+### Parallel execution (V2)
 
-Only one Lauren Loop pipeline runs at a time per version (V1 lock: `/tmp/lauren-loop-pilot.lock`, V2 lock: `/tmp/lauren-loop-v2.lock.d/`). If a previous run crashed without releasing the lock, delete it manually:
+V2 supports running 2-3 tasks in parallel across separate terminals. Each task acquires a per-slug lock under `/tmp/lauren-loop-v2.lock.d/<slug>/`, so different slugs can run concurrently while the same slug is still protected against double-execution.
+
+When a V2 instance starts, it shows:
+- **Other running instances** — slug, PID, and goal of any sibling V2 pipelines
+- **Dirty working tree files** — files with uncommitted changes, so you can assess git conflict risk before proceeding
+
+**Git conflicts are your responsibility.** If two parallel tasks edit the same file, you'll need to resolve the conflict manually after one of them finishes.
+
+V1 (`lauren-loop.sh pick`) annotates tasks with `[RUNNING]` if a V2 instance is active for that slug, and warns before launching a duplicate.
+
+### Lock contention / stale locks
+
+V1 lock: `/tmp/lauren-loop-pilot.lock`. V2 per-slug locks: `/tmp/lauren-loop-v2.lock.d/<slug>/`.
+
+If a previous run crashed without releasing the lock, remove the stale lock manually:
 
 ```bash
-rm /tmp/lauren-loop-pilot.lock       # V1
-rm -rf /tmp/lauren-loop-v2.lock.d/   # V2
+rm /tmp/lauren-loop-pilot.lock                 # V1
+rm -rf /tmp/lauren-loop-v2.lock.d/<slug>/      # V2 — specific slug
+rm -rf /tmp/lauren-loop-v2.lock.d/             # V2 — all locks
 ```
 
-Both pipelines now write their slug to a sidecar file (`${LOCK_FILE}.slug` for V1, `slug` inside the V2 lock directory). If V1 and V2 target the same slug concurrently, the later pipeline emits an advisory warning — it does not block, but concurrent modifications to the same task file may cause corruption.
+If V1 and V2 target the same slug concurrently, the later pipeline emits an advisory warning — it does not block, but concurrent modifications to the same task file may cause corruption.
 
 ## Tips
 

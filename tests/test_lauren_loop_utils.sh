@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 TMP_BASE="${TMPDIR:-/tmp}"
 TMP_BASE="${TMP_BASE%/}"
 TMP_ROOT="$(mktemp -d "${TMP_BASE}/lauren-loop-utils.XXXXXX")"
@@ -78,6 +78,79 @@ VERDICT: PASS
 
 ## Execution Log
 (Timestamped round results)
+EOF
+}
+
+write_valid_plan_artifact() {
+    local path="$1" title="${2:-Plan Artifact}"
+    cat > "$path" <<EOF
+# ${title}
+
+## Files to Modify
+- \`lauren-loop-v2.sh\` — preserve tool-written artifacts and add Codex backstops
+- \`lib/lauren-loop-utils.sh\` — add semantic validation and watcher helpers
+
+## Implementation Tasks
+
+\`\`\`xml
+<wave number="1">
+  <task type="auto">
+    <name>Preserve Codex-written artifacts</name>
+    <files>lauren-loop-v2.sh, lib/lauren-loop-utils.sh</files>
+    <action>Keep Codex summary output separate from the real artifact and reject summary-only planner artifacts.</action>
+    <verify>bash -n lauren-loop-v2.sh</verify>
+    <done>Planner artifacts on disk retain the full plan content.</done>
+  </task>
+</wave>
+\`\`\`
+
+## Testability Design
+- Exercise \`bash lauren-loop-v2.sh\` and the shell helper functions through their public script entry points.
+
+## Test Strategy
+- Run the Lauren Loop shell regression suite before and after the change.
+
+## Risk Assessment
+- Ensure early stub detection does not kill a still-growing artifact.
+
+## Dependencies
+- None.
+EOF
+}
+
+write_valid_reviewer_b_artifact() {
+    local path="$1" verdict="${2:-PASS}" findings="${3:-No findings.}"
+    cat > "$path" <<EOF
+# Review B
+
+**Task:** task.md
+**Focus:** Architecture / Structural Integrity
+**Scope:** src/main.py
+
+## Findings
+
+${findings}
+
+## Done-Criteria Check
+
+Not applicable.
+
+## Dimension Coverage
+
+**1. Architecture / Structural Integrity:** checked
+**2. Correctness:** checked
+**3. Test Quality:** checked
+**4. Edge Cases:** checked
+**5. Error Handling:** checked
+**6. Security:** checked
+**7. Performance:** checked
+**8. Caller Impact:** checked
+
+## Verdict
+
+**VERDICT: ${verdict}**
+**Blocking findings:** None
+**Rationale:** test artifact
 EOF
 }
 
@@ -902,6 +975,216 @@ EOF
     grep -q 'DISPUTED: needs human review' "$out"
 ) && pass "41. start_agent_monitor — surfaces DISPUTED lines" \
   || fail "41. start_agent_monitor — surfaces DISPUTED lines"
+
+# ============================================================
+# Test 42: _validate_agent_output_for_role — summary-only reviewer stub is rejected
+# ============================================================
+(
+    artifact="$TMP_ROOT/reviewer-summary-only.md"
+    cat > "$artifact" <<'EOF'
+**Files modified:** competitive/review-b.md
+**Tests:** 0 passed, 0 failed (review only - no tests run)
+**What's left:** Ready for review synthesis
+**Task file updated:** none
+EOF
+    _validate_agent_output "$artifact"
+    ! _validate_agent_output_for_role "reviewer-b" "$artifact" >/dev/null 2>&1
+) && pass "42. _validate_agent_output_for_role — summary-only reviewer stub is rejected" \
+  || fail "42. _validate_agent_output_for_role — summary-only reviewer stub is rejected"
+
+# ============================================================
+# Test 43: _validate_agent_output_for_role — valid reviewer-b artifact passes
+# ============================================================
+(
+    artifact="$TMP_ROOT/reviewer-valid.md"
+    write_valid_reviewer_b_artifact "$artifact" "PASS" "No findings."
+    _validate_agent_output_for_role "reviewer-b" "$artifact"
+) && pass "43. _validate_agent_output_for_role — valid reviewer-b artifact passes" \
+  || fail "43. _validate_agent_output_for_role — valid reviewer-b artifact passes"
+
+# ============================================================
+# Test 43b: reviewer-b validation derives dimension count from the prompt contract
+# ============================================================
+(
+    temp_root="$TMP_ROOT/reviewer-dimension-contract"
+    mkdir -p "$temp_root/prompts"
+    awk '
+        /^## Verdict$/ && !inserted {
+            print "**9. Rollout Safety:** <checked result>"
+            print ""
+            inserted=1
+        }
+        { print }
+    ' "$REPO_ROOT/prompts/reviewer-b.md" > "$temp_root/prompts/reviewer-b.md"
+    SCRIPT_DIR="$temp_root"
+
+    artifact="$TMP_ROOT/reviewer-missing-9th-dimension.md"
+    write_valid_reviewer_b_artifact "$artifact" "PASS" "No findings."
+    ! _validate_agent_output_for_role "reviewer-b" "$artifact" >/dev/null 2>&1
+
+    fixed_artifact="$TMP_ROOT/reviewer-with-9th-dimension.md"
+    awk '
+        /^## Verdict$/ && !inserted {
+            print "**9. Rollout Safety:** checked"
+            print ""
+            inserted=1
+        }
+        { print }
+    ' "$artifact" > "$fixed_artifact"
+    _validate_agent_output_for_role "reviewer-b" "$fixed_artifact"
+) && pass "43b. reviewer-b validation derives dimension count from the prompt contract" \
+  || fail "43b. reviewer-b validation derives dimension count from the prompt contract"
+
+# ============================================================
+# Test 44: _validate_agent_output_for_role — valid planner-b artifact passes
+# ============================================================
+(
+    artifact="$TMP_ROOT/planner-valid.md"
+    write_valid_plan_artifact "$artifact" "Plan B"
+    _validate_agent_output_for_role "planner-b" "$artifact"
+) && pass "44. _validate_agent_output_for_role — valid planner-b artifact passes" \
+  || fail "44. _validate_agent_output_for_role — valid planner-b artifact passes"
+
+# ============================================================
+# Test 44b: planner validation rejects truncated XML task blocks
+# ============================================================
+(
+    artifact="$TMP_ROOT/planner-truncated.md"
+    cat > "$artifact" <<'EOF'
+# Plan B
+
+## Files to Modify
+- `lauren-loop-v2.sh` — preserve planner artifacts
+
+## Implementation Tasks
+
+```xml
+<wave number="1">
+  <task type="auto">
+    <name>Truncated plan</name>
+    <files>lauren-loop-v2.sh</files>
+    <action>Describe a partial change.</action>
+    <verify>bash test_lauren_loop_utils.sh</verify>
+    <done>Not complete yet.</done>
+```
+
+## Testability Design
+- Exercise the planner validator.
+
+## Test Strategy
+- Expect the validator to reject the missing closing tags.
+
+## Risk Assessment
+- A truncated artifact must not count as complete.
+
+## Dependencies
+- None.
+EOF
+    ! _validate_agent_output_for_role "planner-b" "$artifact" >/dev/null 2>&1
+) && pass "44b. planner validation rejects truncated XML task blocks" \
+  || fail "44b. planner validation rejects truncated XML task blocks"
+
+# ============================================================
+# Test 45: _watch_codex_artifact_for_static_invalid — kills static invalid artifact
+# ============================================================
+(
+    _agent_poll_interval_seconds() { echo 0.05; }
+    _agent_terminate_grace_seconds() { echo 0; }
+
+    artifact="$TMP_ROOT/static-invalid-planner.md"
+    marker="$TMP_ROOT/static-invalid-planner.marker"
+    log_file="$TMP_ROOT/static-invalid-planner.log"
+    printf 'ARTIFACT_WRITTEN\n' > "$artifact"
+
+    /bin/bash -c 'sleep 30' &
+    cmd_pid=$!
+
+    set +e
+    _watch_codex_artifact_for_static_invalid "planner-b" "$artifact" "$cmd_pid" "$marker" "$log_file" &
+    watcher_pid=$!
+    wait "$watcher_pid"
+    watcher_rc=$?
+    wait "$cmd_pid" 2>/dev/null
+    set -e
+
+    [[ "$watcher_rc" -ne 0 ]]
+    [[ -f "$marker" ]]
+    ! kill -0 "$cmd_pid" 2>/dev/null
+    grep -q 'static_invalid_artifact' "$log_file"
+) && pass "45. _watch_codex_artifact_for_static_invalid — kills static invalid artifact" \
+  || fail "45. _watch_codex_artifact_for_static_invalid — kills static invalid artifact"
+
+# ============================================================
+# Test 46: _watch_codex_artifact_for_static_invalid — growing incomplete artifact survives
+# ============================================================
+(
+    _agent_poll_interval_seconds() { echo 0.1; }
+    _agent_terminate_grace_seconds() { echo 0; }
+
+    artifact="$TMP_ROOT/growing-reviewer.md"
+    marker="$TMP_ROOT/growing-reviewer.marker"
+    log_file="$TMP_ROOT/growing-reviewer.log"
+
+    /bin/bash -c '
+        artifact="$1"
+        printf "# Review B\n\n## Findings\n\nNo findings.\n" > "$artifact"
+        sleep 0.05
+        printf "\n## Done-Criteria Check\n\nNot applicable.\n" >> "$artifact"
+        sleep 0.05
+        printf "\n## Dimension Coverage\n\n**1. Architecture / Structural Integrity:** checked\n**2. Correctness:** checked\n**3. Test Quality:** checked\n**4. Edge Cases:** checked\n**5. Error Handling:** checked\n**6. Security:** checked\n**7. Performance:** checked\n**8. Caller Impact:** checked\n" >> "$artifact"
+        sleep 0.05
+        printf "\n## Verdict\n\n**VERDICT: PASS**\n**Blocking findings:** None\n**Rationale:** test artifact\n" >> "$artifact"
+        sleep 0.1
+    ' bash "$artifact" &
+    cmd_pid=$!
+
+    set +e
+    _watch_codex_artifact_for_static_invalid "reviewer-b" "$artifact" "$cmd_pid" "$marker" "$log_file" &
+    watcher_pid=$!
+    wait "$watcher_pid"
+    watcher_rc=$?
+    wait "$cmd_pid"
+    cmd_rc=$?
+    set -e
+
+    [[ "$watcher_rc" -eq 0 ]]
+    [[ "$cmd_rc" -eq 0 ]]
+    [[ ! -f "$marker" ]]
+    _validate_agent_output_for_role "reviewer-b" "$artifact"
+) && pass "46. _watch_codex_artifact_for_static_invalid — growing incomplete artifact survives" \
+  || fail "46. _watch_codex_artifact_for_static_invalid — growing incomplete artifact survives"
+
+# ============================================================
+# Test 47: _terminate_pid_tree — TERM-ignoring child gets KILLed after grace
+# ============================================================
+(
+    _agent_terminate_grace_seconds() { echo 1; }
+
+    # Spawn a process that traps and ignores TERM
+    bash -c 'trap "" TERM; sleep 30' &
+    target_pid=$!
+    sleep 0.2
+
+    # Verify it's alive
+    kill -0 "$target_pid" 2>/dev/null || { echo "target process not alive before terminate" >&2; exit 1; }
+
+    _terminate_pid_tree "$target_pid" 1
+
+    # Brief settle — kill -9 is async; real callers always follow with wait $pid
+    sleep 0.2
+
+    # Process should be dead after KILL
+    ! kill -0 "$target_pid" 2>/dev/null || { echo "TERM-ignoring process survived _terminate_pid_tree" >&2; exit 1; }
+) && pass "47. _terminate_pid_tree — TERM-ignoring child gets KILLed after grace" \
+  || fail "47. _terminate_pid_tree — TERM-ignoring child gets KILLed after grace"
+
+# ============================================================
+# Test 48: reviewer-b prompt is path-agnostic
+# ============================================================
+(
+    ! rg -n 'competitive/review-b\.md' "$REPO_ROOT/prompts/reviewer-b.md" >/dev/null 2>&1
+) && pass "48. reviewer-b prompt is path-agnostic" \
+  || fail "48. reviewer-b prompt is path-agnostic"
 
 # ============================================================
 # Summary

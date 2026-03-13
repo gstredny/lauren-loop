@@ -62,7 +62,14 @@ write_prompt_fixtures() {
     mkdir -p "$root/prompts"
     local prompt
     for prompt in exploration-summarizer planner-a planner-b plan-evaluator critic reviser executor reviewer reviewer-b review-evaluator fix-plan-author fix-executor project-rules; do
-        printf 'placeholder for %s\n' "$prompt" > "$root/prompts/${prompt}.md"
+        case "$prompt" in
+            planner-b|reviewer-b)
+                cp "$REPO_ROOT/prompts/${prompt}.md" "$root/prompts/${prompt}.md"
+                ;;
+            *)
+                printf 'placeholder for %s\n' "$prompt" > "$root/prompts/${prompt}.md"
+                ;;
+        esac
     done
 }
 
@@ -77,6 +84,42 @@ write_plan_evaluation_artifact() {
 Checkpoint plan
 EOF
     printf '{"selected_plan_present":true}\n' > "${path%.*}.contract.json"
+}
+
+write_valid_plan_artifact() {
+    local path="$1" title="${2:-Plan Artifact}" change_label="${3:-Update}"
+    cat > "$path" <<EOF
+# ${title}
+
+## Files to Modify
+- \`src/main.py\` — ${change_label}
+
+## Implementation Tasks
+
+\`\`\`xml
+<wave number="1">
+  <task type="auto">
+    <name>Exercise the planning artifact contract</name>
+    <files>src/main.py</files>
+    <action>Describe the production change and the test-first order without writing code.</action>
+    <verify>bash tests/test_lauren_loop_integration.sh</verify>
+    <done>The plan is complete and ready for evaluation.</done>
+  </task>
+</wave>
+\`\`\`
+
+## Testability Design
+- Exercise the shell pipeline through \`lauren_loop_competitive\`.
+
+## Test Strategy
+- Run the shell regression suite around the pipeline phases.
+
+## Risk Assessment
+- Ensure fallback logic does not discard a still-growing valid artifact.
+
+## Dependencies
+- None.
+EOF
 }
 
 write_plan_critique_artifact() {
@@ -376,18 +419,16 @@ mock_run_agent() {
     # Create phase-specific artifacts
     local comp_dir="$_COMP_DIR"
     local task_file="$_TASK_FILE"
-    case "$role" in
+        case "$role" in
         explorer)
             printf '# Exploration Summary\n\nExploration of test codebase.\n' \
                 > "${comp_dir}/exploration-summary.md"
             ;;
         planner-a)
-            printf '# Plan A\n\n## Files to Modify\n\n| File | Change |\n|------|--------|\n| src/main.py | Update |\n' \
-                > "${comp_dir}/plan-a.md"
+            write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
             ;;
         planner-b)
-            printf '# Plan B\n\n## Files to Modify\n\n| File | Change |\n|------|--------|\n| src/main.py | Alternative |\n' \
-                > "${comp_dir}/plan-b.md"
+            write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
             ;;
         evaluator)
             write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
@@ -587,15 +628,15 @@ run_agent() {
     printf '%s\n' "\$role" >> "$TMP_ROOT/sigterm-child.calls"
     mkdir -p "\$(dirname "\$log_file")"
     : > "\$log_file"
-    case "\$role" in
+        case "\$role" in
         explorer)
             printf '# Exploration Summary\n' > "\$COMP_DIR/exploration-summary.md"
             ;;
         planner-a)
-            printf '# Plan A\n\n## Files to Modify\n\n| File | Change |\n|------|--------|\n| src/main.py | Update |\n' > "\$COMP_DIR/plan-a.md"
+            write_valid_plan_artifact "\$COMP_DIR/plan-a.md" "Plan A" "Update"
             ;;
         planner-b)
-            printf '# Plan B\n\n## Files to Modify\n\n| File | Change |\n|------|--------|\n| src/main.py | Alt |\n' > "\$COMP_DIR/plan-b.md"
+            write_valid_plan_artifact "\$COMP_DIR/plan-b.md" "Plan B" "Alt"
             ;;
         evaluator)
             cat > "\$COMP_DIR/plan-evaluation.md" <<'EVALEOF'
@@ -707,12 +748,10 @@ EOF
                     > "${comp_dir}/exploration-summary.md"
                 ;;
             planner-a)
-                printf '# Plan A\n\n## Files to Modify\n\n| File | Change |\n|------|--------|\n| src/main.py | Update |\n' \
-                    > "${comp_dir}/plan-a.md"
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
                 ;;
             planner-b)
-                printf '# Plan B\n\n## Files to Modify\n\n| File | Change |\n|------|--------|\n| src/main.py | Alternative |\n' \
-                    > "${comp_dir}/plan-b.md"
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
                 ;;
             evaluator)
                 write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
@@ -825,6 +864,372 @@ EOF
     [[ -s "${comp_dir}/execution-diff.patch" ]]
 ) && pass "5. Checkpoint resume — executor failure + re-run skips completed phases" \
   || fail "5. Checkpoint resume — executor failure + re-run skips completed phases"
+
+# ============================================================
+# Test 6: Planner B watcher fallback — pipeline continues with planner A only
+# ============================================================
+(
+    root="$(setup_integration_fixture "planner-b-fallback")"
+    slug="integ-planner-b-fallback"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Claude survivor"
+                ;;
+            planner-b)
+                printf 'ARTIFACT_WRITTEN\n' > "${comp_dir}/plan-b.md"
+                return 65
+                ;;
+            executor|fix-executor*)
+                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
+                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Planner B fallback test") >/dev/null 2>&1
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    grep -q 'Single plan (plan-a.md) seeded' "$task_file"
+    grep -q '^ARTIFACT_WRITTEN$' "${comp_dir}/plan-b.md"
+    grep -q '^# Plan A$' "${comp_dir}/revised-plan.md"
+) && pass "6. Planner B watcher fallback — pipeline continues with planner A only" \
+  || fail "6. Planner B watcher fallback — pipeline continues with planner A only"
+
+# ============================================================
+# Test 7: Reviewer B watcher fallback — pipeline continues with reviewer A only
+# ============================================================
+(
+    root="$(setup_integration_fixture "reviewer-b-fallback")"
+    slug="integ-reviewer-b-fallback"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
+                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                printf 'ARTIFACT_WRITTEN\n' > "${comp_dir}/reviewer-b.raw.md"
+                return 65
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Reviewer B fallback test") >/dev/null 2>&1
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    grep -q 'review-b=absent' "${comp_dir}/.review-mapping"
+    grep -q '^ARTIFACT_WRITTEN$' "${comp_dir}/reviewer-b.raw.md"
+) && pass "7. Reviewer B watcher fallback — pipeline continues with reviewer A only" \
+  || fail "7. Reviewer B watcher fallback — pipeline continues with reviewer A only"
+
+# ============================================================
+# Test 8: Planner B backstop — slow Codex planner is killed after 2x Claude
+# ============================================================
+(
+    root="$(setup_integration_fixture "planner-b-backstop")"
+    slug="integ-planner-b-backstop"
+    set_integration_globals "$root"
+    ENGINE_PLANNER_B="codex"
+    PLANNER_TIMEOUT="10s"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    log_dir="$task_dir/logs"
+    task_file="$task_dir/task.md"
+    kill_marker="$TMP_ROOT/planner-b-backstop.killed"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Claude survivor"
+                sleep 1
+                ;;
+            planner-b)
+                trap 'printf "killed\n" > "'"$kill_marker"'"; exit 143' TERM
+                sleep 10
+                ;;
+            executor|fix-executor*)
+                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
+                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    start_ts=$(date +%s)
+    (cd "$root" && lauren_loop_competitive "$slug" "Planner B backstop test") >/dev/null 2>&1
+    duration=$(( $(date +%s) - start_ts ))
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    [[ "$duration" -lt 6 ]]
+    [[ -f "$kill_marker" ]]
+    grep -q '\[codex-backstop\]' "${log_dir}/planner-b.log"
+) && pass "8. Planner B backstop — slow Codex planner is killed after 2x Claude" \
+  || fail "8. Planner B backstop — slow Codex planner is killed after 2x Claude"
+
+# ============================================================
+# Test 9: Reviewer B backstop — slow Codex reviewer is killed after 2x Claude
+# ============================================================
+(
+    root="$(setup_integration_fixture "reviewer-b-backstop")"
+    slug="integ-reviewer-b-backstop"
+    set_integration_globals "$root"
+    ENGINE_REVIEWER_B="codex"
+    REVIEWER_TIMEOUT="10s"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    log_dir="$task_dir/logs"
+    task_file="$task_dir/task.md"
+    kill_marker="$TMP_ROOT/reviewer-b-backstop.killed"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
+                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                sleep 1
+                ;;
+            reviewer-b*)
+                trap 'printf "killed\n" > "'"$kill_marker"'"; exit 143' TERM
+                sleep 10
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    start_ts=$(date +%s)
+    (cd "$root" && lauren_loop_competitive "$slug" "Reviewer B backstop test") >/dev/null 2>&1
+    duration=$(( $(date +%s) - start_ts ))
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    [[ "$duration" -lt 7 ]]
+    [[ -f "$kill_marker" ]]
+    grep -q '\[codex-backstop\]' "${log_dir}/reviewer-b.log"
+    grep -q 'review-b=absent' "${comp_dir}/.review-mapping"
+) && pass "9. Reviewer B backstop — slow Codex reviewer is killed after 2x Claude" \
+  || fail "9. Reviewer B backstop — slow Codex reviewer is killed after 2x Claude"
+
+# ============================================================
+# Test 10: Claude planner fails — Codex gets full phase timeout, no backstop arms
+# ============================================================
+(
+    root="$(setup_integration_fixture "no-backstop-on-claude-fail")"
+    slug="integ-no-backstop-on-claude-fail"
+    set_integration_globals "$root"
+    ENGINE_PLANNER_A="claude"
+    ENGINE_PLANNER_B="codex"
+    PLANNER_TIMEOUT="10s"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    log_dir="$task_dir/logs"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                # Claude fails: exit 1 with invalid artifact
+                printf 'incomplete garbage\n' > "${comp_dir}/plan-a.md"
+                return 1
+                ;;
+            planner-b)
+                # Codex succeeds (simulates needing a couple seconds)
+                : > "${log_dir}/planner-b.log"
+                sleep 1
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Codex plan"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
+                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "No backstop on Claude fail") >/dev/null 2>&1
+
+    # Assert: no backstop log entry for planner-b (Claude failed, so backstop should not arm)
+    [[ -f "${log_dir}/planner-b.log" ]]
+    ! grep -q '\[codex-backstop\]' "${log_dir}/planner-b.log" || {
+        echo "backstop should not have armed when Claude planner failed" >&2; exit 1; }
+
+    # Assert: pipeline completed (Codex plan survived as single-plan path)
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+) && pass "10. Claude planner fails — Codex gets full timeout, no backstop arms" \
+  || fail "10. Claude planner fails — Codex gets full timeout, no backstop arms"
+
+# ============================================================
+# Test 10b: review cycle artifacts are snapshotted with cycle-numbered filenames
+# ============================================================
+(
+    root="$(setup_integration_fixture "review-cycle-snapshot")"
+    slug="integ-review-cycle-snapshot"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
+                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Review artifact snapshot test") >/dev/null 2>&1
+
+    [[ -f "${comp_dir}/reviewer-b.raw.cycle1.md" ]]
+    [[ -f "${comp_dir}/review-a.cycle1.md" ]]
+    [[ -f "${comp_dir}/review-b.cycle1.md" ]]
+    [[ -f "${comp_dir}/.review-mapping.cycle1" ]]
+    grep -q '^# Review B$' "${comp_dir}/reviewer-b.raw.cycle1.md"
+) && pass "10b. review cycle artifacts are snapshotted with cycle-numbered filenames" \
+  || fail "10b. review cycle artifacts are snapshotted with cycle-numbered filenames"
 
 # ============================================================
 # Summary

@@ -23,36 +23,16 @@ INTERNAL=false
 FORCE_RERUN=false
 AGENT_SETTINGS='{"disableAllHooks":true}'
 ## Pricing constants + CSV headers — now in lib/lauren-loop-utils.sh
-# Source context guard (optional — enables Azure Foundry routing)
-if [[ -f "$HOME/.claude/scripts/context-guard.sh" ]]; then
-  source "$HOME/.claude/scripts/context-guard.sh"
-  if type setup_azure_context &>/dev/null && setup_azure_context; then
-    echo -e "${GREEN}[INFO] Azure context guard loaded.${NC}"
-  fi
-fi
-
-# Fallback stubs when context-guard.sh is absent
-if ! type codex54_exec_with_guard &>/dev/null; then
-  codex54_exec_with_guard() {
-    # Strip --profile arg if present (not needed without Azure routing)
-    if [[ "${1:-}" == "--profile" ]]; then shift 2; fi
-    command codex exec "$@"
-  }
-  echo -e "${YELLOW}[WARN] No context-guard.sh — codex calls use vanilla 'codex exec'.${NC}" >&2
-fi
-if ! type setup_azure_context &>/dev/null; then
-  setup_azure_context() { return 0; }
-fi
-
+source "$HOME/.claude/scripts/context-guard.sh"
 source "$SCRIPT_DIR/lib/lauren-loop-utils.sh"
 
 # Source project config (optional overrides)
 [[ -f "$SCRIPT_DIR/.lauren-loop.conf" ]] && source "$SCRIPT_DIR/.lauren-loop.conf"
 
 # Config-driven project values (fallback defaults if conf doesn't set them)
-PROJECT_NAME="${PROJECT_NAME:-$(basename "${LAUREN_LOOP_PROJECT_DIR:-$SCRIPT_DIR}")}"
-TEST_CMD="${TEST_CMD:-pytest tests/ -x -q}"
-LINT_CMD="${LINT_CMD:-flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
+PROJECT_NAME="${PROJECT_NAME:-AskGeorge}"
+TEST_CMD="${TEST_CMD:-.venv/bin/python -m pytest tests/ -x -q}"
+LINT_CMD="${LINT_CMD:-.venv/bin/python -m flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
 
 # Config-backed defaults
 MODEL="${LAUREN_LOOP_MODEL:-opus}"
@@ -67,9 +47,13 @@ case "$(echo "$_raw_strict" | tr '[:upper:]' '[:lower:]')" in
 esac
 unset _raw_strict
 LAUREN_LOOP_MAX_COST="${LAUREN_LOOP_MAX_COST:-0}"
+LAUREN_LOOP_EFFECTIVE_STRICT="${LAUREN_LOOP_EFFECTIVE_STRICT:-$LAUREN_LOOP_STRICT}"
+LAUREN_LOOP_AUTO_STRICT="${LAUREN_LOOP_AUTO_STRICT:-false}"
+LAUREN_LOOP_AUTO_STRICT_REASON="${LAUREN_LOOP_AUTO_STRICT_REASON:-}"
 LAUREN_LOOP_CODEX_MODEL="${LAUREN_LOOP_CODEX_MODEL:-gpt-5.4}"
 LAUREN_LOOP_CODEX_PROFILE_HIGH="${LAUREN_LOOP_CODEX_PROFILE_HIGH:-azure54}"
 LAUREN_LOOP_CODEX_PROFILE_MEDIUM="${LAUREN_LOOP_CODEX_PROFILE_MEDIUM:-azure54med}"
+CODEX_ARTIFACT_PATH_PLACEHOLDER="__LAUREN_LOOP_ARTIFACT_PATH__"
 PROJECT_RULES=$(cat "$SCRIPT_DIR/prompts/project-rules.md" 2>/dev/null || echo "")
 [[ -z "$PROJECT_RULES" ]] && echo -e "${YELLOW}WARN: prompts/project-rules.md missing — agents will run without project constraints${NC}"
 ENGINE_EXPLORE="${ENGINE_EXPLORE:-claude}"        # Phase 1
@@ -259,9 +243,45 @@ _reasoning_effort_for_engine() {
 
     case "$profile" in
         "$LAUREN_LOOP_CODEX_PROFILE_MEDIUM") echo "medium" ;;
-        "$LAUREN_LOOP_CODEX_PROFILE_HIGH"|"" ) echo "high" ;;
+        "$LAUREN_LOOP_CODEX_PROFILE_HIGH"|"" ) echo "xhigh" ;;
         *) echo "unknown" ;;
     esac
+}
+
+_task_auto_strict_reason() {
+    local slug="$1" goal="$2"
+    local haystack="${slug} ${goal}"
+
+    if printf '%s\n' "$haystack" | grep -Eqi '(^|[^[:alnum:]_])((prod(uction)?[ -]?(cutover|deploy(ment)?|rollout))|(deploy(ment)?)|(cutover))([^[:alnum:]_]|$)'; then
+        printf 'deployment or production-cutover keyword in slug/goal\n'
+        return 0
+    fi
+
+    if printf '%s\n' "$haystack" | grep -Eqi '(^|[^[:alnum:]_])((security)|(secret|secrets)|(credential|credentials)|(key[ -]?vault)|(rbac))([^[:alnum:]_]|$)'; then
+        printf 'security-sensitive keyword in slug/goal\n'
+        return 0
+    fi
+
+    return 1
+}
+
+_apply_effective_strict_mode() {
+    local slug="$1" goal="$2"
+    local auto_reason=""
+
+    LAUREN_LOOP_EFFECTIVE_STRICT="$LAUREN_LOOP_STRICT"
+    LAUREN_LOOP_AUTO_STRICT="false"
+    LAUREN_LOOP_AUTO_STRICT_REASON=""
+
+    if [[ "$LAUREN_LOOP_STRICT" == "true" ]]; then
+        return 0
+    fi
+
+    if auto_reason=$(_task_auto_strict_reason "$slug" "$goal"); then
+        LAUREN_LOOP_EFFECTIVE_STRICT="true"
+        LAUREN_LOOP_AUTO_STRICT="true"
+        LAUREN_LOOP_AUTO_STRICT_REASON="$auto_reason"
+    fi
 }
 
 _codex_attempt_indicates_capacity_failure() {
@@ -270,32 +290,252 @@ _codex_attempt_indicates_capacity_failure() {
     grep -Eqi 'too_many_requests|no_capacity|rate.limit' "$attempt_log"
 }
 
-_run_codex_agent_attempt() {
-    local profile="$1" prompt="$2" output_file="$3" log_file="$4" timeout="$5"
+_codex_attempt_indicates_stream_failure() {
+    local attempt_log="$1"
+    [[ -f "$attempt_log" ]] || return 1
+    grep -Eqi 'content_filter' "$attempt_log" && return 1
+    _codex_attempt_indicates_capacity_failure "$attempt_log" && return 1
+    grep -Eqi 'response\.failed|stream disconnected' "$attempt_log"
+}
 
-    : > "$log_file"
-    [[ -n "$output_file" ]] && rm -f "$output_file"
+_codex_attempt_fallback_reason() {
+    local attempt_log="$1" exit_code="${2:-1}"
+    [[ -f "$attempt_log" ]] || return 1
 
-    if [[ ${#prompt} -gt 10240 ]]; then
-        echo "$prompt" | _timeout "$timeout" codex54_exec_with_guard --profile "$profile" - \
-            -o "$output_file" >> "$log_file" 2>&1
+    if [[ "$exit_code" -eq 2 ]] || _codex_attempt_indicates_capacity_failure "$attempt_log"; then
+        printf 'capacity\n'
+        return 0
+    fi
+
+    if _codex_attempt_indicates_stream_failure "$attempt_log"; then
+        printf 'stream\n'
+        return 0
+    fi
+
+    return 1
+}
+
+_codex_attempt_artifact_path() {
+    local canonical_file="$1"
+    local attempt_number="$2"
+    local extension=""
+    local stem="$canonical_file"
+
+    if [[ "$canonical_file" == *.* ]]; then
+        extension=".${canonical_file##*.}"
+        stem="${canonical_file%${extension}}"
+    fi
+
+    printf '%s.attempt-%s%s\n' "$stem" "$attempt_number" "$extension"
+}
+
+_codex_summary_path_for_log() {
+    local role_log="$1"
+    printf '%s.summary.txt\n' "${role_log%.log}"
+}
+
+_codex_attempt_summary_path() {
+    local role_log="$1"
+    local attempt_number="$2"
+    printf '%s.attempt-%s.summary.txt\n' "${role_log%.log}" "$attempt_number"
+}
+
+_codex_prompt_with_artifact_path() {
+    local prompt="$1"
+    local artifact_path="$2"
+
+    if [[ "$prompt" == *"$CODEX_ARTIFACT_PATH_PLACEHOLDER"* ]]; then
+        printf '%s' "${prompt//$CODEX_ARTIFACT_PATH_PLACEHOLDER/$artifact_path}"
     else
-        _timeout "$timeout" codex54_exec_with_guard --profile "$profile" "$prompt" \
-            -o "$output_file" >> "$log_file" 2>&1
+        printf '%s' "$prompt"
     fi
 }
 
-_process_alive() {
-    local pid="$1"
-    [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-    if [[ -d "/proc/$pid" ]]; then
+_codex_attempt_artifact_state() {
+    local role="$1"
+    local exit_code="$2"
+    local artifact_file="$3"
+
+    if _validate_agent_output_for_role "$role" "$artifact_file" >/dev/null 2>&1; then
+        if [[ "$exit_code" -eq 0 ]]; then
+            printf 'valid\n'
+        else
+            printf 'complete_fallback\n'
+        fi
+    else
+        printf 'partial_or_invalid\n'
+    fi
+}
+
+_latest_codex_attempt_artifact() {
+    local canonical_file="$1"
+    local extension=""
+    local stem="$canonical_file"
+    local artifact_dir="" artifact_base="" candidate="" attempt_number=""
+    local highest_attempt=-1
+    local latest_artifact=""
+
+    if [[ "$canonical_file" == *.* ]]; then
+        extension=".${canonical_file##*.}"
+        stem="${canonical_file%${extension}}"
+    fi
+
+    artifact_dir=$(dirname "$canonical_file")
+    artifact_base=$(basename "$stem")
+
+    for candidate in "$artifact_dir"/"${artifact_base}.attempt-"*"$extension"; do
+        [[ -f "$candidate" ]] || continue
+        attempt_number=$(basename "$candidate")
+        attempt_number="${attempt_number#${artifact_base}.attempt-}"
+        attempt_number="${attempt_number%${extension}}"
+        [[ "$attempt_number" =~ ^[0-9]+$ ]] || continue
+        if (( attempt_number > highest_attempt )); then
+            highest_attempt=$attempt_number
+            latest_artifact="$candidate"
+        fi
+    done
+
+    [[ -n "$latest_artifact" ]] && printf '%s\n' "$latest_artifact"
+}
+
+_resolve_live_codex_artifact_candidate() {
+    local role="$1"
+    local canonical_file="$2"
+    local latest_attempt=""
+
+    [[ -n "$canonical_file" ]] || return 1
+    if ! _codex_role_uses_tool_written_artifact "$role"; then
+        printf '%s\n' "$canonical_file"
         return 0
     fi
-    kill -0 "$pid" 2>/dev/null
+
+    latest_attempt=$(_latest_codex_attempt_artifact "$canonical_file")
+    if [[ -n "$latest_attempt" ]]; then
+        printf '%s\n' "$latest_attempt"
+    else
+        printf '%s\n' "$canonical_file"
+    fi
+}
+
+_run_codex_agent_attempt() {
+    local role="$1" profile="$2" prompt="$3" artifact_file="$4" attempt_log="$5" role_log="$6" timeout="$7" summary_file="${8:-}"
+    local timeout_flag watcher_flag watcher_pid="" watchdog_pid="" cmd_pid="" exit_code=0
+    local codex_output_file="$artifact_file" timeout_seconds=""
+
+    : > "$attempt_log"
+
+    timeout_flag=$(mktemp "${TMPDIR:-/tmp}/lauren-loop-codex-timeout.XXXXXX") || return 1
+    watcher_flag=$(mktemp "${TMPDIR:-/tmp}/lauren-loop-codex-watch.XXXXXX") || {
+        rm -f "$timeout_flag"
+        return 1
+    }
+    rm -f "$timeout_flag" "$watcher_flag"
+
+    if _codex_role_uses_tool_written_artifact "$role"; then
+        [[ "$artifact_file" != "/dev/null" ]] && rm -f "$artifact_file"
+        if [[ -z "$summary_file" ]]; then
+            summary_file=$(_codex_summary_path_for_log "$role_log")
+        fi
+        rm -f "$summary_file"
+        codex_output_file="$summary_file"
+    else
+        [[ "$artifact_file" != "/dev/null" ]] && rm -f "$artifact_file"
+    fi
+
+    if [[ ${#prompt} -gt 10240 ]]; then
+        (
+            set -o pipefail
+            printf '%s' "$prompt" | codex54_exec_with_guard --profile "$profile" - -o "$codex_output_file" 2>&1 | tee -a "$attempt_log" >> "$role_log"
+        ) &
+    else
+        (
+            set -o pipefail
+            codex54_exec_with_guard --profile "$profile" "$prompt" \
+                -o "$codex_output_file" 2>&1 | tee -a "$attempt_log" >> "$role_log"
+        ) &
+    fi
+    cmd_pid=$!
+
+    if _codex_role_uses_tool_written_artifact "$role"; then
+        _watch_codex_artifact_for_static_invalid "$role" "$artifact_file" "$cmd_pid" "$watcher_flag" "$role_log" &
+        watcher_pid=$!
+    fi
+
+    timeout_seconds=$(_duration_to_seconds "$timeout")
+    (
+        sleep "$timeout_seconds"
+        if kill -0 "$cmd_pid" 2>/dev/null; then
+            : > "$timeout_flag"
+            _terminate_pid_tree "$cmd_pid"
+        fi
+    ) &
+    watchdog_pid=$!
+
+    wait "$cmd_pid" 2>/dev/null || exit_code=$?
+
+    if [[ -n "$watcher_pid" ]]; then
+        kill "$watcher_pid" 2>/dev/null || true
+        wait "$watcher_pid" 2>/dev/null || true
+    fi
+    if [[ -n "$watchdog_pid" ]]; then
+        kill "$watchdog_pid" 2>/dev/null || true
+        wait "$watchdog_pid" 2>/dev/null || true
+    fi
+
+    if [[ -f "$timeout_flag" ]]; then
+        exit_code=124
+    fi
+    if [[ -f "$watcher_flag" ]]; then
+        exit_code=65
+    fi
+
+    rm -f "$timeout_flag" "$watcher_flag"
+    return "$exit_code"
+}
+
+_enforce_codex_phase_backstop() {
+    local pid="$1" role="$2" codex_start_ts="$3" timeout="$4" claude_duration="$5" log_file="$6" artifact_file="${7:-}"
+    local timeout_seconds phase_deadline claude_deadline cutoff_epoch poll_interval now live_artifact=""
+
+    (( claude_duration < 1 )) && claude_duration=1
+    timeout_seconds=$(_duration_to_seconds "$timeout")
+    phase_deadline=$((codex_start_ts + timeout_seconds))
+    claude_deadline=$((codex_start_ts + (claude_duration * 2)))
+    cutoff_epoch=$phase_deadline
+    if (( claude_deadline < cutoff_epoch )); then
+        cutoff_epoch=$claude_deadline
+    fi
+    poll_interval=$(_agent_poll_interval_seconds)
+
+    while kill -0 "$pid" 2>/dev/null; do
+        now=$(date +%s)
+        if (( now >= cutoff_epoch )); then
+            printf '[codex-backstop] role=%s claude_duration_sec=%s cutoff_epoch=%s\n' \
+                "$role" "$claude_duration" "$cutoff_epoch" >> "$log_file"
+            _terminate_pid_tree "$pid"
+            # TOCTOU guard: process may have completed naturally before TERM arrived
+            live_artifact=$(_resolve_live_codex_artifact_candidate "$role" "$artifact_file")
+            if [[ -n "$live_artifact" ]] && _validate_agent_output_for_role "$role" "$live_artifact" >/dev/null 2>&1; then
+                printf '[codex-backstop] role=%s artifact valid after termination — treating as natural completion\n' \
+                    "$role" >> "$log_file"
+                return 0
+            fi
+            return 1
+        fi
+        sleep "$poll_interval"
+    done
+
+    return 0
+}
+
+_read_pid_file() {
+    local pid_file="$1"
+    tr -d '[:space:]' < "$pid_file" 2>/dev/null
 }
 
 _read_lock_pid() {
-    cat "$LOCK_DIR/pid" 2>/dev/null | tr -d '[:space:]'
+    local slug="${1:-$SLUG}"
+    _read_pid_file "$LOCK_DIR/$slug/pid"
 }
 
 _lock_dir_mtime_epoch() {
@@ -305,60 +545,213 @@ _lock_dir_mtime_epoch() {
     printf '%s\n' "$mtime"
 }
 
+_lock_dir_recent_age_seconds() {
+    local dir="$1"
+    local now=""
+    local lock_mtime=0
+    now=$(date +%s)
+    lock_mtime=$(_lock_dir_mtime_epoch "$dir" 2>/dev/null || echo 0)
+    [[ "$lock_mtime" =~ ^[0-9]+$ ]] || return 1
+    (( lock_mtime > 0 )) || return 1
+    local lock_age=$((now - lock_mtime))
+    if (( lock_age < 30 )); then
+        printf '%s\n' "$lock_age"
+        return 0
+    fi
+    return 1
+}
+
+_warn_dirty_working_tree_files() {
+    local dirty_files=""
+    command -v git >/dev/null 2>&1 || return 0
+    git rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 0
+    dirty_files=$(
+        {
+            git diff --name-only 2>/dev/null || true
+            git diff --cached --name-only 2>/dev/null || true
+        } | sort -u
+    )
+    [[ -n "$dirty_files" ]] || return 0
+
+    echo -e "${YELLOW}Files currently modified in working tree:${NC}"
+    echo "$dirty_files" | while read -r f; do echo "  $f"; done
+    echo -e "${YELLOW}Parallel instances touching these files may cause git conflicts.${NC}"
+}
+
+_finalize_lock_acquisition() {
+    local slug_dir="$1"
+    if [[ -n "${GOAL:-}" ]]; then
+        _atomic_write "$slug_dir/goal" "$GOAL" || return 1
+    else
+        rm -f "$slug_dir/goal" 2>/dev/null || true
+    fi
+
+    _LOCK_ACQUIRED=true
+    [[ -n "${SLUG:-}" ]] && { _check_cross_version_lock "v2" "$SLUG" || true; }
+
+    # Show other running V2 instances (if any)
+    local others=""
+    others=$(_list_running_v2_instances | grep -v "^${SLUG}	" || true)
+    if [[ -n "$others" ]]; then
+        echo -e "${YELLOW}Other V2 instances currently running:${NC}"
+        while IFS=$'\t' read -r other_slug other_pid other_goal; do
+            echo -e "  ${BLUE}${other_slug}${NC} (PID ${other_pid}) - ${other_goal:-<no goal>}"
+        done <<< "$others"
+    fi
+
+    _warn_dirty_working_tree_files
+}
+
+_claim_stale_lock_recovery() {
+    local slug_dir="$1"
+    local reclaim_dir="$slug_dir/.reclaim"
+    local reclaim_pid=""
+    local reclaim_age=""
+    local claim_attempt
+
+    for claim_attempt in 1 2; do
+        if mkdir "$reclaim_dir" 2>/dev/null; then
+            if ! _atomic_write "$reclaim_dir/pid" "$$"; then
+                rm -rf "$reclaim_dir"
+                echo -e "${RED}Failed to initialize stale lock recovery marker at ${reclaim_dir}.${NC}"
+                return 1
+            fi
+            return 0
+        fi
+
+        if [[ ! -d "$reclaim_dir" ]]; then
+            echo -e "${RED}Failed to claim stale lock recovery at ${reclaim_dir}.${NC}"
+            return 1
+        fi
+
+        reclaim_pid=$(_read_pid_file "$reclaim_dir/pid")
+        if [[ -n "$reclaim_pid" ]] && _process_alive "$reclaim_pid"; then
+            echo -e "${YELLOW}Stale lock recovery already in progress for '${SLUG}' (PID $reclaim_pid). Exiting.${NC}"
+            return 2
+        fi
+
+        reclaim_age=$(_lock_dir_recent_age_seconds "$reclaim_dir" 2>/dev/null || true)
+        if [[ "$reclaim_age" =~ ^[0-9]+$ ]]; then
+            echo -e "${YELLOW}Stale lock recovery is still initializing (${reclaim_age}s old). Exiting.${NC}"
+            return 2
+        fi
+
+        rm -rf "$reclaim_dir" || {
+            echo -e "${RED}Failed to remove stale lock recovery marker at ${reclaim_dir}.${NC}"
+            return 1
+        }
+    done
+
+    echo -e "${YELLOW}Another process claimed stale lock recovery for '${SLUG}'. Exiting.${NC}"
+    return 2
+}
+
 acquire_lock() {
     if [ "$INTERNAL" = true ]; then
         return 0  # Parent holds the lock
     fi
 
+    if [[ "$SLUG" == */* ]]; then
+        printf 'ERROR: SLUG contains / - this is not supported\n' >&2
+        exit 1
+    fi
+
+    local slug_dir="$LOCK_DIR/$SLUG"
+    local reclaim_dir="$slug_dir/.reclaim"
+
+    # Create parent dir (non-exclusive; safe for concurrent instances)
+    mkdir -p "$LOCK_DIR" 2>/dev/null || true
+
     local attempt
     for attempt in 1 2; do
-        if mkdir "$LOCK_DIR" 2>/dev/null; then
-            local pid_tmp="$LOCK_DIR/pid.tmp.$$"
-            if ! printf '%s\n' "$$" > "$pid_tmp" || ! mv "$pid_tmp" "$LOCK_DIR/pid"; then
-                rm -f "$pid_tmp"
-                rm -rf "$LOCK_DIR"
-                echo -e "${RED}Failed to initialize lauren-loop-v2 lock at ${LOCK_DIR}.${NC}"
+        # Atomic per-slug lock via mkdir
+        if mkdir "$slug_dir" 2>/dev/null; then
+            if ! _atomic_write "$slug_dir/pid" "$$"; then
+                rm -rf "$slug_dir"
+                echo -e "${RED}Failed to initialize lauren-loop-v2 lock at ${slug_dir}.${NC}"
                 return 1
             fi
-            [[ -n "${SLUG:-}" ]] && echo "$SLUG" > "$LOCK_DIR/slug"
-            _LOCK_ACQUIRED=true
-            [[ -n "${SLUG:-}" ]] && { _check_cross_version_lock "v2" "$SLUG" || true; }
+            if ! _finalize_lock_acquisition "$slug_dir"; then
+                rm -rf "$slug_dir"
+                echo -e "${RED}Failed to finalize lauren-loop-v2 lock at ${slug_dir}.${NC}"
+                return 1
+            fi
+
             return 0
         fi
 
-        if [[ ! -d "$LOCK_DIR" ]]; then
-            echo -e "${RED}Failed to acquire lauren-loop-v2 lock at ${LOCK_DIR}.${NC}"
+        if [[ ! -d "$slug_dir" ]]; then
+            echo -e "${RED}Failed to acquire lauren-loop-v2 lock at ${slug_dir}.${NC}"
             exit 1
         fi
 
+        # Slug dir exists — check if owner is alive
         local lock_pid=""
-        lock_pid=$(_read_lock_pid)
+        lock_pid=$(_read_lock_pid "$SLUG")
         if [[ -n "$lock_pid" ]] && _process_alive "$lock_pid"; then
-            echo -e "${RED}Another lauren-loop-v2.sh is running (PID $lock_pid). Exiting.${NC}"
+            echo -e "${RED}Already running '${SLUG}' (PID $lock_pid). Exiting.${NC}"
             return 1
         fi
 
+        # Stale lock recovery
         if [[ -z "$lock_pid" ]]; then
-            local lock_mtime=0
-            local now
-            now=$(date +%s)
-            lock_mtime=$(_lock_dir_mtime_epoch "$LOCK_DIR" 2>/dev/null || echo 0)
-            if [[ "$lock_mtime" =~ ^[0-9]+$ ]] && (( lock_mtime > 0 )); then
-                local lock_age=$((now - lock_mtime))
-                if (( lock_age < 30 )); then
-                    echo -e "${YELLOW}Lock directory is still initializing (${lock_age}s old). Exiting.${NC}"
+            local lock_age=""
+            lock_age=$(_lock_dir_recent_age_seconds "$slug_dir" 2>/dev/null || true)
+            if [[ "$lock_age" =~ ^[0-9]+$ ]]; then
+                echo -e "${YELLOW}Lock directory is still initializing (${lock_age}s old). Exiting.${NC}"
+                return 1
+            fi
+            echo -e "${YELLOW}Stale lock directory found (${slug_dir}; PID missing after initialization window). Reclaiming.${NC}"
+        else
+            echo -e "${YELLOW}Stale lock directory found (${slug_dir}; PID ${lock_pid} not running). Reclaiming.${NC}"
+        fi
+
+        local reclaim_rc=0
+        _claim_stale_lock_recovery "$slug_dir" || reclaim_rc=$?
+        if [[ "$reclaim_rc" -ne 0 ]]; then
+            if [[ "$reclaim_rc" -eq 2 ]]; then
+                return 1
+            fi
+            echo -e "${RED}Failed to claim stale lock directory at ${slug_dir}.${NC}"
+            return 1
+        fi
+
+        local verified_pid=""
+        if _atomic_write "$slug_dir/pid" "$$"; then
+            verified_pid=$(_read_lock_pid "$SLUG")
+            if [[ "$verified_pid" == "$$" ]]; then
+                rm -rf "$reclaim_dir"
+                if ! _finalize_lock_acquisition "$slug_dir"; then
+                    rm -rf "$slug_dir"
+                    echo -e "${RED}Failed to finalize reclaimed lauren-loop-v2 lock at ${slug_dir}.${NC}"
                     return 1
                 fi
+                return 0
             fi
-            echo -e "${YELLOW}Stale lock directory found (${LOCK_DIR}; PID missing after initialization window). Removing.${NC}"
-        else
-            echo -e "${YELLOW}Stale lock directory found (${LOCK_DIR}; PID ${lock_pid} not running). Removing.${NC}"
+
+            rm -rf "$reclaim_dir"
+            echo -e "${YELLOW}Another process won stale lock recovery for '${SLUG}'. Exiting.${NC}"
+            return 1
         fi
 
-        rm -rf "$LOCK_DIR" || {
-            echo -e "${RED}Failed to remove stale lock directory at ${LOCK_DIR}.${NC}"
+        echo -e "${YELLOW}Stale lock directory could not rewrite ${slug_dir}/pid. Recreating lock directory.${NC}"
+        rm -rf "$slug_dir" || {
+            echo -e "${RED}Failed to remove unrecoverable stale lock directory at ${slug_dir}.${NC}"
             return 1
         }
+
+        if mkdir "$slug_dir" 2>/dev/null; then
+            if _atomic_write "$slug_dir/pid" "$$"; then
+                if ! _finalize_lock_acquisition "$slug_dir"; then
+                    rm -rf "$slug_dir"
+                    echo -e "${RED}Failed to finalize recreated lauren-loop-v2 lock at ${slug_dir}.${NC}"
+                    return 1
+                fi
+                return 0
+            fi
+
+            rm -rf "$slug_dir"
+        fi
     done
 
     echo -e "${RED}Failed to acquire lauren-loop-v2 lock after stale-lock recovery.${NC}"
@@ -368,19 +761,21 @@ acquire_lock() {
 release_lock() {
     [[ "$_LOCK_ACQUIRED" == true ]] || return 0
     [[ "$INTERNAL" == true ]] && return 0
-    [[ -d "$LOCK_DIR" ]] || {
+
+    local slug_dir="$LOCK_DIR/$SLUG"
+    [[ -d "$slug_dir" ]] || {
         _LOCK_ACQUIRED=false
         return 0
     }
 
     local lock_pid=""
-    lock_pid=$(_read_lock_pid)
+    lock_pid=$(_read_lock_pid "$SLUG")
     if [[ "$lock_pid" != "$$" ]]; then
-        echo -e "${YELLOW}WARN: Refusing to remove lock at ${LOCK_DIR}; owned by PID ${lock_pid:-unknown}, current PID $$${NC}" >&2
+        echo -e "${YELLOW}WARN: Refusing to remove lock at ${slug_dir}; owned by PID ${lock_pid:-unknown}, current PID $$${NC}" >&2
         return 0
     fi
 
-    rm -rf "$LOCK_DIR"
+    rm -rf "$slug_dir"
     _LOCK_ACQUIRED=false
 }
 
@@ -574,46 +969,115 @@ run_agent() {
             >> "$log_file" 2>&1 || exit_code=$?
 
     elif [[ "$engine" == "codex" ]]; then
-        # GAP (m5): Codex -o may produce empty/missing output if agent fails mid-run.
-        # Keep short stream retries in codex54_exec_with_guard, but do orchestrator-specific
-        # capacity downgrades here so we can log the actual reasoning effort used.
+        # Codex file-authoring roles write the real artifact via tool edits. Keep `-o`
+        # for the final response summary, but direct it to a separate summary file so
+        # it cannot overwrite the real artifact path.
         local codex_profile="$LAUREN_LOOP_CODEX_PROFILE_HIGH"
         local attempt_log=""
-        local capacity_backoff=""
+        local fallback_backoff=""
+        local fallback_reason=""
+        local attempt_number=1
+        local attempt_output_file="$output_file"
+        local attempt_prompt="$prompt"
+        local attempt_summary_file=""
+        local canonical_summary_file=""
+        local attempt_artifact_state="not_applicable"
+        local tool_written_artifact=false
         attempt_log=$(mktemp "${TMPDIR:-/tmp}/lauren-loop-codex-attempt.XXXXXX") || {
             _remove_active_agent_meta "$meta_path"
             echo "ERROR: Failed to create Codex attempt log for $role" >&2
             return 1
         }
 
-        if _run_codex_agent_attempt "$codex_profile" "$prompt" "$output_file" "$attempt_log" "$timeout"; then
+        if _codex_role_uses_tool_written_artifact "$role"; then
+            tool_written_artifact=true
+            canonical_summary_file=$(_codex_summary_path_for_log "$log_file")
+        fi
+
+        if [[ "$tool_written_artifact" == true ]]; then
+            attempt_output_file=$(_codex_attempt_artifact_path "$output_file" "$attempt_number")
+            attempt_prompt=$(_codex_prompt_with_artifact_path "$prompt" "$attempt_output_file")
+            attempt_summary_file=$(_codex_attempt_summary_path "$log_file" "$attempt_number")
+        fi
+
+        if _run_codex_agent_attempt "$role" "$codex_profile" "$attempt_prompt" "$attempt_output_file" "$attempt_log" "$log_file" "$timeout" "$attempt_summary_file"; then
             exit_code=0
         else
             exit_code=$?
         fi
-        printf '[codex-attempt] role=%s profile=%s reasoning=%s\n' \
-            "$role" "$codex_profile" "$reasoning_effort" >> "$log_file"
-        cat "$attempt_log" >> "$log_file"
 
-        if [[ $exit_code -ne 0 ]] && { [[ $exit_code -eq 2 ]] || _codex_attempt_indicates_capacity_failure "$attempt_log"; }; then
+        if [[ "$tool_written_artifact" == true ]]; then
+            attempt_artifact_state=$(_codex_attempt_artifact_state "$role" "$exit_code" "$attempt_output_file")
+            if [[ "$attempt_artifact_state" != "partial_or_invalid" ]] && \
+               ! _atomic_promote_file "$attempt_output_file" "$output_file"; then
+                rm -f "$attempt_log"
+                _remove_active_agent_meta "$meta_path"
+                echo "ERROR: Failed to promote Codex attempt artifact for $role" >&2
+                return 1
+            fi
+            if [[ -n "$attempt_summary_file" && -f "$attempt_summary_file" ]] && \
+               ! _atomic_promote_file "$attempt_summary_file" "$canonical_summary_file"; then
+                rm -f "$attempt_log"
+                _remove_active_agent_meta "$meta_path"
+                echo "ERROR: Failed to promote Codex summary artifact for $role" >&2
+                return 1
+            fi
+        fi
+        printf '[codex-attempt] role=%s profile=%s reasoning=%s attempt=%s artifact_state=%s artifact=%s\n' \
+            "$role" "$codex_profile" "$reasoning_effort" "$attempt_number" "$attempt_artifact_state" "$attempt_output_file" >> "$log_file"
+
+        if [[ "$attempt_artifact_state" == "valid" || "$attempt_artifact_state" == "complete_fallback" ]]; then
+            fallback_reason=""
+        elif fallback_reason=$(_codex_attempt_fallback_reason "$attempt_log" "$exit_code"); then
             codex_profile="$LAUREN_LOOP_CODEX_PROFILE_MEDIUM"
 
-            for capacity_backoff in 15 30 60; do
-                echo "WARN: Codex capacity failure for $role; retrying with profile ${codex_profile} after ${capacity_backoff}s backoff." >> "$log_file"
-                sleep "$capacity_backoff"
+            for fallback_backoff in 15 30 60; do
+                echo "WARN: Codex ${fallback_reason} failure for $role; retrying with profile ${codex_profile} after ${fallback_backoff}s backoff." >> "$log_file"
+                sleep "$fallback_backoff"
                 reasoning_effort=$(_reasoning_effort_for_engine "$engine" "$codex_profile")
                 _set_active_agent_reasoning "$meta_path" "$reasoning_effort" || true
+                attempt_number=$((attempt_number + 1))
+                attempt_output_file="$output_file"
+                attempt_prompt="$prompt"
+                attempt_summary_file=""
+                attempt_artifact_state="not_applicable"
+                if [[ "$tool_written_artifact" == true ]]; then
+                    attempt_output_file=$(_codex_attempt_artifact_path "$output_file" "$attempt_number")
+                    attempt_prompt=$(_codex_prompt_with_artifact_path "$prompt" "$attempt_output_file")
+                    attempt_summary_file=$(_codex_attempt_summary_path "$log_file" "$attempt_number")
+                fi
 
-                if _run_codex_agent_attempt "$codex_profile" "$prompt" "$output_file" "$attempt_log" "$timeout"; then
+                if _run_codex_agent_attempt "$role" "$codex_profile" "$attempt_prompt" "$attempt_output_file" "$attempt_log" "$log_file" "$timeout" "$attempt_summary_file"; then
                     exit_code=0
                 else
                     exit_code=$?
                 fi
-                printf '[codex-attempt] role=%s profile=%s reasoning=%s\n' \
-                    "$role" "$codex_profile" "$reasoning_effort" >> "$log_file"
-                cat "$attempt_log" >> "$log_file"
 
-                if [[ $exit_code -eq 0 ]] || ! _codex_attempt_indicates_capacity_failure "$attempt_log"; then
+                if [[ "$tool_written_artifact" == true ]]; then
+                    attempt_artifact_state=$(_codex_attempt_artifact_state "$role" "$exit_code" "$attempt_output_file")
+                    if [[ "$attempt_artifact_state" != "partial_or_invalid" ]] && \
+                       ! _atomic_promote_file "$attempt_output_file" "$output_file"; then
+                        rm -f "$attempt_log"
+                        _remove_active_agent_meta "$meta_path"
+                        echo "ERROR: Failed to promote Codex retry artifact for $role" >&2
+                        return 1
+                    fi
+                    if [[ -n "$attempt_summary_file" && -f "$attempt_summary_file" ]] && \
+                       ! _atomic_promote_file "$attempt_summary_file" "$canonical_summary_file"; then
+                        rm -f "$attempt_log"
+                        _remove_active_agent_meta "$meta_path"
+                        echo "ERROR: Failed to promote Codex retry summary for $role" >&2
+                        return 1
+                    fi
+                fi
+                printf '[codex-attempt] role=%s profile=%s reasoning=%s attempt=%s artifact_state=%s artifact=%s\n' \
+                    "$role" "$codex_profile" "$reasoning_effort" "$attempt_number" "$attempt_artifact_state" "$attempt_output_file" >> "$log_file"
+
+                if [[ "$attempt_artifact_state" == "valid" || "$attempt_artifact_state" == "complete_fallback" ]]; then
+                    break
+                fi
+
+                if ! fallback_reason=$(_codex_attempt_fallback_reason "$attempt_log" "$exit_code"); then
                     break
                 fi
             done
@@ -814,7 +1278,14 @@ _backup_artifacts_on_force() {
     mkdir -p "$backup_dir"
 
     local artifact
-    for artifact in "$comp_dir"/*.md "$comp_dir"/*.patch "$comp_dir"/*.json; do
+    for artifact in \
+        "$comp_dir"/*.md \
+        "$comp_dir"/*.patch \
+        "$comp_dir"/*.json \
+        "$comp_dir"/.plan-mapping \
+        "$comp_dir"/.review-mapping \
+        "$comp_dir"/.review-mapping.cycle* \
+        "$comp_dir"/.cycle-state.json; do
         [[ -f "$artifact" ]] || continue
         cp "$artifact" "$backup_dir"/
     done
@@ -841,10 +1312,17 @@ _clear_force_artifacts() {
         "$comp_dir/reviewer-b.raw.md" \
         "$comp_dir/review-a.md" \
         "$comp_dir/review-b.md" \
+        "$comp_dir"/reviewer-a.raw.cycle*.md \
+        "$comp_dir"/reviewer-b.raw.cycle*.md \
+        "$comp_dir"/review-a.cycle*.md \
+        "$comp_dir"/review-b.cycle*.md \
+        "$comp_dir"/plan-b.attempt-*.md \
+        "$comp_dir"/reviewer-b.raw.attempt-*.md \
         "$comp_dir/plan-1.md" \
         "$comp_dir/plan-2.md" \
         "$comp_dir/.plan-mapping" \
         "$comp_dir/.review-mapping" \
+        "$comp_dir"/.review-mapping.cycle* \
         "$comp_dir/human-review-handoff.md" \
         "$comp_dir/blinding-metadata.log" \
         "$comp_dir/run-manifest.json" \
@@ -856,7 +1334,7 @@ _clear_force_artifacts() {
         "$comp_dir/fix-plan.contract.json" \
         "$comp_dir/fix-execution.contract.json"
     rm -f "$comp_dir"/fix-diff-cycle*.patch
-    rm -f "$task_log_dir/cost.csv" "$task_log_dir"/.cost-*.csv
+    rm -f "$task_log_dir/cost.csv" "$task_log_dir"/.cost-*.csv "$task_log_dir"/*.summary.txt
 }
 
 _log_diagnostic_lines() {
@@ -1582,25 +2060,25 @@ _v2_select_phase7_scope_plan_file() {
 }
 
 _phase2_planner_artifact_state() {
-    local exit_code="$1" artifact="$2"
-    if [[ "$exit_code" -ne 0 ]]; then
-        printf 'unavailable\n'
+    local role="$1" exit_code="$2" artifact="$3"
+    if _validate_agent_output_for_role "$role" "$artifact" >/dev/null 2>&1; then
+        printf 'valid\n'
         return 0
     fi
-    if _validate_agent_output "$artifact" >/dev/null 2>&1; then
-        printf 'valid\n'
+    if [[ "$exit_code" -ne 0 ]]; then
+        printf 'unavailable\n'
     else
         printf 'corrupt\n'
     fi
 }
 
 _phase2_checkpoint_plan_state() {
-    local artifact="$1"
+    local role="$1" artifact="$2"
     if [[ ! -e "$artifact" ]]; then
         printf 'missing\n'
         return 0
     fi
-    if _validate_agent_output "$artifact" >/dev/null 2>&1; then
+    if _validate_agent_output_for_role "$role" "$artifact" >/dev/null 2>&1; then
         printf 'valid\n'
     else
         printf 'corrupt\n'
@@ -1644,6 +2122,7 @@ _phase7_resume_gate_reason() {
 lauren_loop_competitive() {
     local slug="$1" goal="$2"
     SLUG="$slug"
+    _apply_effective_strict_mode "$slug" "$goal"
 
     # Directory setup
     local task_dir="$(_v2_task_artifact_dir "$slug")"
@@ -1711,6 +2190,11 @@ TASKEOF
         _append_manifest_phase "phase-0" "preflight" "$(_iso_timestamp)" "$(_iso_timestamp)" "skipped" "needs verification" || true
         _finalize_run_manifest "needs verification" 0 || true
         return 0
+    fi
+
+    if [[ "$LAUREN_LOOP_AUTO_STRICT" == "true" ]]; then
+        echo -e "${YELLOW}Auto-enabling strict mode: ${LAUREN_LOOP_AUTO_STRICT_REASON}${NC}"
+        log_execution "$task_file" "Preflight: auto-enabled strict mode (${LAUREN_LOOP_AUTO_STRICT_REASON})"
     fi
 
     # Prompt file paths
@@ -1788,6 +2272,56 @@ TASKEOF
         } > "$tmp_file"
 
         mv "$tmp_file" "$handoff_file"
+    }
+
+    _write_single_planner_handoff() {
+        local surviving_plan="$1"
+        local handoff_file="${comp_dir}/human-review-handoff.md"
+        local tmp_file
+        tmp_file=$(mktemp "${TMPDIR:-/tmp}/planner-handoff.XXXXXX")
+
+        {
+            echo "# Human Review Handoff"
+            echo
+            echo "**Task:** ${task_file}"
+            echo "**Final review verdict:** SINGLE_PLANNER"
+            echo "**Strict mode:** ${LAUREN_LOOP_EFFECTIVE_STRICT}"
+            if [[ "$LAUREN_LOOP_AUTO_STRICT" == "true" ]]; then
+                echo "**Auto-strict reason:** ${LAUREN_LOOP_AUTO_STRICT_REASON}"
+            fi
+            echo
+            echo "## Available Planning Artifact"
+            echo "- Surviving plan: ${surviving_plan}"
+            echo "- Exploration summary: ${comp_dir}/exploration-summary.md"
+            echo "- Planner A log: ${log_dir}/planner-a.log"
+            echo "- Planner B log: ${log_dir}/planner-b.log"
+            echo
+            echo "## Human Reviewer Focus"
+            echo "- Review the surviving plan for missing scope, rollback coverage, and operational safeguards before any execution phase starts."
+            echo "- Compare the surviving plan against ${comp_dir}/exploration-summary.md and the task goal to decide whether to approve, revise, or rerun planning."
+            echo "- Inspect preserved attempt artifacts in ${comp_dir}/plan-b.attempt-*.md if Codex produced partial or alternate plans during retries."
+        } > "$tmp_file"
+
+        mv "$tmp_file" "$handoff_file"
+    }
+
+    _snapshot_review_cycle_artifacts() {
+        local cycle_number="$1"
+        local source_file="" snapshot_file=""
+
+        for source_file in \
+            "${comp_dir}/reviewer-a.raw.md" \
+            "${comp_dir}/reviewer-b.raw.md" \
+            "${comp_dir}/review-a.md" \
+            "${comp_dir}/review-b.md"; do
+            [[ -f "$source_file" ]] || continue
+            snapshot_file="${source_file%.md}.cycle${cycle_number}.md"
+            _atomic_promote_file "$source_file" "$snapshot_file" || return 1
+        done
+
+        if [[ -f "${comp_dir}/.review-mapping" ]]; then
+            _atomic_promote_file "${comp_dir}/.review-mapping" "${comp_dir}/.review-mapping.cycle${cycle_number}" || return 1
+        fi
     }
 
     _mark_fix_execution_handoff() {
@@ -1904,7 +2438,7 @@ EOF
     _classify_diff_risk() {
         local diff_lines=0 has_critical=false
         diff_lines=$(git diff --numstat HEAD 2>/dev/null | awk '{s+=$1+$2}END{print s+0}' || echo 0)
-        if git diff --name-only HEAD 2>/dev/null | grep -qiE '(auth|security|database|migration|\.env)'; then
+        if git diff --name-only HEAD 2>/dev/null | grep -Eqi '(^|/|[-_.])((security)|(secret|secrets)|(credential|credentials)|(keyvault)|(rbac)|(database)|(schema)|(migrations?)|(\.env))($|/|[-_.])'; then
             has_critical=true
         fi
         if [[ "$has_critical" == true ]]; then
@@ -1992,10 +2526,14 @@ Write a detailed implementation plan to ${comp_dir}/plan-a.md."
         local plan_a_prompt_body="$AGENT_PROMPT_BODY"
         local plan_a_sysprompt="$AGENT_SYSTEM_PROMPT"
 
+        local plan_b_output_path="${comp_dir}/plan-b.md"
+        if [[ "$ENGINE_PLANNER_B" == "codex" ]]; then
+            plan_b_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
+        fi
         local plan_b_instruction="Goal: ${goal}
 
 Read the exploration summary at ${comp_dir}/exploration-summary.md and the task file at ${task_file}.
-Write a detailed implementation plan to ${comp_dir}/plan-b.md."
+Write a detailed implementation plan to ${plan_b_output_path}."
         prepare_agent_request "$ENGINE_PLANNER_B" "$planner_b_prompt" "$plan_b_instruction" || {
             _fail_phase "planning" "Failed to assemble planner-b prompt" "Check agent log at ${log_dir}/planner-b.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
         }
@@ -2004,22 +2542,40 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
 
         echo -e "${BLUE}Spawning parallel: planner-a (${ENGINE_PLANNER_A}) + planner-b (${ENGINE_PLANNER_B})${NC}"
 
+        local planner_a_start_ts=0 planner_b_start_ts=0
+        local planner_a_duration=0
+        local planner_b_backstopped=false
+
+        planner_a_start_ts=$(date +%s)
         run_agent "planner-a" "$ENGINE_PLANNER_A" "$plan_a_prompt_body" "$plan_a_sysprompt" \
             "${comp_dir}/plan-a.md" "${log_dir}/planner-a.log" "$PLANNER_TIMEOUT" "100" &
         local pid_a=$!
 
+        planner_b_start_ts=$(date +%s)
         run_agent "planner-b" "$ENGINE_PLANNER_B" "$plan_b_prompt_body" "$plan_b_sysprompt" \
             "${comp_dir}/plan-b.md" "${log_dir}/planner-b.log" "$PLANNER_TIMEOUT" "100" &
         local pid_b=$!
 
         local exit_a=0 exit_b=0
         wait $pid_a || exit_a=$?
+        planner_a_duration=$(( $(date +%s) - planner_a_start_ts ))
+        (( planner_a_duration < 0 )) && planner_a_duration=0
+        if [[ "$ENGINE_PLANNER_A" == "claude" ]] && [[ "$ENGINE_PLANNER_B" == "codex" ]] && \
+           _validate_agent_output_for_role "planner-a" "${comp_dir}/plan-a.md" >/dev/null 2>&1 && \
+           kill -0 "$pid_b" 2>/dev/null; then
+            if ! _enforce_codex_phase_backstop "$pid_b" "planner-b" "$planner_b_start_ts" "$PLANNER_TIMEOUT" "$planner_a_duration" "${log_dir}/planner-b.log" "${comp_dir}/plan-b.md"; then
+                planner_b_backstopped=true
+            fi
+        fi
         wait $pid_b || exit_b=$?
+        if [[ "$planner_b_backstopped" == true ]]; then
+            _append_interrupted_cost_rows TERM || true
+        fi
         _merge_cost_csvs || true
 
         echo -e "${BLUE}Parallel done: A=$exit_a, B=$exit_b${NC}"
 
-        case "$(_phase2_planner_artifact_state "$exit_a" "${comp_dir}/plan-a.md")" in
+        case "$(_phase2_planner_artifact_state "planner-a" "$exit_a" "${comp_dir}/plan-a.md")" in
             valid)
                 plan_a_valid=true
                 ;;
@@ -2031,7 +2587,7 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
                 return 1
                 ;;
         esac
-        case "$(_phase2_planner_artifact_state "$exit_b" "${comp_dir}/plan-b.md")" in
+        case "$(_phase2_planner_artifact_state "planner-b" "$exit_b" "${comp_dir}/plan-b.md")" in
             valid)
                 plan_b_valid=true
                 ;;
@@ -2066,7 +2622,7 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
     local surviving_plan=""
 
     if [[ "$phase2_skipped" == true ]]; then
-        case "$(_phase2_checkpoint_plan_state "${comp_dir}/plan-a.md")" in
+        case "$(_phase2_checkpoint_plan_state "planner-a" "${comp_dir}/plan-a.md")" in
             valid)
                 plan_a_valid=true
                 ;;
@@ -2078,7 +2634,7 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
                 return 1
                 ;;
         esac
-        case "$(_phase2_checkpoint_plan_state "${comp_dir}/plan-b.md")" in
+        case "$(_phase2_checkpoint_plan_state "planner-b" "${comp_dir}/plan-b.md")" in
             valid)
                 plan_b_valid=true
                 ;;
@@ -2102,6 +2658,15 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
 
     if [[ "$plan_a_valid" != true || "$plan_b_valid" != true ]]; then
         [[ "$plan_a_valid" == true ]] && surviving_plan="${comp_dir}/plan-a.md" || surviving_plan="${comp_dir}/plan-b.md"
+        if _strict_contract_mode; then
+            echo -e "${YELLOW}Only one plan produced with effective strict mode — halting for human review${NC}"
+            set_task_status "$task_file" "needs verification"
+            log_execution "$task_file" "Phase 2: Single planner halt (strict=${LAUREN_LOOP_EFFECTIVE_STRICT}, auto_strict=${LAUREN_LOOP_AUTO_STRICT}, surviving_plan=$(basename "$surviving_plan"))"
+            _write_single_planner_handoff "$surviving_plan" || true
+            _finalize_run_manifest "needs verification" 0 || true
+            return 0
+        fi
+
         echo -e "${YELLOW}Only one plan produced — evaluator skipped, surviving plan seeds revised-plan.md${NC}"
         if [[ ! -s "${comp_dir}/revised-plan.md" ]] || [[ "$FORCE_RERUN" == "true" ]]; then
             cp "$surviving_plan" "${comp_dir}/revised-plan.md"
@@ -2410,28 +2975,30 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
         clear_markdown_section "$task_file" "## Review Findings"
         clear_markdown_section "$task_file" "## Review Critique"
 
-        local reviewer_a_prompt_runtime reviewer_b_prompt_runtime
+        local reviewer_a_prompt_runtime
         reviewer_a_prompt_runtime=$(mktemp "${TMPDIR:-/tmp}/reviewer-a.XXXXXX")
         sed "s|\$PROJECT_NAME|$PROJECT_NAME|g" "$reviewer_a_prompt" > "$reviewer_a_prompt_runtime"
-        reviewer_b_prompt_runtime=$(mktemp "${TMPDIR:-/tmp}/reviewer-b.XXXXXX")
-        sed "s|competitive/review-b.md|${comp_dir}/reviewer-b.raw.md|g" "$reviewer_b_prompt" > "$reviewer_b_prompt_runtime"
 
         local review_diff_context="Read the baseline implementation diff at ${baseline_diff}."
         if [[ -n "$latest_fix_diff" ]]; then
             review_diff_context="${review_diff_context} Read the latest fix-cycle diff at ${latest_fix_diff}."
         fi
         local review_a_instruction="Read the task file at ${task_file}. ${review_diff_context} Review all changed files and write findings to ## Review Findings. This is review cycle $((fix_cycle + 1))."
-        local review_b_instruction="Read the task file at ${task_file}. ${review_diff_context} Read ${comp_dir}/exploration-summary.md for context. Write your review to ${comp_dir}/reviewer-b.raw.md. This is review cycle $((fix_cycle + 1))."
+        local review_b_output_path="${comp_dir}/reviewer-b.raw.md"
+        if [[ "$ENGINE_REVIEWER_B" == "codex" ]]; then
+            review_b_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
+        fi
+        local review_b_instruction="Read the task file at ${task_file}. ${review_diff_context} Read ${comp_dir}/exploration-summary.md for context. Write your review to ${review_b_output_path}. This is review cycle $((fix_cycle + 1))."
 
         prepare_agent_request "$ENGINE_REVIEWER_A" "$reviewer_a_prompt_runtime" "$review_a_instruction" || {
-            rm -f "$reviewer_a_prompt_runtime" "$reviewer_b_prompt_runtime"
+            rm -f "$reviewer_a_prompt_runtime"
             _fail_phase "reviewing" "Failed to assemble reviewer-a prompt" "Check agent log at ${log_dir}/reviewer-a*.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
         }
         local reviewer_a_body="$AGENT_PROMPT_BODY"
         local reviewer_a_system="$AGENT_SYSTEM_PROMPT"
 
-        prepare_agent_request "$ENGINE_REVIEWER_B" "$reviewer_b_prompt_runtime" "$review_b_instruction" || {
-            rm -f "$reviewer_a_prompt_runtime" "$reviewer_b_prompt_runtime"
+        prepare_agent_request "$ENGINE_REVIEWER_B" "$reviewer_b_prompt" "$review_b_instruction" || {
+            rm -f "$reviewer_a_prompt_runtime"
             _fail_phase "reviewing" "Failed to assemble reviewer-b prompt" "Check agent log at ${log_dir}/reviewer-b*.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
         }
         local reviewer_b_body="$AGENT_PROMPT_BODY"
@@ -2445,38 +3012,60 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
 
         echo -e "${BLUE}Spawning parallel: ${reviewer_a_role} + ${reviewer_b_role}${NC}"
 
+        local reviewer_a_start_ts=0 reviewer_b_start_ts=0
+        local reviewer_a_duration=0
+        local reviewer_a_usable=false reviewer_b_backstopped=false
+
+        reviewer_a_start_ts=$(date +%s)
         run_agent "$reviewer_a_role" "$ENGINE_REVIEWER_A" "$reviewer_a_body" "$reviewer_a_system" \
             "/dev/null" "$reviewer_a_log" "$REVIEWER_TIMEOUT" "100" &
         local pid_ra=$!
 
+        reviewer_b_start_ts=$(date +%s)
         run_agent "$reviewer_b_role" "$ENGINE_REVIEWER_B" "$reviewer_b_body" "$reviewer_b_system" \
             "${comp_dir}/reviewer-b.raw.md" "$reviewer_b_log" "$REVIEWER_TIMEOUT" "100" &
         local pid_rb=$!
 
         local exit_ra=0 exit_rb=0
         wait $pid_ra || exit_ra=$?
-        wait $pid_rb || exit_rb=$?
-        _merge_cost_csvs || true
-        rm -f "$reviewer_a_prompt_runtime" "$reviewer_b_prompt_runtime"
-        _validate_agent_output "${comp_dir}/reviewer-a.raw.md" || true
-        _validate_agent_output "${comp_dir}/reviewer-b.raw.md" || true
-
-        if [[ "$exit_ra" -ne 0 && "$exit_rb" -ne 0 ]]; then
-            _fail_phase "reviewing" "Both reviewers failed (A=$exit_ra, B=$exit_rb)" "Both reviewers failed. Check ${log_dir}/reviewer-*.log. Retry with --force to re-run from Phase 5"
-        fi
+        reviewer_a_duration=$(( $(date +%s) - reviewer_a_start_ts ))
+        (( reviewer_a_duration < 0 )) && reviewer_a_duration=0
 
         if extract_markdown_section_to_file "$task_file" "## Review Findings" "${comp_dir}/reviewer-a.raw.md"; then
             clear_markdown_section "$task_file" "## Review Findings"
+            if _validate_agent_output_for_role "reviewer-a" "${comp_dir}/reviewer-a.raw.md" >/dev/null 2>&1; then
+                reviewer_a_usable=true
+            fi
         else
             grep -i 'review.findings' "$task_file" | head -5 | while IFS= read -r _line; do
                 log_execution "$task_file" "  diagnostic: found heading: $_line"
             done
         fi
 
+        if [[ "$ENGINE_REVIEWER_A" == "claude" ]] && [[ "$ENGINE_REVIEWER_B" == "codex" ]] && \
+           [[ "$reviewer_a_usable" == true ]] && \
+           kill -0 "$pid_rb" 2>/dev/null; then
+            if ! _enforce_codex_phase_backstop "$pid_rb" "$reviewer_b_role" "$reviewer_b_start_ts" "$REVIEWER_TIMEOUT" "$reviewer_a_duration" "$reviewer_b_log" "${comp_dir}/reviewer-b.raw.md"; then
+                reviewer_b_backstopped=true
+            fi
+        fi
+        wait $pid_rb || exit_rb=$?
+        if [[ "$reviewer_b_backstopped" == true ]]; then
+            _append_interrupted_cost_rows TERM || true
+        fi
+        _merge_cost_csvs || true
+        rm -f "$reviewer_a_prompt_runtime"
+        _validate_agent_output "${comp_dir}/reviewer-a.raw.md" || true
+        _validate_agent_output_for_role "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" || true
+
+        if [[ "$exit_ra" -ne 0 && "$exit_rb" -ne 0 ]]; then
+            _fail_phase "reviewing" "Both reviewers failed (A=$exit_ra, B=$exit_rb)" "Both reviewers failed. Check ${log_dir}/reviewer-*.log. Retry with --force to re-run from Phase 5"
+        fi
+
         echo -e "${BLUE}Review parallel done: A=$exit_ra, B=$exit_rb${NC}"
         local has_review_a=false has_review_b=false
-        [[ -s "${comp_dir}/reviewer-a.raw.md" ]] && has_review_a=true
-        [[ -s "${comp_dir}/reviewer-b.raw.md" ]] && has_review_b=true
+        _validate_agent_output "${comp_dir}/reviewer-a.raw.md" >/dev/null 2>&1 && has_review_a=true
+        _validate_agent_output_for_role "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" >/dev/null 2>&1 && has_review_b=true
 
         if [[ "$has_review_a" == false ]]; then
             if [[ "$exit_ra" -ne 0 ]]; then
@@ -2506,21 +3095,6 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
             return 1
         fi
 
-        # Single-reviewer policy gate
-        if [[ "$has_review_a" != "$has_review_b" ]]; then
-            if [[ "$LAUREN_LOOP_STRICT" == "true" ]] || [[ "$SINGLE_REVIEWER_POLICY" == "strict" ]] || [[ "${_diff_risk:-LOW}" == "HIGH" ]]; then
-                echo -e "${YELLOW}Single reviewer available with strict policy, strict mode, or HIGH diff risk — halting for human review${NC}"
-                set_task_status "$task_file" "needs verification"
-                log_execution "$task_file" "Phase 5: Single reviewer halt (strict=${LAUREN_LOOP_STRICT}, policy=${SINGLE_REVIEWER_POLICY}, diff_risk=${_diff_risk:-LOW})"
-                _write_human_review_handoff "SINGLE_REVIEWER" "$fix_cycle" || true
-                pipeline_finished=true
-                pipeline_human_review_halt=true
-                break
-            else
-                log_execution "$task_file" "Phase 5: Single reviewer — continuing to synthesis (policy=${SINGLE_REVIEWER_POLICY}, diff_risk=${_diff_risk:-LOW})"
-            fi
-        fi
-
         if [[ "$has_review_a" == true && "$has_review_b" == true ]]; then
             if (( RANDOM % 2 )); then
                 cp "${comp_dir}/reviewer-a.raw.md" "${comp_dir}/review-a.md"
@@ -2538,9 +3112,30 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
             cp "${comp_dir}/reviewer-b.raw.md" "${comp_dir}/review-b.md"
             _atomic_write "${comp_dir}/.review-mapping" "review-a=absent review-b=reviewer-b.raw"
         fi
+        _snapshot_review_cycle_artifacts "$((fix_cycle + 1))" || {
+            set_task_status "$task_file" "blocked"
+            log_execution "$task_file" "Phase 5: Failed to snapshot per-cycle review artifacts"
+            _print_cost_summary
+            return 1
+        }
+
+        # Single-reviewer policy gate
+        if [[ "$has_review_a" != "$has_review_b" ]]; then
+            if _strict_contract_mode || [[ "$SINGLE_REVIEWER_POLICY" == "strict" ]] || [[ "${_diff_risk:-LOW}" == "HIGH" ]]; then
+                echo -e "${YELLOW}Single reviewer available with strict policy, effective strict mode, or HIGH diff risk — halting for human review${NC}"
+                set_task_status "$task_file" "needs verification"
+                log_execution "$task_file" "Phase 5: Single reviewer halt (strict=${LAUREN_LOOP_EFFECTIVE_STRICT}, policy=${SINGLE_REVIEWER_POLICY}, diff_risk=${_diff_risk:-LOW})"
+                _write_human_review_handoff "SINGLE_REVIEWER" "$fix_cycle" || true
+                pipeline_finished=true
+                pipeline_human_review_halt=true
+                break
+            else
+                log_execution "$task_file" "Phase 5: Single reviewer — continuing to synthesis (policy=${SINGLE_REVIEWER_POLICY}, diff_risk=${_diff_risk:-LOW})"
+            fi
+        fi
 
         # Signal: early reviewer consensus — both PASS, skip synthesis
-        if [[ "$LAUREN_LOOP_STRICT" != "true" ]] && [[ "$has_review_a" == true && "$has_review_b" == true ]]; then
+        if ! _strict_contract_mode && [[ "$has_review_a" == true && "$has_review_b" == true ]]; then
             local verdict_review_a="" verdict_review_b=""
             verdict_review_a=$(_parse_contract "${comp_dir}/review-a.md" "verdict")
             verdict_review_b=$(_parse_contract "${comp_dir}/review-b.md" "verdict")
@@ -2568,7 +3163,7 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
                     log_execution "$task_file" "Phase 5: Dual-PASS overridden: critical/major findings (a=${_crit_a}, b=${_crit_b})"
                 fi
             fi
-        elif [[ "$LAUREN_LOOP_STRICT" == "true" ]] && [[ "$has_review_a" == true && "$has_review_b" == true ]]; then
+        elif _strict_contract_mode && [[ "$has_review_a" == true && "$has_review_b" == true ]]; then
             log_execution "$task_file" "Phase 5: Strict mode disabled raw reviewer PASS fast path"
         fi
         _append_manifest_phase "phase-5" "review-cycle-$((fix_cycle+1))" "$_phase_start" "$(_iso_timestamp)" "completed" "" || true
@@ -2731,7 +3326,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         fix_plan_ready=$(_parse_contract "${comp_dir}/fix-plan.md" "ready")
         local fix_plan_ready_upper=""
         fix_plan_ready_upper=$(echo "$fix_plan_ready" | tr '[:lower:]' '[:upper:]')
-        if [[ "$LAUREN_LOOP_STRICT" == "true" ]] && [[ "$fix_plan_ready_upper" != "YES" && "$fix_plan_ready_upper" != "NO" ]]; then
+        if _strict_contract_mode && [[ "$fix_plan_ready_upper" != "YES" && "$fix_plan_ready_upper" != "NO" ]]; then
             echo -e "${RED}Strict mode requires fix-plan.contract.json ready=true|false${NC}"
             set_task_status "$task_file" "blocked"
             log_execution "$task_file" "Phase 6: Strict contract failure for fix-plan ready signal"
@@ -2839,7 +3434,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         fix_exec_status=$(_parse_contract "${comp_dir}/fix-execution.md" "status")
         local fix_exec_status_upper=""
         fix_exec_status_upper=$(echo "$fix_exec_status" | tr '[:lower:]' '[:upper:]')
-        if [[ "$LAUREN_LOOP_STRICT" == "true" ]] && [[ "$fix_exec_status_upper" != "COMPLETE" && "$fix_exec_status_upper" != "BLOCKED" ]]; then
+        if _strict_contract_mode && [[ "$fix_exec_status_upper" != "COMPLETE" && "$fix_exec_status_upper" != "BLOCKED" ]]; then
             echo -e "${RED}Strict mode requires fix-execution.contract.json status=COMPLETE|BLOCKED${NC}"
             set_task_status "$task_file" "blocked"
             log_execution "$task_file" "Phase 7: Strict contract failure for fix-execution status signal"
@@ -2884,7 +3479,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         capture_diff_artifact "$pre_fix_sha" "$latest_fix_diff" "$task_file" "$phase7_scope_plan_file" "$pre_fix_dirty"
         _v2_log_capture_scope_details "$task_file" "Phase 7"
         if [[ ! -s "$latest_fix_diff" ]]; then
-            if [[ "$LAUREN_LOOP_STRICT" == "true" ]]; then
+            if _strict_contract_mode; then
                 echo -e "${RED}Strict mode requires a non-empty fix execution diff${NC}"
                 set_task_status "$task_file" "blocked"
                 log_execution "$task_file" "Phase 7: Strict mode blocked empty fix execution diff"
@@ -3473,7 +4068,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$LAUREN_LOOP_STRICT" == "true" && "$DRY_RUN" != "true" ]]; then
+_apply_effective_strict_mode "$SLUG" "$GOAL"
+
+if [[ "$LAUREN_LOOP_EFFECTIVE_STRICT" == "true" && "$DRY_RUN" != "true" ]]; then
     if [[ ! "$LAUREN_LOOP_MAX_COST" =~ ^[0-9]+([.][0-9]+)?$ ]] || awk -v max="$LAUREN_LOOP_MAX_COST" 'BEGIN { exit !(max <= 0) }'; then
         echo -e "${RED}Strict mode requires LAUREN_LOOP_MAX_COST to be set to a positive value for live runs.${NC}"
         exit 1
@@ -3490,7 +4087,12 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Slug:    $SLUG"
     echo "  Goal:    $GOAL"
     echo "  Model:   $MODEL"
-    echo "  Strict:  $LAUREN_LOOP_STRICT"
+    echo "  Strict:  $LAUREN_LOOP_EFFECTIVE_STRICT"
+    if [[ "$LAUREN_LOOP_AUTO_STRICT" == "true" ]]; then
+        echo "  Strict reason: auto (${LAUREN_LOOP_AUTO_STRICT_REASON})"
+    elif [[ "$LAUREN_LOOP_STRICT" == "true" ]]; then
+        echo "  Strict reason: explicit --strict / LAUREN_LOOP_STRICT"
+    fi
     echo ""
     echo "  Task dir:  docs/tasks/open/${SLUG}/"
     echo "  Artifacts: docs/tasks/open/${SLUG}/competitive/"

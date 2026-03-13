@@ -1,6 +1,6 @@
 # Lauren Loop V2
 
-This document describes the current production-hardened behavior of [`lauren-loop-v2.sh`](lauren-loop-v2.sh) and [`lib/lauren-loop-utils.sh`](lib/lauren-loop-utils.sh) after Phases A-C.
+This document describes the current production-hardened behavior of [`lauren-loop-v2.sh`](/Users/gstredny/AskGeorgeProject/lauren-loop-v2.sh) and [`lib/lauren-loop-utils.sh`](/Users/gstredny/AskGeorgeProject/lib/lauren-loop-utils.sh) after Phases A-C.
 
 ## Overview
 
@@ -33,7 +33,7 @@ Flags:
 - `--internal`
   - Reuses the parent lock in nested invocations.
 - `--force`
-  - Backs up prior artifacts, clears Lauren Loop-owned outputs, and reruns from Phase 1.
+  - Backs up prior artifacts, clears Lauren Loop-owned outputs plus preserved attempt/cycle provenance files, and reruns from Phase 1.
 - `--strict`
   - Enables strict production/CI behavior.
 
@@ -53,7 +53,7 @@ Subcommands:
 | Variable | Default | Meaning |
 |---|---|---|
 | `LAUREN_LOOP_MODEL` | `opus` | Claude model name used by `--model` if not overridden |
-| `LAUREN_LOOP_STRICT` | `false` | Strict-mode switch |
+| `LAUREN_LOOP_STRICT` | `false` | Explicit strict-mode switch; high-risk slug/goal text can also auto-enable effective strict mode |
 | `LAUREN_LOOP_MAX_COST` | `0` | Cost ceiling in USD; `<= 0` disables the ceiling |
 | `LAUREN_LOOP_NOTIFY` | `0` | If set to `1`, emit one macOS terminal-state notification for live runs |
 | `SINGLE_REVIEWER_POLICY` | `synthesis` | `synthesis` or `strict` |
@@ -86,6 +86,9 @@ Codex-routed phases receive prompts assembled by `assemble_codex_prompt()`:
 This mirrors `assemble_claude_prompt()` which prepends the same `PROJECT_RULES` to Claude prompts.
 
 The Codex model name used in cost manifests and metadata defaults to `gpt-5.4` and is configurable via `LAUREN_LOOP_CODEX_MODEL`.
+The current primary Codex Lauren-loop profile is `azure54`, which is configured for effective reasoning `xhigh`; `azure54med` is reserved as the medium-effort fallback. Lauren loop only drops to `azure54med` after the primary profile exhausts either the stream-disconnect path or the capacity-throttling path, and it does not currently route the main executor or fix executor through Codex by default.
+
+For Codex file-authoring roles (`planner-b`, `reviewer-b*`), each attempt now writes to an attempt-local artifact path (`plan-b.attempt-N.md`, `reviewer-b.raw.attempt-N.md`) and an attempt-local summary file in `logs/` (`planner-b.attempt-N.summary.txt`, `reviewer-b.attempt-N.summary.txt`). The canonical latest aliases (`plan-b.md`, `reviewer-b.raw.md`, `planner-b.summary.txt`, `reviewer-b.summary.txt`) are updated only by atomic promotion after a structurally complete artifact exists, so retries cannot erase a usable prior attempt.
 
 ### Timeouts
 
@@ -118,8 +121,8 @@ The Codex model name used in cost manifests and metadata defaults to `gpt-5.4` a
 - Timeout escalation:
   - `_timeout()` escalates from `TERM` to `KILL` after a 5-second grace window.
 - Force reruns:
-  - `_backup_artifacts_on_force()` snapshots prior `.md`, `.patch`, and `.json` artifacts.
-  - `_clear_force_artifacts()` removes Lauren Loop-owned outputs only.
+  - `_backup_artifacts_on_force()` snapshots prior `.md`, `.patch`, `.json`, and mapping artifacts.
+  - `_clear_force_artifacts()` removes Lauren Loop-owned outputs plus preserved attempt/cycle files only.
 - Execution safety:
   - empty execution diffs are detected
   - diff-scope validation is wired after Phase 4
@@ -130,8 +133,9 @@ The Codex model name used in cost manifests and metadata defaults to `gpt-5.4` a
   - `_parse_contract()` prefers `.contract.json` sidecars, then falls back to markdown parsing when non-strict.
   - `_normalize_contract_token()` canonicalizes `verdict`, `ready`, and `status` values.
 - Confidence gating:
-  - `_classify_diff_risk()` feeds single-reviewer policy decisions.
-  - single-reviewer survival can halt based on policy or risk.
+  - `_classify_diff_risk()` uses conservative path-token matching for review-phase single-survivor halts.
+  - deployment / production-cutover / security-sensitive slug-or-goal text auto-enables effective strict mode for the full runtime.
+  - single-reviewer or single-planner survival can halt based on effective strict mode or risk.
 - Resumability:
   - `_write_cycle_state()`, `_read_cycle_state()`, `_resume_target_ready()`, and `_phase7_resume_gate_reason()` support subphase resume.
 - Corruption guards:
@@ -148,13 +152,15 @@ The Codex model name used in cost manifests and metadata defaults to `gpt-5.4` a
   - `tests/test_lauren_loop_logic.sh`
 - Prompt/runtime alignment:
   - the five routed prompts now emit JSON contract sidecars.
+  - Reviewer B is path-agnostic; the runtime instruction supplies the review artifact path per attempt instead of patching a rendered prompt.
 - Strict mode:
   - strict parsing disables regex fallback for routed artifacts
   - ambiguous routed signals halt
+  - single-planner survival halts before evaluation/execution
   - single-reviewer survival halts
   - raw dual-PASS fast path is disabled
   - empty fix diffs hard-block
-  - cost ceiling is required only for strict live runs, not strict dry runs
+  - cost ceiling is required only for effective-strict live runs, not strict dry runs
 
 ## Contracts
 
@@ -195,12 +201,19 @@ The Codex model name used in cost manifests and metadata defaults to `gpt-5.4` a
 ### Review Phase
 
 - At least one usable reviewer artifact is required.
+- `reviewer-a.raw.md`, `reviewer-b.raw.md`, `review-a.md`, and `review-b.md` are snapshotted per cycle as `*.cycleN.md`, and `.review-mapping` is snapshotted as `.review-mapping.cycleN`.
 - If both reviewer artifacts survive:
   - non-strict mode may fast-path only when both routed verdicts are `PASS` and no critical/major findings are detected
   - strict mode always disables this fast path and forces `review-synthesis.md`
 - If only one reviewer artifact survives:
   - non-strict mode may continue to synthesis
   - strict mode always halts for human review
+
+### Planning Phase
+
+- `planner-b` attempt artifacts are preserved as `plan-b.attempt-N.md`.
+- A non-zero-exit planner artifact still counts if it passes structural completeness validation.
+- Effective strict mode halts for human review when only one planner survives, instead of seeding `revised-plan.md` automatically.
 
 ### Review Synthesis Verdicts
 
@@ -378,5 +391,5 @@ The notifier is shell-native only. It does not rely on Claude hooks, and it sile
 For long-running work, use a separate idle Claude session as a watcher with the standardized `/loop` prompt below. The watcher should cancel itself after it sees `needs verification` or `blocked`.
 
 ```text
-/loop 5m watch-lauren-loop:<slug> Read docs/tasks/open/<slug>/task.md. If ## Status is "in progress", reply with the newest Execution Log line only. If ## Status is "needs verification" or "blocked", summarize the terminal reason using task.md and any available human-review-handoff.md or review-synthesis.md, say "LAUREN LOOP DONE", then list scheduled tasks and delete the one whose prompt contains "watch-lauren-loop:<slug>".
+/loop 5m watch-lauren-loop:<slug> Read /Users/gstredny/AskGeorgeProject/docs/tasks/open/<slug>/task.md. If ## Status is "in progress", reply with the newest Execution Log line only. If ## Status is "needs verification" or "blocked", summarize the terminal reason using task.md and any available human-review-handoff.md or review-synthesis.md, say "LAUREN LOOP DONE", then list scheduled tasks and delete the one whose prompt contains "watch-lauren-loop:<slug>".
 ```

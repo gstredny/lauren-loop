@@ -58,17 +58,16 @@ PROJ_HASH=$(printf '%s' "$SCRIPT_DIR" | md5 -q 2>/dev/null || printf '%s' "$SCRI
 PROJ_HASH="${PROJ_HASH:0:8}"
 NEXT_CACHE="/tmp/lauren-loop-next-${USER}-${PROJ_HASH}.txt"
 
-# Source context guard (optional — enables Azure Foundry routing)
+# Source context guard and set Azure env vars for all claude calls
 if [[ -f "$HOME/.claude/scripts/context-guard.sh" ]]; then
   source "$HOME/.claude/scripts/context-guard.sh"
-  if type setup_azure_context &>/dev/null && setup_azure_context; then
+  if ! setup_azure_context; then
+    echo -e "${YELLOW}[WARN] Azure context guard failed — claude calls may use personal API. Run 'az account show' to re-authenticate.${NC}" >&2
+  else
     echo -e "${GREEN}[INFO] Azure context guard loaded.${NC}"
   fi
-fi
-
-# Fallback stubs when context-guard.sh is absent
-if ! type setup_azure_context &>/dev/null; then
-  setup_azure_context() { return 0; }
+else
+  echo -e "${YELLOW}[WARN] No context-guard.sh found — skipping Azure routing.${NC}"
 fi
 
 # Source shared utility functions
@@ -78,9 +77,9 @@ fi
 [[ -f "$SCRIPT_DIR/.lauren-loop.conf" ]] && source "$SCRIPT_DIR/.lauren-loop.conf"
 
 # Config-driven project values (fallback defaults if conf doesn't set them)
-PROJECT_NAME="${PROJECT_NAME:-$(basename "${LAUREN_LOOP_PROJECT_DIR:-$SCRIPT_DIR}")}"
-TEST_CMD="${TEST_CMD:-pytest tests/ -x -q}"
-LINT_CMD="${LINT_CMD:-flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
+PROJECT_NAME="${PROJECT_NAME:-AskGeorge}"
+TEST_CMD="${TEST_CMD:-.venv/bin/python -m pytest tests/ -x -q}"
+LINT_CMD="${LINT_CMD:-.venv/bin/python -m flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
 
 # ============================================================
 # Utility functions (needed by subcommands and main pipeline)
@@ -194,8 +193,10 @@ start_lead_monitor() {
 stop_lead_monitor() {
     if [ -n "$LEAD_MONITOR_PIDS" ]; then
         for pid in $LEAD_MONITOR_PIDS; do
-            kill "$pid" 2>/dev/null
-            wait "$pid" 2>/dev/null
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                kill "$pid" 2>/dev/null || true
+                wait "$pid" 2>/dev/null || true
+            fi
         done
         LEAD_MONITOR_PIDS=""
     fi
@@ -240,6 +241,46 @@ run_retro_agent() {
         printf '[%s] TIMEOUT: retro generation timed out after 120s for %s\n' "$(date -Iseconds)" "$task_stem" >> "$retro_log"
     fi
     return 1
+}
+
+# ============================================================
+# scan_eligible_tasks — Pre-filter tasks by status
+# Sets: ELIGIBLE_TASKS, EXCLUDED_TASKS
+# ============================================================
+scan_eligible_tasks() {
+    ELIGIBLE_TASKS=""
+    EXCLUDED_TASKS=""
+    local eligible_count=0
+    local excluded_count=0
+
+    while IFS= read -r file; do
+        local basename
+        basename=$(basename "$file")
+        # Skip non-task files
+        [[ "$basename" == "INDEX.md" || "$basename" == "FEATURE-ROADMAP.md" ]] && continue
+
+        # Extract status line (first 5 lines, case-insensitive match)
+        local status_line
+        status_line=$(head -5 "$file" | grep -i '^## Status:' | head -1)
+        # Skip files without a Status header (not task files)
+        [ -z "$status_line" ] && continue
+
+        # Normalize: strip header prefix, trim whitespace, lowercase
+        local task_status
+        task_status=$(echo "$status_line" | sed 's/^## [Ss]tatus:[[:space:]]*//' | tr '[:upper:]' '[:lower:]' | sed 's/[[:space:]]*$//')
+
+        local rel_path="${file#$SCRIPT_DIR/}"
+
+        if [[ "$task_status" == "not started" ]]; then
+            ELIGIBLE_TASKS="${ELIGIBLE_TASKS}${ELIGIBLE_TASKS:+$'\n'}${rel_path}"
+            eligible_count=$((eligible_count + 1))
+        else
+            EXCLUDED_TASKS="${EXCLUDED_TASKS}${EXCLUDED_TASKS:+$'\n'}${rel_path} (${task_status})"
+            excluded_count=$((excluded_count + 1))
+        fi
+    done < <(find "$SCRIPT_DIR/docs/tasks/open" -name '*.md' -not -path '*/competitive/*' | sort)
+
+    printf '[%s] Task scan: %d eligible, %d excluded\n' "$(date -Iseconds)" "$eligible_count" "$excluded_count" >&2
 }
 
 # ============================================================
@@ -297,8 +338,40 @@ ${summaries}"
         fi
     fi
 
+    # Scan eligible vs excluded tasks
+    scan_eligible_tasks
+    local eligible_count
+    eligible_count=$(echo "$ELIGIBLE_TASKS" | grep -c . 2>/dev/null || echo 0)
+
+    local eligible_section=""
+    if [ -n "$ELIGIBLE_TASKS" ]; then
+        eligible_section="## Eligible Tasks (Status: not started) — ONLY rank these ${eligible_count} tasks
+${ELIGIBLE_TASKS}"
+    else
+        eligible_section="## Eligible Tasks (Status: not started)
+No eligible tasks found. All open tasks are in progress, blocked, or awaiting verification."
+    fi
+
+    local excluded_section=""
+    if [ -n "$EXCLUDED_TASKS" ]; then
+        excluded_section="## Excluded Tasks — DO NOT rank these
+These tasks are already in progress, blocked, or awaiting verification. Use them only for dependency context.
+${EXCLUDED_TASKS}"
+    fi
+
     # Assemble enriched user prompt
     NEXT_TASK_USER_PROMPT="$base_instruction"
+
+    NEXT_TASK_USER_PROMPT="${NEXT_TASK_USER_PROMPT}
+
+${eligible_section}"
+
+    if [ -n "$excluded_section" ]; then
+        NEXT_TASK_USER_PROMPT="${NEXT_TASK_USER_PROMPT}
+
+${excluded_section}"
+    fi
+
     if [ -n "$git_state" ]; then
         NEXT_TASK_USER_PROMPT="${NEXT_TASK_USER_PROMPT}
 
@@ -323,7 +396,7 @@ usage() {
     echo "  auto <slug> <goal>    Classify once and route to V1 or V2"
     echo "  reset <slug>          Reset stuck task to last stable status"
     echo "  execute <slug>        Execute a plan-approved task via TDD executor"
-    echo "  review <slug>         Review an executed task's diff via reviewer + critic loop"
+    echo "  review <slug>         Review an executed or verification-ready task's diff via reviewer + critic loop"
     echo "  fix <slug>            Apply fixes for review findings, then re-review"
     echo "  chaos <slug>          Run chaos-critic against approved plan"
     echo "  verify <slug>         Goal-backward verification of task outcomes"
@@ -461,6 +534,234 @@ task_file_stem() {
     fi
 }
 
+_pick_load_ranked_tasks() {
+    local pick_output_file="$1"
+    local task_lines=""
+    local line complexity remainder num file goal
+
+    _PICK_PARSER_TIER=""
+    PICK_NUMS=()
+    PICK_FILES=()
+    PICK_GOALS=()
+    PICK_COMPLEXITY=()
+    PICK_COUNT=0
+
+    # Primary parser: extract pipe-delimited lines after ## TASK_LIST header
+    if grep -q '^## TASK_LIST' "$pick_output_file"; then
+        task_lines=$(sed -n '/^## TASK_LIST/,$ { /^## TASK_LIST/d; p; }' "$pick_output_file" \
+            | sed '/^[[:space:]]*$/d' \
+            | grep -E '^[0-9]+\|.+\|.+\|.+$' || true)
+    fi
+    [ -n "$task_lines" ] && _PICK_PARSER_TIER="primary"
+
+    # Fallback parser: scrape **N. [filename]** or **N. filename** entries from human-readable output
+    if [ -z "$task_lines" ]; then
+        task_lines=$(grep -oE '\*\*[0-9]+\. \[([^]]+)\]\*\* — (.+)' "$pick_output_file" \
+            | sed -E 's/\*\*([0-9]+)\. \[([^]]+)\]\*\* — (.*)/\1|\2|\3|Unknown/' || true)
+        [ -n "$task_lines" ] && _PICK_PARSER_TIER="bold-bracket"
+    fi
+    if [ -z "$task_lines" ]; then
+        task_lines=$(grep -oE '\*\*[0-9]+\. [^*]+\*\* — .+' "$pick_output_file" \
+            | sed -E 's/\*\*([0-9]+)\. ([^*]+)\*\* — (.*)/\1|\2|\3|Unknown/' || true)
+        [ -n "$task_lines" ] && _PICK_PARSER_TIER="bold-plain"
+    fi
+
+    if [ -z "$task_lines" ]; then
+        echo -e "${YELLOW}Could not parse task list from ranking output.${NC}"
+        echo "Full output is above — copy a task slug manually."
+        return 1
+    fi
+
+    while IFS= read -r line; do
+        complexity="${line##*|}"
+        remainder="${line%|*}"
+        num="${remainder%%|*}"
+        remainder="${remainder#*|}"
+        file="${remainder%%|*}"
+        goal="${remainder#*|}"
+        num=$(echo "$num" | tr -d '[:space:]')
+        file=$(echo "$file" | tr -d '[:space:]')
+        complexity=$(echo "$complexity" | tr -d '[:space:]')
+        PICK_NUMS+=("$num")
+        PICK_FILES+=("$file")
+        PICK_GOALS+=("$goal")
+        PICK_COMPLEXITY+=("$complexity")
+    done <<< "$task_lines"
+
+    PICK_COUNT=${#PICK_FILES[@]}
+    if [ "$PICK_COUNT" -eq 0 ]; then
+        echo -e "${YELLOW}No tasks parsed from ranking output.${NC}"
+        return 1
+    fi
+
+    echo -e "${DIM:-}(Parsed via ${_PICK_PARSER_TIER} parser)${NC:-}"
+
+    for (( i=0; i<PICK_COUNT; i++ )); do
+        if [[ -z "${PICK_FILES[$i]}" || -z "${PICK_GOALS[$i]}" ]]; then
+            echo -e "${YELLOW}Warning: parser extracted empty file or goal at position $((i+1)) — rerun pick to refresh cache${NC}"
+        fi
+    done
+
+    return 0
+}
+
+_pick_interactive_select_task() {
+    local pick_temp_file="$1"
+    local running_v2_slugs=""
+    local local_complexity="" color="$NC" pick_stem="" running_tag=""
+    local pick_input="" selected_idx="" selected_file="" selected_goal="" selected_slug=""
+    local confirm_running="" pick_confirm="" pick_route=""
+    local i
+    local -a pick_auto_cmd=()
+
+    running_v2_slugs=$(_list_running_v2_instances 2>/dev/null | cut -f1 || true)
+
+    echo -e "${BLUE}Select a task:${NC}"
+    echo ""
+    for i in $(seq 0 $(( PICK_COUNT - 1 ))); do
+        local_complexity="${PICK_COMPLEXITY[$i]}"
+        case "$local_complexity" in
+            Low)    color="$GREEN" ;;
+            Medium) color="$YELLOW" ;;
+            High)   color="$RED" ;;
+            *)      color="$NC" ;;
+        esac
+        pick_stem=$(task_file_stem "${PICK_FILES[$i]}")
+        running_tag=""
+        if echo "$running_v2_slugs" | grep -qx "$pick_stem" 2>/dev/null; then
+            running_tag=" ${YELLOW}[RUNNING]${NC}"
+        fi
+        printf "  %2s) %-40s %b[%s]%b%b\n" "${PICK_NUMS[$i]}" "${PICK_FILES[$i]}" "$color" "$local_complexity" "$NC" "$running_tag"
+        printf "      %s\n" "${PICK_GOALS[$i]}"
+    done
+    echo ""
+    echo "   0) Cancel"
+    echo ""
+
+    while true; do
+        printf "Enter number: "
+        if ! read -r pick_input </dev/tty; then
+            echo ""
+            echo "Cancelled."
+            return 0
+        fi
+
+        if [ -z "$pick_input" ]; then
+            continue
+        fi
+        if [ "$pick_input" = "0" ] || [ "$pick_input" = "q" ] || [ "$pick_input" = "Q" ]; then
+            echo "Cancelled."
+            return 0
+        fi
+
+        if ! [[ "$pick_input" =~ ^[0-9]+$ ]]; then
+            echo -e "${RED}Invalid input. Enter a number from the list above, or 0 to cancel.${NC}"
+            continue
+        fi
+
+        selected_idx=""
+        for i in $(seq 0 $(( PICK_COUNT - 1 ))); do
+            if [ "${PICK_NUMS[$i]}" = "$pick_input" ]; then
+                selected_idx=$i
+                break
+            fi
+        done
+
+        if [ -z "$selected_idx" ]; then
+            echo -e "${RED}Number $pick_input is not in the list. Try again or enter 0 to cancel.${NC}"
+            continue
+        fi
+
+        selected_file="${PICK_FILES[$selected_idx]}"
+        selected_goal="${PICK_GOALS[$selected_idx]}"
+        selected_slug=$(task_file_stem "$selected_file")
+
+        if _is_slug_running_v2 "$selected_slug" 2>/dev/null; then
+            echo ""
+            echo -e "${YELLOW}Warning: '${selected_slug}' is already running under V2.${NC}"
+            printf "Continue anyway? (y/n): "
+            if ! read -r confirm_running </dev/tty; then
+                echo ""
+                echo "Cancelled."
+                return 0
+            fi
+            if [[ "$confirm_running" != "y" && "$confirm_running" != "Y" ]]; then
+                continue
+            fi
+        fi
+
+        echo ""
+        echo -e "${GREEN}Selected: ${selected_slug}${NC} — ${selected_goal}"
+        echo ""
+
+        pick_auto_cmd=( "$0" auto "$selected_slug" "$selected_goal" )
+        if [ -n "${MODEL:-}" ]; then
+            pick_auto_cmd+=( --model "$MODEL" )
+        fi
+        if [ "$DRY_RUN" = true ]; then
+            pick_auto_cmd+=( --dry-run )
+        fi
+
+        while true; do
+            printf "Launch pipeline? (y/n) "
+            if ! read -r pick_confirm </dev/tty; then
+                echo ""
+                echo "Cancelled."
+                return 0
+            fi
+
+            case "$pick_confirm" in
+                y|Y)
+                    while true; do
+                        printf "Route: (1) Auto-classify  (2) Simple (V1)  (3) Complex (V2) "
+                        if ! read -r pick_route </dev/tty; then
+                            echo ""
+                            echo "Cancelled."
+                            return 0
+                        fi
+
+                        case "$pick_route" in
+                            1)
+                                rm -f "$pick_temp_file"
+                                exec "${pick_auto_cmd[@]}"
+                                ;;
+                            2)
+                                rm -f "$pick_temp_file"
+                                exec "${pick_auto_cmd[@]}" --simple
+                                ;;
+                            3)
+                                rm -f "$pick_temp_file"
+                                exec "${pick_auto_cmd[@]}" --thorough
+                                ;;
+                            0|n|N)
+                                break
+                                ;;
+                            "")
+                                echo -e "${RED}Enter 1, 2, or 3${NC}"
+                                ;;
+                            *)
+                                echo -e "${RED}Enter 1, 2, or 3${NC}"
+                                ;;
+                        esac
+                    done
+                    ;;
+                n|N)
+                    echo ""
+                    echo -e "${BLUE}To launch manually:${NC}"
+                    echo "  ./lauren-loop.sh auto \"${selected_slug}\" \"${selected_goal}\""
+                    return 0
+                    ;;
+                "")
+                    echo -e "${RED}Enter y or n${NC}"
+                    ;;
+                *)
+                    echo -e "${RED}Enter y or n${NC}"
+                    ;;
+            esac
+        done
+    done
+}
+
 parse_classification_from_file() {
     local output_file="$1"
     local classification
@@ -499,12 +800,31 @@ extract_classifier_rationale() {
     ' "$output_file" | sed '/^[[:space:]]*$/d' | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
 }
 
+format_auto_duration() {
+    local duration="$1"
+    local hours minutes
+
+    if [ "$duration" -lt 60 ]; then
+        echo "<1m"
+        return 0
+    fi
+
+    hours=$((duration / 3600))
+    minutes=$(((duration % 3600) / 60))
+
+    if [ "$hours" -gt 0 ]; then
+        printf '%sh %sm\n' "$hours" "$minutes"
+    else
+        printf '%sm\n' "$minutes"
+    fi
+}
+
 print_auto_summary() {
-    local route="$1"
-    local reason="$2"
-    local duration="$3"
-    local cost="$4"
-    local exit_code="$5"
+    local route="$1" reason="$2" duration="$3" cost="$4" exit_code="$5"
+    local cocomo="${6:-N/A}"
+    local display_duration
+
+    display_duration=$(format_auto_duration "$duration")
 
     echo ""
     echo -e "${BLUE}=============================================="
@@ -513,8 +833,10 @@ print_auto_summary() {
     echo ""
     echo "  Pipeline: ${route}"
     echo "  Reason:   ${reason}"
-    echo "  Duration: ${duration}s"
+    echo "  Duration: ${display_duration}"
     echo "  Cost:     ${cost}"
+    echo "  Offshore Dev Cost: ${cocomo}"
+    echo "            Traditional development estimate using industry-standard COCOMO II productivity model."
     echo "  Exit:     ${exit_code}"
 }
 
@@ -683,6 +1005,8 @@ if [ "${1:-}" = "auto" ]; then
         exit 1
     fi
 
+    AUTO_PRE_SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+
     set +e
     if [ "$AUTO_ROUTE" = "v1" ]; then
         AUTO_SUMMARY_ROUTE="V1"
@@ -694,11 +1018,8 @@ if [ "${1:-}" = "auto" ]; then
             AUTO_CMD+=( --resume )
         fi
         AUTO_CMD+=( --model "$MODEL" )
-        if [ "$NO_REVIEW" = true ]; then
-            AUTO_CMD+=( --no-review )
-        fi
-        # Auto keeps the routed V1 path at needs verification instead of auto-closing.
-        AUTO_CMD+=( --no-close )
+        # Routed V1 auto stops after execution handoff for human verification.
+        AUTO_CMD+=( --no-review --no-close )
         "${AUTO_CMD[@]}"
         AUTO_CHILD_EXIT=$?
         AUTO_COST=$(read_v1_total_cost "$SLUG")
@@ -733,7 +1054,8 @@ if [ "${1:-}" = "auto" ]; then
     if [ "$AUTO_DURATION" -lt 0 ]; then
         AUTO_DURATION=0
     fi
-    print_auto_summary "$AUTO_SUMMARY_ROUTE" "$AUTO_REASON" "$AUTO_DURATION" "$AUTO_COST" "$AUTO_CHILD_EXIT"
+    AUTO_COCOMO=$(compute_cocomo_estimate "$AUTO_PRE_SHA")
+    print_auto_summary "$AUTO_SUMMARY_ROUTE" "$AUTO_REASON" "$AUTO_DURATION" "$AUTO_COST" "$AUTO_CHILD_EXIT" "$AUTO_COCOMO"
     exit "$AUTO_CHILD_EXIT"
 fi
 
@@ -920,221 +1242,12 @@ ${NEXT_TASK_CONTENT}"
     sed '/^## TASK_LIST/,$d' "$PICK_TEMP"
     echo ""
 
-    # --- Parse ## TASK_LIST block ---
-    # Primary parser: extract pipe-delimited lines after ## TASK_LIST header
-    TASK_LINES=""
-    if grep -q '^## TASK_LIST' "$PICK_TEMP"; then
-        TASK_LINES=$(sed -n '/^## TASK_LIST/,$ { /^## TASK_LIST/d; p; }' "$PICK_TEMP" \
-            | sed '/^[[:space:]]*$/d' \
-            | grep -E '^[0-9]+\|.+\|.+\|.+$' || true)
-    fi
-
-    [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="primary"
-
-    # Fallback parser: scrape **N. [filename]** or **N. filename** entries from human-readable output
-    if [ -z "$TASK_LINES" ]; then
-        # Try bracketed format first: **1. [filename.md]** — goal
-        TASK_LINES=$(grep -oE '\*\*[0-9]+\. \[([^]]+)\]\*\* — (.+)' "$PICK_TEMP" \
-            | sed -E 's/\*\*([0-9]+)\. \[([^]]+)\]\*\* — (.*)/\1|\2|\3|Unknown/' || true)
-        [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="bold-bracket"
-    fi
-    if [ -z "$TASK_LINES" ]; then
-        # Try unbracketed format: **1. filename.md** — goal
-        TASK_LINES=$(grep -oE '\*\*[0-9]+\. [^*]+\*\* — .+' "$PICK_TEMP" \
-            | sed -E 's/\*\*([0-9]+)\. ([^*]+)\*\* — (.*)/\1|\2|\3|Unknown/' || true)
-        [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="bold-plain"
-    fi
-
-    # If both parsers fail, show full output and exit
-    if [ -z "$TASK_LINES" ]; then
-        echo -e "${YELLOW}Could not parse task list from ranking output.${NC}"
-        echo "Full output is above — copy a task slug manually."
+    if ! _pick_load_ranked_tasks "$PICK_TEMP"; then
         rm -f "$PICK_TEMP"
         exit 1
     fi
 
-    # Build arrays from parsed lines
-    declare -a PICK_NUMS=()
-    declare -a PICK_FILES=()
-    declare -a PICK_GOALS=()
-    declare -a PICK_COMPLEXITY=()
-    while IFS= read -r line; do
-        complexity="${line##*|}"
-        remainder="${line%|*}"
-        num="${remainder%%|*}"
-        remainder="${remainder#*|}"
-        file="${remainder%%|*}"
-        goal="${remainder#*|}"
-        num=$(echo "$num" | tr -d '[:space:]')
-        file=$(echo "$file" | tr -d '[:space:]')
-        complexity=$(echo "$complexity" | tr -d '[:space:]')
-        PICK_NUMS+=("$num")
-        PICK_FILES+=("$file")
-        PICK_GOALS+=("$goal")
-        PICK_COMPLEXITY+=("$complexity")
-    done <<< "$TASK_LINES"
-
-    PICK_COUNT=${#PICK_FILES[@]}
-    echo -e "${DIM}(Parsed via ${_PICK_PARSER_TIER} parser)${NC}"
-
-    # Validate extracted fields
-    local _pick_valid=true
-    for (( i=0; i<PICK_COUNT; i++ )); do
-        if [[ -z "${PICK_FILES[$i]}" || -z "${PICK_GOALS[$i]}" ]]; then
-            echo -e "${YELLOW}Warning: parser extracted empty file or goal at position $((i+1)) — rerun pick to refresh cache${NC}"
-            _pick_valid=false
-        fi
-    done
-
-    if [ "$PICK_COUNT" -eq 0 ]; then
-        echo -e "${YELLOW}No tasks parsed from ranking output.${NC}"
-        rm -f "$PICK_TEMP"
-        exit 1
-    fi
-
-    # Display numbered selection menu with color-coded complexity
-    echo -e "${BLUE}Select a task:${NC}"
-    echo ""
-    for i in $(seq 0 $(( PICK_COUNT - 1 ))); do
-        local_complexity="${PICK_COMPLEXITY[$i]}"
-        case "$local_complexity" in
-            Low)    color="$GREEN" ;;
-            Medium) color="$YELLOW" ;;
-            High)   color="$RED" ;;
-            *)      color="$NC" ;;
-        esac
-        printf "  %2s) %-40s %b[%s]%b\n" "${PICK_NUMS[$i]}" "${PICK_FILES[$i]}" "$color" "$local_complexity" "$NC"
-        printf "      %s\n" "${PICK_GOALS[$i]}"
-    done
-    echo ""
-    echo "   0) Cancel"
-    echo ""
-
-    # Interactive read loop
-    while true; do
-        printf "Enter number: "
-        if ! read -r PICK_INPUT </dev/tty; then
-            echo ""
-            echo "Cancelled."
-            rm -f "$PICK_TEMP"
-            exit 0
-        fi
-
-        # Handle empty input or cancel
-        if [ -z "$PICK_INPUT" ]; then
-            continue
-        fi
-        if [ "$PICK_INPUT" = "0" ] || [ "$PICK_INPUT" = "q" ] || [ "$PICK_INPUT" = "Q" ]; then
-            echo "Cancelled."
-            rm -f "$PICK_TEMP"
-            exit 0
-        fi
-
-        # Validate numeric
-        if ! [[ "$PICK_INPUT" =~ ^[0-9]+$ ]]; then
-            echo -e "${RED}Invalid input. Enter a number from the list above, or 0 to cancel.${NC}"
-            continue
-        fi
-
-        # Find matching entry
-        SELECTED_IDX=""
-        for i in $(seq 0 $(( PICK_COUNT - 1 ))); do
-            if [ "${PICK_NUMS[$i]}" = "$PICK_INPUT" ]; then
-                SELECTED_IDX=$i
-                break
-            fi
-        done
-
-        if [ -z "$SELECTED_IDX" ]; then
-            echo -e "${RED}Number $PICK_INPUT is not in the list. Try again or enter 0 to cancel.${NC}"
-            continue
-        fi
-
-        # Valid selection
-        SELECTED_FILE="${PICK_FILES[$SELECTED_IDX]}"
-        SELECTED_GOAL="${PICK_GOALS[$SELECTED_IDX]}"
-        SELECTED_SLUG=$(task_file_stem "$SELECTED_FILE")
-
-        echo ""
-        echo -e "${GREEN}Selected: ${SELECTED_SLUG}${NC} — ${SELECTED_GOAL}"
-        echo ""
-
-        # Build base auto command
-        PICK_AUTO_CMD=( "$0" auto "$SELECTED_SLUG" "$SELECTED_GOAL" )
-        if [ -n "${MODEL:-}" ]; then
-            PICK_AUTO_CMD+=( --model "$MODEL" )
-        fi
-        if [ "$DRY_RUN" = true ]; then
-            PICK_AUTO_CMD+=( --dry-run )
-        fi
-
-        # Confirmation prompt — two sequential questions
-        while true; do
-            # Question 1: Launch?
-            printf "Launch pipeline? (y/n) "
-            if ! read -r PICK_CONFIRM </dev/tty; then
-                echo ""
-                echo "Cancelled."
-                break
-            fi
-
-            case "$PICK_CONFIRM" in
-                y|Y)
-                    # Question 2: Route selection
-                    while true; do
-                        printf "Route: (1) Auto-classify  (2) Simple (V1)  (3) Complex (V2) "
-                        if ! read -r PICK_ROUTE </dev/tty; then
-                            echo ""
-                            echo "Cancelled."
-                            break 2
-                        fi
-
-                        case "$PICK_ROUTE" in
-                            1)
-                                rm -f "$PICK_TEMP"
-                                exec "${PICK_AUTO_CMD[@]}"
-                                ;;
-                            2)
-                                rm -f "$PICK_TEMP"
-                                exec "${PICK_AUTO_CMD[@]}" --simple
-                                ;;
-                            3)
-                                rm -f "$PICK_TEMP"
-                                exec "${PICK_AUTO_CMD[@]}" --thorough
-                                ;;
-                            0|n|N)
-                                # Go back to Question 1
-                                break
-                                ;;
-                            "")
-                                echo -e "${RED}Enter 1, 2, or 3${NC}"
-                                continue
-                                ;;
-                            *)
-                                echo -e "${RED}Enter 1, 2, or 3${NC}"
-                                continue
-                                ;;
-                        esac
-                    done
-                    ;;
-                n|N)
-                    echo ""
-                    echo -e "${BLUE}To launch manually:${NC}"
-                    echo "  ./lauren-loop.sh auto \"${SELECTED_SLUG}\" \"${SELECTED_GOAL}\""
-                    break
-                    ;;
-                "")
-                    echo -e "${RED}Enter y or n${NC}"
-                    continue
-                    ;;
-                *)
-                    echo -e "${RED}Enter y or n${NC}"
-                    continue
-                    ;;
-            esac
-        done
-        break
-    done
+    _pick_interactive_select_task "$PICK_TEMP"
 
     rm -f "$PICK_TEMP"
     exit 0
@@ -1226,6 +1339,11 @@ if [ "${1:-}" = "execute" ]; then
 
     # Verify status
     CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
+    if [ "$CURRENT_STATUS" = "needs verification" ]; then
+        echo -e "${GREEN}Task already executed and awaiting verification. Run: ./lauren-loop.sh review ${SLUG} or ./lauren-loop.sh verify ${SLUG}${NC}"
+        log_execution "$TASK_FILE" "Execute skipped — task already awaiting verification"
+        exit 0
+    fi
     if [ "$CURRENT_STATUS" = "executed" ]; then
         echo -e "${GREEN}Task already executed by Lead agent. Run: ./lauren-loop.sh review ${SLUG}${NC}"
         log_execution "$TASK_FILE" "Execute skipped — task already executed by Lead agent"
@@ -1326,8 +1444,9 @@ ${PROMPT_CONTENT}"
         exit 1
     fi
 
-    # Update status to executed
-    _sed_i 's/^## Status: .*/## Status: executed/' "$TASK_FILE"
+    # Successful execution hands off to human verification unless scope review is needed.
+    FINAL_STATUS="needs verification"
+    _sed_i 's/^## Status: .*/## Status: needs verification/' "$TASK_FILE"
     log_execution "$TASK_FILE" "Executor completed successfully"
 
     # Scope check: verify changed files match plan
@@ -1335,6 +1454,7 @@ ${PROMPT_CONTENT}"
         echo -e "${YELLOW}Setting status to needs-human-review due to scope violation${NC}"
         _sed_i 's/^## Status: .*/## Status: needs-human-review/' "$TASK_FILE"
         log_execution "$TASK_FILE" "Scope check failed: changed files don't match plan"
+        FINAL_STATUS="needs-human-review"
     fi
 
     # Capture git diff from pre-execution SHA
@@ -1351,14 +1471,28 @@ ${PROMPT_CONTENT}"
         git diff --cached >> "$DIFF_FILE" 2>/dev/null || true
     fi
 
+    if [ "$FINAL_STATUS" = "needs verification" ]; then
+        EXEC_TEST_SIGNAL=$(latest_execution_test_signal "$TASK_FILE")
+        REL_LOG_FILE="${LOG_FILE#"$SCRIPT_DIR"/}"
+        REL_DIFF_FILE="${DIFF_FILE#"$SCRIPT_DIR"/}"
+        LEFT_OFF_SUMMARY="Automated V1 execution completed. Latest execution evidence: ${EXEC_TEST_SIGNAL:-Executor completed successfully}. Artifacts: ${REL_DIFF_FILE}, ${REL_LOG_FILE}. Task is ready for human verification."
+        ATTEMPT_ENTRY="- $(date '+%Y-%m-%d'): Executed approved V1 plan via executor. Latest execution evidence: ${EXEC_TEST_SIGNAL:-Executor completed successfully}. Artifacts: ${REL_DIFF_FILE}, ${REL_LOG_FILE}. -> Result: worked"
+        finalize_v1_verification_handoff "$TASK_FILE" "$LEFT_OFF_SUMMARY" "$ATTEMPT_ENTRY"
+        log_execution "$TASK_FILE" "Executor handoff complete: awaiting human verification"
+    fi
+
     echo ""
     echo -e "${GREEN}Execution complete${NC}"
     echo "  Task file: $TASK_FILE"
-    echo "  Status: executed"
+    echo "  Status: $FINAL_STATUS"
     echo "  Log: $LOG_FILE"
     echo "  Diff: $DIFF_FILE"
     echo ""
-    echo "Next: Review the diff and execution log, then run the critic or merge."
+    if [ "$FINAL_STATUS" = "needs verification" ]; then
+        echo "Next: Review or verify the task, then close it after human verification."
+    else
+        echo "Next: Review the diff and execution log, then run the critic or merge."
+    fi
 
     exit 0
 fi
@@ -1568,11 +1702,11 @@ if [ "${1:-}" = "review" ]; then
         exit 1
     fi
 
-    # Status gate: only "executed", "fixed", or "reviewing" (stuck) tasks can be reviewed
+    # Status gate: only executed, verification-ready, fixed, or reviewing tasks can be reviewed
     CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
-    if [ "$CURRENT_STATUS" != "executed" ] && [ "$CURRENT_STATUS" != "fixed" ] && [ "$CURRENT_STATUS" != "reviewing" ]; then
-        echo -e "${RED}Task status is '$CURRENT_STATUS', expected 'executed', 'fixed', or 'reviewing'${NC}"
-        echo "Only executed, fixed, or reviewing (stuck) tasks can be reviewed."
+    if [ "$CURRENT_STATUS" != "executed" ] && [ "$CURRENT_STATUS" != "needs verification" ] && [ "$CURRENT_STATUS" != "fixed" ] && [ "$CURRENT_STATUS" != "reviewing" ]; then
+        echo -e "${RED}Task status is '$CURRENT_STATUS', expected 'executed', 'needs verification', 'fixed', or 'reviewing'${NC}"
+        echo "Only executed, needs verification, fixed, or reviewing (stuck) tasks can be reviewed."
         exit 1
     fi
 
@@ -3041,16 +3175,29 @@ main_lead() {
 
     case "$final_status" in
         executed)
-            log_execution "$TASK_FILE" "Lead completed: plan approved and executed"
-            echo -e "${GREEN}Plan approved and executed${NC}"
-            echo "  Task file: $TASK_FILE"
-            echo "  Status: executed"
-
             if [ "$NO_REVIEW" = true ]; then
+                local lead_log_file lead_diff_file rel_lead_log_file rel_lead_diff_file lead_exec_signal left_off_summary attempt_entry
+                lead_log_file="$LOG_DIR/pilot-${SLUG}-lead.log"
+                lead_diff_file="$LOG_DIR/pilot-${SLUG}-diff.patch"
+                rel_lead_log_file="${lead_log_file#"$SCRIPT_DIR"/}"
+                rel_lead_diff_file="${lead_diff_file#"$SCRIPT_DIR"/}"
+                lead_exec_signal=$(latest_execution_test_signal "$TASK_FILE")
+                left_off_summary="Automated V1 lead execution completed. Latest execution evidence: ${lead_exec_signal:-Lead completed successfully}. Artifacts: ${rel_lead_diff_file}, ${rel_lead_log_file}. Task is ready for human verification."
+                attempt_entry="- $(date '+%Y-%m-%d'): Routed V1 auto execution completed via lead pipeline. Latest execution evidence: ${lead_exec_signal:-Lead completed successfully}. Artifacts: ${rel_lead_diff_file}, ${rel_lead_log_file}. -> Result: worked"
+                finalize_v1_verification_handoff "$TASK_FILE" "$left_off_summary" "$attempt_entry"
+                log_execution "$TASK_FILE" "Lead completed: plan approved, executed, and handed off for human verification"
+                echo -e "${GREEN}Plan approved and executed${NC}"
+                echo "  Task file: $TASK_FILE"
+                echo "  Status: needs verification"
                 echo ""
-                echo "  --no-review: skipping auto-review"
-                echo "  Next: ./lauren-loop.sh review $SLUG"
+                echo "  --no-review: routed V1 auto stops after execution handoff"
+                echo "  Next: ./lauren-loop.sh review $SLUG or ./lauren-loop.sh verify $SLUG"
             else
+                log_execution "$TASK_FILE" "Lead completed: plan approved and executed"
+                echo -e "${GREEN}Plan approved and executed${NC}"
+                echo "  Task file: $TASK_FILE"
+                echo "  Status: executed"
+
                 # Auto-chain: review → fix → re-review (max 2 fix cycles)
                 local fix_cycle=0
                 local max_fix_cycles=2

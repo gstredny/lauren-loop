@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")" && pwd)"
 TMP_BASE="${TMPDIR:-/tmp}"
 TMP_BASE="${TMP_BASE%/}"
 TMP_ROOT="$(mktemp -d "${TMP_BASE}/lauren-loop-resume.XXXXXX")"

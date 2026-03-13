@@ -29,3 +29,8 @@
 # ENGINE_PLANNER_B=codex
 # ENGINE_REVIEWER_A=claude
 # ENGINE_REVIEWER_B=codex
+
+# COCOMO II cost comparison (used in cost-summary reports)
+# COCOMO_SLOC_PER_HOUR=20
+# COCOMO_OFFSHORE_RATE=55
+# COCOMO_SDLC_MULTIPLIER=1

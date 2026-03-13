@@ -56,7 +56,14 @@ write_prompt_fixtures() {
     mkdir -p "$root/prompts"
     local prompt
     for prompt in exploration-summarizer planner-a planner-b plan-evaluator critic reviser executor reviewer reviewer-b review-evaluator fix-plan-author fix-executor project-rules; do
-        printf 'placeholder for %s\n' "$prompt" > "$root/prompts/${prompt}.md"
+        case "$prompt" in
+            planner-b|reviewer-b)
+                cp "$REPO_ROOT/prompts/${prompt}.md" "$root/prompts/${prompt}.md"
+                ;;
+            *)
+                printf 'placeholder for %s\n' "$prompt" > "$root/prompts/${prompt}.md"
+                ;;
+        esac
     done
 }
 
@@ -71,6 +78,47 @@ write_plan_evaluation_artifact() {
 Checkpoint plan
 EOF
     printf '{"selected_plan_present":true}\n' > "${path%.*}.contract.json"
+}
+
+write_valid_plan_artifact() {
+    local path="$1" title="${2:-Plan Artifact}" change_label="${3:-Update}" fenced="${4:-yes}"
+    local open_fence="" close_fence=""
+    if [[ "$fenced" != "no" ]]; then
+        open_fence='```xml'
+        close_fence='```'
+    fi
+    cat > "$path" <<EOF
+# ${title}
+
+## Files to Modify
+- \`src/main.py\` — ${change_label}
+
+## Implementation Tasks
+
+${open_fence}
+<wave number="1">
+  <task type="auto">
+    <name>Exercise checkpoint plan validity</name>
+    <files>src/main.py</files>
+    <action>Describe the test-first change without writing code.</action>
+    <verify>bash tests/test_lauren_loop_logic.sh</verify>
+    <done>The plan is valid for resume-path checks.</done>
+  </task>
+</wave>
+${close_fence}
+
+## Testability Design
+- Exercise the checkpointed pipeline through \`lauren_loop_competitive\`.
+
+## Test Strategy
+- Run the Lauren Loop shell tests that use checkpointed plan artifacts.
+
+## Risk Assessment
+- Keep checkpoint validation aligned with the live planner contract.
+
+## Dependencies
+- None.
+EOF
 }
 
 write_plan_critique_artifact() {
@@ -292,8 +340,8 @@ seed_phase4_checkpoints() {
     local root="$1" slug="$2"
     local comp_dir="$root/docs/tasks/open/$slug/competitive"
     printf 'explore summary\n' > "$comp_dir/exploration-summary.md"
-    printf 'plan a\n' > "$comp_dir/plan-a.md"
-    printf 'plan b\n' > "$comp_dir/plan-b.md"
+    write_valid_plan_artifact "$comp_dir/plan-a.md" "Plan A" "Checkpoint update"
+    write_valid_plan_artifact "$comp_dir/plan-b.md" "Plan B" "Checkpoint alternative"
     printf 'revised plan\n' > "$comp_dir/revised-plan.md"
     write_plan_critique_artifact "$comp_dir/plan-critique.md" "EXECUTE"
     printf 'diff --git a/x b/x\n' > "$comp_dir/execution-diff.patch"
@@ -310,6 +358,7 @@ eval "$(
 
 # Direct V1 legacy coverage for the dormant planner/critic path.
 eval "$(sed -n '/^task_file_stem() {/,/^}/p' "$REPO_ROOT/lauren-loop.sh")"
+eval "$(sed -n '/^_pick_load_ranked_tasks() {/,/^}/p' "$REPO_ROOT/lauren-loop.sh")"
 eval "$(sed -n '/^run_critic() {/,/^}/p' "$REPO_ROOT/lauren-loop.sh")"
 
 (
@@ -556,6 +605,7 @@ EOF
 #!/bin/bash
 set -euo pipefail
 REPO_ROOT="$REPO_ROOT"
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
 source "\$REPO_ROOT/lib/lauren-loop-utils.sh"
 SCRIPT_DIR="\$REPO_ROOT"
 eval "\$(
@@ -565,6 +615,8 @@ eval "\$(
 )"
 MODEL="opus"
 LOCK_DIR="$lock_dir"
+SLUG="test-task"
+GOAL="test goal"
 INTERNAL=false
 _LOCK_ACQUIRED=false
 acquire_lock
@@ -580,6 +632,8 @@ EOF
         sleep 0.05
     done
     LOCK_DIR="$lock_dir"
+    SLUG="test-task"
+    GOAL="test goal"
     INTERNAL=false
     _LOCK_ACQUIRED=false
     set +e
@@ -588,8 +642,157 @@ EOF
     set -e
     wait "$child_pid"
     [[ "$rc" -ne 0 ]]
-) && pass "5. acquire_lock — second process fails on contention" \
-  || fail "5. acquire_lock — second process fails on contention"
+) && pass "5. acquire_lock — same slug, second process fails on contention" \
+  || fail "5. acquire_lock — same slug, second process fails on contention"
+
+(
+    lock_dir="$TMP_ROOT/lock-parallel.d"
+    child="$TMP_ROOT/lock-holder-parallel.sh"
+    cat > "$child" <<EOF
+#!/bin/bash
+set -euo pipefail
+REPO_ROOT="$REPO_ROOT"
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+source "\$REPO_ROOT/lib/lauren-loop-utils.sh"
+SCRIPT_DIR="\$REPO_ROOT"
+eval "\$(
+    sed -n '/^## Pricing constants/,/^usage()/{ /^usage()/d; p; }' "\$REPO_ROOT/lauren-loop-v2.sh" \
+        | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
+        | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
+)"
+MODEL="opus"
+LOCK_DIR="$lock_dir"
+SLUG="slug-alpha"
+GOAL="alpha goal"
+INTERNAL=false
+_LOCK_ACQUIRED=false
+acquire_lock
+printf 'ready\n' > "$TMP_ROOT/parallel.ready"
+sleep 3
+release_lock
+EOF
+    chmod +x "$child"
+    "$child" &
+    child_pid=$!
+    for _ in $(seq 1 100); do
+        [[ -f "$TMP_ROOT/parallel.ready" ]] && break
+        sleep 0.05
+    done
+    LOCK_DIR="$lock_dir"
+    SLUG="slug-beta"
+    GOAL="beta goal"
+    INTERNAL=false
+    _LOCK_ACQUIRED=false
+    set +e
+    acquire_lock >/dev/null 2>&1
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]]
+    [[ -f "$lock_dir/slug-alpha/pid" ]]
+    [[ -f "$lock_dir/slug-beta/pid" ]]
+    release_lock 2>/dev/null || true
+    wait "$child_pid"
+    [[ ! -d "$lock_dir" || -z "$(ls -A "$lock_dir")" ]]
+) && pass "5b. acquire_lock — different slugs succeed in parallel" \
+  || fail "5b. acquire_lock — different slugs succeed in parallel"
+
+(
+    lock_dir="$TMP_ROOT/lock-git-safe.d"
+    bin_dir="$TMP_ROOT/git-stub/bin"
+    mkdir -p "$bin_dir"
+    cat > "$bin_dir/git" <<'EOF'
+#!/bin/bash
+exit 1
+EOF
+    chmod +x "$bin_dir/git"
+    PATH="$bin_dir:$PATH"
+    LOCK_DIR="$lock_dir"
+    SLUG="gitless-lock"
+    GOAL="gitless goal"
+    INTERNAL=false
+    _LOCK_ACQUIRED=false
+    acquire_lock >/dev/null 2>&1
+    [[ -f "$lock_dir/gitless-lock/pid" ]]
+    release_lock
+    [[ ! -d "$lock_dir/gitless-lock" ]]
+) && pass "5c. acquire_lock — succeeds when git warning path is unavailable" \
+  || fail "5c. acquire_lock — succeeds when git warning path is unavailable"
+
+(
+    lock_dir="$TMP_ROOT/lock-stale-race.d"
+    mkdir -p "$lock_dir/stale-race"
+    dead_pid=$(bash -c 'echo $$')
+    echo "$dead_pid" > "$lock_dir/stale-race/pid"
+    child="$TMP_ROOT/stale-lock-racer.sh"
+    cat > "$child" <<EOF
+#!/bin/bash
+set -euo pipefail
+REPO_ROOT="$REPO_ROOT"
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC='\033[0m'
+source "\$REPO_ROOT/lib/lauren-loop-utils.sh"
+SCRIPT_DIR="\$REPO_ROOT"
+eval "\$(
+    sed -n '/^## Pricing constants/,/^usage()/{ /^usage()/d; p; }' "\$REPO_ROOT/lauren-loop-v2.sh" \
+        | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
+        | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
+)"
+label="\$1"
+MODEL="opus"
+LOCK_DIR="$lock_dir"
+SLUG="stale-race"
+GOAL="stale race \$label"
+INTERNAL=false
+_LOCK_ACQUIRED=false
+start_file="$TMP_ROOT/stale-race.start"
+release_file="$TMP_ROOT/stale-race.release"
+while [[ ! -f "\$start_file" ]]; do
+    sleep 0.05
+done
+set +e
+acquire_lock >/dev/null 2>&1
+rc=\$?
+set -e
+printf '%s\n' "\$rc" > "$TMP_ROOT/stale-race.\$label.rc"
+if [[ "\$rc" -eq 0 ]]; then
+    printf '%s\n' "\$\$" > "$TMP_ROOT/stale-race.\$label.pid"
+    while [[ ! -f "\$release_file" ]]; do
+        sleep 0.05
+    done
+    release_lock
+fi
+EOF
+    chmod +x "$child"
+    "$child" a &
+    child_a=$!
+    "$child" b &
+    child_b=$!
+    : > "$TMP_ROOT/stale-race.start"
+    for _ in $(seq 1 100); do
+        [[ -f "$TMP_ROOT/stale-race.a.rc" && -f "$TMP_ROOT/stale-race.b.rc" ]] && break
+        sleep 0.05
+    done
+    [[ -f "$TMP_ROOT/stale-race.a.rc" ]]
+    [[ -f "$TMP_ROOT/stale-race.b.rc" ]]
+    rc_a=$(cat "$TMP_ROOT/stale-race.a.rc")
+    rc_b=$(cat "$TMP_ROOT/stale-race.b.rc")
+    success_count=0
+    [[ "$rc_a" -eq 0 ]] && success_count=$((success_count + 1))
+    [[ "$rc_b" -eq 0 ]] && success_count=$((success_count + 1))
+    [[ "$success_count" -eq 1 ]]
+    if [[ "$rc_a" -eq 0 ]]; then
+        winner_label="a"
+    else
+        winner_label="b"
+    fi
+    [[ -f "$lock_dir/stale-race/pid" ]]
+    [[ "$(tr -d '[:space:]' < "$lock_dir/stale-race/pid")" == "$(tr -d '[:space:]' < "$TMP_ROOT/stale-race.$winner_label.pid")" ]]
+    [[ ! -e "$lock_dir/stale-race/.reclaim" ]]
+    : > "$TMP_ROOT/stale-race.release"
+    wait "$child_a"
+    wait "$child_b"
+    [[ ! -d "$lock_dir/stale-race" ]]
+) && pass "5d. acquire_lock — concurrent stale recovery yields a single owner" \
+  || fail "5d. acquire_lock — concurrent stale recovery yields a single owner"
 
 (
     TASK_LOG_DIR="$TMP_ROOT/cost-merge"
@@ -942,6 +1145,74 @@ EOF
 ) && pass "12. cycle state resume — resumes into later subphase" \
   || fail "12. cycle state resume — resumes into later subphase"
 
+(
+    slug="single-plan-auto-strict"
+    fixture_root="$(setup_pipeline_fixture "$slug" "$slug")"
+    ROLE_LOG="$TMP_ROOT/${slug}.roles"
+    : > "$ROLE_LOG"
+    SCRIPT_DIR="$fixture_root"
+    MODEL="opus"
+    PROJECT_RULES=""
+    AGENT_SETTINGS='{}'
+    set_runtime_defaults
+    stub_manifest_hooks
+    FORCE_RERUN=false
+    LAUREN_LOOP_STRICT=false
+    ENGINE_EXPLORE="claude"
+    ENGINE_PLANNER_A="claude"
+    ENGINE_PLANNER_B="claude"
+    prepare_agent_request() { AGENT_PROMPT_BODY="$3"; AGENT_SYSTEM_PROMPT=""; }
+    start_agent_monitor() { :; }
+    stop_agent_monitor() { :; }
+    capture_diff_artifact() { printf 'diff --git a/x b/x\n' > "$2"; }
+    check_diff_scope() { return 0; }
+    _classify_diff_risk() { printf 'LOW\n'; }
+    _block_on_untracked_files() { return 0; }
+    _check_cost_ceiling() { return 0; }
+    _print_cost_summary() { :; }
+    _print_phase_timing() { :; }
+    run_agent() {
+        local role="$1" _engine="$2" _body="$3" _system="$4" output="$5" log_file="$6"
+        : > "$log_file"
+        printf '%s\n' "$role" >> "$ROLE_LOG"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nPlanning context.\n' > "$output"
+                ;;
+            planner-a)
+                printf 'partial planner a\n' > "$output"
+                return 1
+                ;;
+            planner-b)
+                write_valid_plan_artifact "$output" "Plan B" "Production cutover plan"
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+    (
+        cd "$fixture_root"
+        lauren_loop_competitive "$slug" "production cutover deployment"
+    )
+    handoff="$fixture_root/docs/tasks/open/$slug/competitive/human-review-handoff.md"
+    task_file="$fixture_root/docs/tasks/open/$slug/task.md"
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    [[ -f "$handoff" ]]
+    grep -q 'Final review verdict: SINGLE_PLANNER' "$handoff"
+    ! grep -q '^evaluator$' "$ROLE_LOG"
+    [[ ! -f "$fixture_root/docs/tasks/open/$slug/competitive/revised-plan.md" ]]
+    grep -q 'Single planner halt' "$task_file"
+) && pass "12b. auto strict halts on a single surviving planner" \
+  || fail "12b. auto strict halts on a single surviving planner"
+
+(
+    ! _task_auto_strict_reason "authorizer-cleanup" "authorization helper maintenance" >/dev/null 2>&1
+    _task_auto_strict_reason "prod-cutover" "production cutover deployment" | grep -q 'deployment or production-cutover'
+) && pass "12c. auto strict matching is conservative and catches prod cutover" \
+  || fail "12c. auto strict matching is conservative and catches prod cutover"
+
 # Use the documented zero-cost sentinel here; an empty value is now
 # legitimately repopulated by `.lauren-loop.conf` during V2 startup.
 (
@@ -953,6 +1224,16 @@ EOF
     echo "$output" | grep -q 'Strict mode requires LAUREN_LOOP_MAX_COST'
 ) && pass "13. strict mode — live run requires cost ceiling" \
   || fail "13. strict mode — live run requires cost ceiling"
+
+(
+    set +e
+    output="$(LAUREN_LOOP_MAX_COST=0 bash "$REPO_ROOT/lauren-loop-v2.sh" prod-cutover "production cutover deployment" 2>&1)"
+    rc=$?
+    set -e
+    [[ "$rc" -ne 0 ]]
+    echo "$output" | grep -q 'Strict mode requires LAUREN_LOOP_MAX_COST'
+) && pass "13b. auto strict live run also requires a cost ceiling" \
+  || fail "13b. auto strict live run also requires a cost ceiling"
 
 (
     set +e
@@ -1274,9 +1555,9 @@ TEST_CMD="python -m pytest"
 LINT_CMD="python -m flake8"
 EOF
     source "$conf_root/.lauren-loop.conf"
-    PROJECT_NAME="${PROJECT_NAME:-$(basename "${LAUREN_LOOP_PROJECT_DIR:-$SCRIPT_DIR}")}"
-    TEST_CMD="${TEST_CMD:-pytest tests/ -x -q}"
-    LINT_CMD="${LINT_CMD:-flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
+    PROJECT_NAME="${PROJECT_NAME:-AskGeorge}"
+    TEST_CMD="${TEST_CMD:-.venv/bin/python -m pytest tests/ -x -q}"
+    LINT_CMD="${LINT_CMD:-.venv/bin/python -m flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
     [ "$PROJECT_NAME" = "TestProject" ]
     [ "$TEST_CMD" = "python -m pytest" ]
     [ "$LINT_CMD" = "python -m flake8" ]
@@ -1285,11 +1566,11 @@ EOF
 
 (
     PROJECT_NAME="" TEST_CMD="" LINT_CMD=""
-    PROJECT_NAME="${PROJECT_NAME:-$(basename "${LAUREN_LOOP_PROJECT_DIR:-$SCRIPT_DIR}")}"
-    TEST_CMD="${TEST_CMD:-pytest tests/ -x -q}"
-    LINT_CMD="${LINT_CMD:-flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
-    [ -n "$PROJECT_NAME" ]
-    [ "$TEST_CMD" = "pytest tests/ -x -q" ]
+    PROJECT_NAME="${PROJECT_NAME:-AskGeorge}"
+    TEST_CMD="${TEST_CMD:-.venv/bin/python -m pytest tests/ -x -q}"
+    LINT_CMD="${LINT_CMD:-.venv/bin/python -m flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
+    [ "$PROJECT_NAME" = "AskGeorge" ]
+    [ "$TEST_CMD" = ".venv/bin/python -m pytest tests/ -x -q" ]
 ) && pass "22. fallback defaults work when conf doesn't set PROJECT_NAME" \
   || fail "22. fallback defaults work when conf doesn't set PROJECT_NAME"
 
@@ -1405,17 +1686,14 @@ Ranking explanation here.
 1|task-a.md|Goal A|Low
 2|task-b.md|Goal B|High
 PICKEOF
-    _PICK_PARSER_TIER=""
-    TASK_LINES=""
-    if grep -q '^## TASK_LIST' "$PICK_TEMP"; then
-        TASK_LINES=$(sed -n '/^## TASK_LIST/,$ { /^## TASK_LIST/d; p; }' "$PICK_TEMP" \
-            | sed '/^[[:space:]]*$/d' \
-            | grep -E '^[0-9]+\|.+\|.+\|.+$' || true)
-    fi
-    [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="primary"
+    _pick_load_ranked_tasks "$PICK_TEMP" > "$TMP_ROOT/gap4-primary.out"
     [ "$_PICK_PARSER_TIER" = "primary" ]
-) && pass "34. Gap 4: primary parser tier detected" \
-  || fail "34. Gap 4: primary parser tier detected"
+    [ "$PICK_COUNT" -eq 2 ]
+    [ "${PICK_FILES[0]}" = "task-a.md" ]
+    [ "${PICK_GOALS[1]}" = "Goal B" ]
+    [ "${PICK_COMPLEXITY[1]}" = "High" ]
+) && pass "34. Gap 4: primary parser helper detects tier and builds arrays" \
+  || fail "34. Gap 4: primary parser helper detects tier and builds arrays"
 
 (
     PICK_TEMP="$TMP_ROOT/gap4-bold-bracket.txt"
@@ -1423,22 +1701,13 @@ PICKEOF
 **1. [task-a.md]** — Goal A
 **2. [task-b.md]** — Goal B
 PICKEOF
-    _PICK_PARSER_TIER=""
-    TASK_LINES=""
-    if grep -q '^## TASK_LIST' "$PICK_TEMP"; then
-        TASK_LINES=$(sed -n '/^## TASK_LIST/,$ { /^## TASK_LIST/d; p; }' "$PICK_TEMP" \
-            | sed '/^[[:space:]]*$/d' \
-            | grep -E '^[0-9]+\|.+\|.+\|.+$' || true)
-    fi
-    [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="primary"
-    if [ -z "$TASK_LINES" ]; then
-        TASK_LINES=$(grep -oE '\*\*[0-9]+\. \[([^]]+)\]\*\* — (.+)' "$PICK_TEMP" \
-            | sed -E 's/\*\*([0-9]+)\. \[([^]]+)\]\*\* — (.*)/\1|\2|\3|Unknown/' || true)
-        [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="bold-bracket"
-    fi
+    _pick_load_ranked_tasks "$PICK_TEMP" > "$TMP_ROOT/gap4-bold-bracket.out"
     [ "$_PICK_PARSER_TIER" = "bold-bracket" ]
-) && pass "35. Gap 4: bold-bracket fallback parser tier detected" \
-  || fail "35. Gap 4: bold-bracket fallback parser tier detected"
+    [ "$PICK_COUNT" -eq 2 ]
+    [ "${PICK_FILES[1]}" = "task-b.md" ]
+    [ "${PICK_COMPLEXITY[0]}" = "Unknown" ]
+) && pass "35. Gap 4: bold-bracket helper uses fallback and builds arrays" \
+  || fail "35. Gap 4: bold-bracket helper uses fallback and builds arrays"
 
 (
     PICK_TEMP="$TMP_ROOT/gap4-bold-plain.txt"
@@ -1446,77 +1715,195 @@ PICKEOF
 **1. task-a.md** — Goal A
 **2. task-b.md** — Goal B
 PICKEOF
-    _PICK_PARSER_TIER=""
-    TASK_LINES=""
-    if grep -q '^## TASK_LIST' "$PICK_TEMP"; then
-        TASK_LINES=$(sed -n '/^## TASK_LIST/,$ { /^## TASK_LIST/d; p; }' "$PICK_TEMP" \
-            | sed '/^[[:space:]]*$/d' \
-            | grep -E '^[0-9]+\|.+\|.+\|.+$' || true)
-    fi
-    [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="primary"
-    if [ -z "$TASK_LINES" ]; then
-        TASK_LINES=$(grep -oE '\*\*[0-9]+\. \[([^]]+)\]\*\* — (.+)' "$PICK_TEMP" \
-            | sed -E 's/\*\*([0-9]+)\. \[([^]]+)\]\*\* — (.*)/\1|\2|\3|Unknown/' || true)
-        [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="bold-bracket"
-    fi
-    if [ -z "$TASK_LINES" ]; then
-        TASK_LINES=$(grep -oE '\*\*[0-9]+\. [^*]+\*\* — .+' "$PICK_TEMP" \
-            | sed -E 's/\*\*([0-9]+)\. ([^*]+)\*\* — (.*)/\1|\2|\3|Unknown/' || true)
-        [ -n "$TASK_LINES" ] && _PICK_PARSER_TIER="bold-plain"
-    fi
+    _pick_load_ranked_tasks "$PICK_TEMP" > "$TMP_ROOT/gap4-bold-plain.out"
     [ "$_PICK_PARSER_TIER" = "bold-plain" ]
-) && pass "36. Gap 4: bold-plain fallback parser tier detected" \
-  || fail "36. Gap 4: bold-plain fallback parser tier detected"
+    [ "$PICK_COUNT" -eq 2 ]
+    [ "${PICK_GOALS[0]}" = "Goal A" ]
+    [ "${PICK_COMPLEXITY[1]}" = "Unknown" ]
+) && pass "36. Gap 4: bold-plain helper uses fallback and builds arrays" \
+  || fail "36. Gap 4: bold-plain helper uses fallback and builds arrays"
 
-# Gap 9: Cross-version lock awareness
+# Planner artifact validation regressions
+(
+    fenced_plan="$TMP_ROOT/planner-valid-fenced.md"
+    write_valid_plan_artifact "$fenced_plan" "Plan Artifact" "Fenced valid plan" "yes"
+    _validate_agent_output_for_role "planner-a" "$fenced_plan"
+) && pass "37. planner validation accepts fenced valid artifacts" \
+  || fail "37. planner validation accepts fenced valid artifacts"
+
+(
+    unfenced_plan="$TMP_ROOT/planner-valid-unfenced.md"
+    write_valid_plan_artifact "$unfenced_plan" "Plan Artifact" "Unfenced valid plan" "no"
+    _validate_agent_output_for_role "planner-a" "$unfenced_plan"
+) && pass "38. planner validation accepts unfenced valid artifacts" \
+  || fail "38. planner validation accepts unfenced valid artifacts"
+
+(
+    invalid_plan="$TMP_ROOT/planner-invalid-unbalanced-fence.md"
+    write_valid_plan_artifact "$invalid_plan" "Plan Artifact" "Broken fence plan" "yes"
+    printf '```xml\n' >> "$invalid_plan"
+    ! _validate_agent_output_for_role "planner-a" "$invalid_plan"
+) && pass "39. planner validation rejects unbalanced fenced artifacts" \
+  || fail "39. planner validation rejects unbalanced fenced artifacts"
+
+(
+    misplaced_plan="$TMP_ROOT/planner-invalid-misplaced-tasks.md"
+    cat > "$misplaced_plan" <<'EOF'
+# Plan Artifact
+
+## Files to Modify
+- `src/main.py` — Misplaced task structure
+
+## Implementation Tasks
+Task details moved to the wrong section.
+
+## Testability Design
+```xml
+<wave number="1">
+  <task type="auto">
+    <name>Misplaced task structure</name>
+    <files>src/main.py</files>
+    <action>Describe the test-first change without writing code.</action>
+    <verify>bash tests/test_lauren_loop_logic.sh</verify>
+    <done>The validator must reject XML blocks outside Implementation Tasks.</done>
+  </task>
+</wave>
+```
+
+## Test Strategy
+- Run the Lauren Loop shell tests that use checkpointed plan artifacts.
+
+## Risk Assessment
+- Keep checkpoint validation aligned with the live planner contract.
+
+## Dependencies
+- None.
+EOF
+    ! _validate_agent_output_for_role "planner-a" "$misplaced_plan"
+) && pass "40. planner validation rejects task blocks outside Implementation Tasks" \
+  || fail "40. planner validation rejects task blocks outside Implementation Tasks"
+
+(
+    stub_bin="$TMP_ROOT/pick-bin"
+    stub_home="$TMP_ROOT/pick-home"
+    cache_user="lauren-loop-pick-$$"
+    mkdir -p "$stub_bin" "$stub_home"
+    cat > "$stub_bin/claude" <<'EOF'
+#!/bin/bash
+exit 99
+EOF
+    chmod +x "$stub_bin/claude"
+    project_hash=$(printf '%s' "$REPO_ROOT" | md5 -q 2>/dev/null || printf '%s' "$REPO_ROOT" | md5sum | cut -c1-8)
+    project_hash="${project_hash:0:8}"
+    next_cache="/tmp/lauren-loop-next-${cache_user}-${project_hash}.txt"
+    cat > "$next_cache" <<'EOF'
+Ranking explanation here.
+
+## TASK_LIST
+1|docs/tasks/open/fix-lauren-loop-planner-validator-and-pick-regression.md|Fix the Lauren Loop planner validator and pick regression|Low
+EOF
+
+    set +e
+    output=$(PATH="$stub_bin:$PATH" HOME="$stub_home" USER="$cache_user" bash "$REPO_ROOT/lauren-loop.sh" pick 2>&1)
+    rc=$?
+    set -e
+    rm -f "$next_cache"
+
+    [[ "$rc" -eq 0 ]]
+    echo "$output" | grep -q 'Using cached ranking'
+    echo "$output" | grep -q 'Select a task'
+    echo "$output" | grep -q 'Cancelled.'
+    ! echo "$output" | grep -q 'local: can only be used in a function'
+) && pass "41. lauren-loop.sh pick reaches the real menu path without top-level local crashes" \
+  || fail "41. lauren-loop.sh pick reaches the real menu path without top-level local crashes"
+
+# Gap 9: Cross-version lock awareness (per-slug V2 layout)
 (
     lock_dir="$(mktemp -d "$TMP_ROOT/v2lock.XXXXXX")"
-    echo "$$" > "$lock_dir/pid"
-    echo "my-task" > "$lock_dir/slug"
+    mkdir -p "$lock_dir/my-task"
+    echo "$$" > "$lock_dir/my-task/pid"
     _V2_LOCK_DIR="$lock_dir" _check_cross_version_lock "v1" "my-task"
     rc=$?
     [ "$rc" -eq 1 ]
-) && pass "37. Gap 9: cross-lock warns when V2 holds same slug (returns 1)" \
-  || fail "37. Gap 9: cross-lock warns when V2 holds same slug (returns 1)"
+) && pass "42. Gap 9: cross-lock warns when V2 holds same slug (returns 1)" \
+  || fail "42. Gap 9: cross-lock warns when V2 holds same slug (returns 1)"
 
 (
     lock_dir="$(mktemp -d "$TMP_ROOT/v2lock.XXXXXX")"
-    echo "$$" > "$lock_dir/pid"
-    echo "other-task" > "$lock_dir/slug"
+    mkdir -p "$lock_dir/other-task"
+    echo "$$" > "$lock_dir/other-task/pid"
     _V2_LOCK_DIR="$lock_dir" _check_cross_version_lock "v1" "my-task"
     rc=$?
     [ "$rc" -eq 0 ]
-) && pass "38. Gap 9: cross-lock silent when V2 holds different slug (returns 0)" \
-  || fail "38. Gap 9: cross-lock silent when V2 holds different slug (returns 0)"
+) && pass "43. Gap 9: cross-lock silent when V2 holds different slug (returns 0)" \
+  || fail "43. Gap 9: cross-lock silent when V2 holds different slug (returns 0)"
 
 (
     lock_dir="$(mktemp -d "$TMP_ROOT/v2lock.XXXXXX")"
     dead_pid=$(bash -c 'echo $$')
-    echo "$dead_pid" > "$lock_dir/pid"
-    echo "my-task" > "$lock_dir/slug"
+    mkdir -p "$lock_dir/my-task"
+    echo "$dead_pid" > "$lock_dir/my-task/pid"
     _V2_LOCK_DIR="$lock_dir" _check_cross_version_lock "v1" "my-task"
     rc=$?
     [ "$rc" -eq 0 ]
-) && pass "39. Gap 9: cross-lock ignores dead PID (returns 0)" \
-  || fail "39. Gap 9: cross-lock ignores dead PID (returns 0)"
+) && pass "44. Gap 9: cross-lock ignores dead PID (returns 0)" \
+  || fail "44. Gap 9: cross-lock ignores dead PID (returns 0)"
 
 (
     lock_dir="$TMP_ROOT/v2lock-nonexistent"
     _V2_LOCK_DIR="$lock_dir" _check_cross_version_lock "v1" "my-task"
     rc=$?
     [ "$rc" -eq 0 ]
-) && pass "40. Gap 9: cross-lock returns 0 when no lock dir exists" \
-  || fail "40. Gap 9: cross-lock returns 0 when no lock dir exists"
+) && pass "45. Gap 9: cross-lock returns 0 when no lock dir exists" \
+  || fail "45. Gap 9: cross-lock returns 0 when no lock dir exists"
 
 (
     lock_dir="$(mktemp -d "$TMP_ROOT/v2lock.XXXXXX")"
-    echo "$$" > "$lock_dir/pid"
-    # No slug file written
+    # No per-slug dir at all for my-task
     _V2_LOCK_DIR="$lock_dir" _check_cross_version_lock "v1" "my-task"
     rc=$?
     [ "$rc" -eq 0 ]
-) && pass "41. Gap 9: cross-lock returns 0 when PID alive but no slug file" \
-  || fail "41. Gap 9: cross-lock returns 0 when PID alive but no slug file"
+) && pass "46. Gap 9: cross-lock returns 0 when no per-slug lock dir exists" \
+  || fail "46. Gap 9: cross-lock returns 0 when no per-slug lock dir exists"
+
+# _list_running_v2_instances / _is_slug_running_v2 tests
+(
+    lock_dir="$(mktemp -d "$TMP_ROOT/v2enum.XXXXXX")"
+    mkdir -p "$lock_dir/alive-task"
+    echo "$$" > "$lock_dir/alive-task/pid"
+    echo "alive goal" > "$lock_dir/alive-task/goal"
+    dead_pid=$(bash -c 'echo $$')
+    mkdir -p "$lock_dir/dead-task"
+    echo "$dead_pid" > "$lock_dir/dead-task/pid"
+    echo "dead goal" > "$lock_dir/dead-task/goal"
+    output=$(_V2_LOCK_DIR="$lock_dir" _list_running_v2_instances)
+    echo "$output" | grep -q "alive-task"
+    ! echo "$output" | grep -q "dead-task"
+) && pass "47. _list_running_v2_instances lists alive, skips dead" \
+  || fail "47. _list_running_v2_instances lists alive, skips dead"
+
+(
+    lock_dir="$(mktemp -d "$TMP_ROOT/v2enum.XXXXXX")"
+    mkdir -p "$lock_dir/active-slug"
+    echo "$$" > "$lock_dir/active-slug/pid"
+    _V2_LOCK_DIR="$lock_dir" _is_slug_running_v2 "active-slug"
+) && pass "48. _is_slug_running_v2 returns 0 for active slug" \
+  || fail "48. _is_slug_running_v2 returns 0 for active slug"
+
+(
+    lock_dir="$(mktemp -d "$TMP_ROOT/v2enum.XXXXXX")"
+    ! _V2_LOCK_DIR="$lock_dir" _is_slug_running_v2 "missing-slug"
+) && pass "49. _is_slug_running_v2 returns 1 for missing slug" \
+  || fail "49. _is_slug_running_v2 returns 1 for missing slug"
+
+(
+    lock_dir="$(mktemp -d "$TMP_ROOT/v2enum.XXXXXX")"
+    dead_pid=$(bash -c 'echo $$')
+    mkdir -p "$lock_dir/stale-slug"
+    echo "$dead_pid" > "$lock_dir/stale-slug/pid"
+    ! _V2_LOCK_DIR="$lock_dir" _is_slug_running_v2 "stale-slug"
+) && pass "50. _is_slug_running_v2 returns 1 for dead PID" \
+  || fail "50. _is_slug_running_v2 returns 1 for dead PID"
 
 echo ""
 echo "============================="
