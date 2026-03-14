@@ -488,6 +488,52 @@ _validate_agent_output_for_role() {
     esac
 }
 
+_promote_latest_valid_attempt() {
+    local role="$1" canonical_path="$2"
+    local extension="" stem="$canonical_path"
+    local artifact_dir artifact_base candidate attempt_number
+    local -a attempts=()
+
+    [[ -n "$canonical_path" ]] || return 1
+    [[ -f "$canonical_path" ]] && return 0
+
+    if [[ "$canonical_path" == *.* ]]; then
+        extension=".${canonical_path##*.}"
+        stem="${canonical_path%${extension}}"
+    fi
+    artifact_dir=$(dirname "$canonical_path")
+    artifact_base=$(basename "$stem")
+
+    for candidate in "$artifact_dir"/"${artifact_base}.attempt-"*"$extension"; do
+        [[ -f "$candidate" ]] || continue
+        attempt_number=$(basename "$candidate")
+        attempt_number="${attempt_number#${artifact_base}.attempt-}"
+        attempt_number="${attempt_number%${extension}}"
+        [[ "$attempt_number" =~ ^[0-9]+$ ]] || continue
+        attempts+=("${attempt_number}:${candidate}")
+    done
+
+    if [[ ${#attempts[@]} -eq 0 ]]; then
+        printf '[codex-attempt-promote] role=%s no valid attempts found\n' "$role" >&2
+        return 1
+    fi
+
+    local sorted=""
+    sorted=$(printf '%s\n' "${attempts[@]}" | sort -t: -k1 -rn)
+    while IFS=: read -r _ path; do
+        [[ -n "$path" ]] || continue
+        if _validate_agent_output_for_role "$role" "$path" >/dev/null 2>&1; then
+            _atomic_promote_file "$path" "$canonical_path" || continue
+            printf '[codex-attempt-promote] role=%s attempt=%s -> canonical=%s\n' \
+                "$role" "$path" "$canonical_path" >&2
+            return 0
+        fi
+    done <<< "$sorted"
+
+    printf '[codex-attempt-promote] role=%s no valid attempts found\n' "$role" >&2
+    return 1
+}
+
 _terminate_pid_tree() {
     local pid="$1" grace="${2:-$(_agent_terminate_grace_seconds)}"
     kill -0 "$pid" 2>/dev/null || return 0
@@ -2013,6 +2059,284 @@ check_diff_scope() {
     return 0
 }
 
+_traditional_dev_proxy_trim_line() {
+    printf '%s\n' "$1" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//'
+}
+
+_traditional_dev_proxy_unique_nonblank_lines() {
+    awk 'NF { if (!seen[$0]++) print $0 }'
+}
+
+_traditional_dev_proxy_normalize_scope_path() {
+    local raw="$1"
+    raw=$(_traditional_dev_proxy_trim_line "$raw")
+    raw="${raw#./}"
+    raw="${raw#\`}"
+    raw="${raw%\`}"
+    case "$raw" in
+        ""|"N/A"|"n/a"|"None"|"none")
+            return 1
+            ;;
+    esac
+    [[ "$raw" == *"/"* || "$raw" == *"."* ]] || return 1
+    printf '%s\n' "$raw"
+}
+
+_traditional_dev_proxy_extract_files_to_modify_paths() {
+    local source_file="$1"
+    [[ -f "$source_file" ]] || return 0
+    awk '
+        /^##+ Files to Modify/ { found=1; next }
+        found && /^##+ / { exit }
+        found {
+            line = $0
+            while (match(line, /\*\*`[^`]+`\*\*/)) {
+                inner = substr(line, RSTART + 3, RLENGTH - 6)
+                print inner
+                line = substr(line, RSTART + RLENGTH)
+            }
+            line = $0
+            while (match(line, /`[^`]+`/)) {
+                inner = substr(line, RSTART + 1, RLENGTH - 2)
+                if (inner ~ /[\/.]/) print inner
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    ' "$source_file" \
+        | while IFS= read -r path; do
+            _traditional_dev_proxy_normalize_scope_path "$path" || true
+        done \
+        | _traditional_dev_proxy_unique_nonblank_lines
+}
+
+_traditional_dev_proxy_extract_xml_task_paths() {
+    local source_file="$1"
+    [[ -f "$source_file" ]] || return 0
+    awk '
+        {
+            line = $0
+            while (match(line, /<files>[^<]+<\/files>/)) {
+                inner = substr(line, RSTART + 7, RLENGTH - 15)
+                print inner
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    ' "$source_file" \
+        | tr ',' '\n' \
+        | while IFS= read -r path; do
+            _traditional_dev_proxy_normalize_scope_path "$path" || true
+        done \
+        | _traditional_dev_proxy_unique_nonblank_lines
+}
+
+_traditional_dev_proxy_extract_relevant_file_paths() {
+    local task_file="$1"
+    [[ -f "$task_file" ]] || return 0
+    awk '
+        /^## Relevant Files:/ { found=1; next }
+        found && /^## / { exit }
+        found {
+            line = $0
+            while (match(line, /`[^`]+`/)) {
+                inner = substr(line, RSTART + 1, RLENGTH - 2)
+                if (inner ~ /[\/.]/) print inner
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+    ' "$task_file" \
+        | while IFS= read -r path; do
+            _traditional_dev_proxy_normalize_scope_path "$path" || true
+        done \
+        | _traditional_dev_proxy_unique_nonblank_lines
+}
+
+_traditional_dev_proxy_slug_from_task_file() {
+    local task_file="$1"
+    case "$task_file" in
+        */task.md)
+            basename "$(dirname "$task_file")"
+            ;;
+        *.md)
+            basename "$task_file" .md
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_traditional_dev_proxy_competitive_dir() {
+    local task_file="$1"
+    local slug=""
+    slug=$(_traditional_dev_proxy_slug_from_task_file "$task_file") || return 1
+    case "$task_file" in
+        */task.md)
+            printf '%s/competitive\n' "$(dirname "$task_file")"
+            ;;
+        *.md)
+            printf '%s/%s/competitive\n' "$(dirname "$task_file")" "$slug"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_traditional_dev_proxy_is_engineering_path() {
+    local path="$1"
+    path=$(_traditional_dev_proxy_trim_line "$path")
+    path="${path#./}"
+    [[ -n "$path" ]] || return 1
+
+    case "$path" in
+        docs/*|logs/*|competitive/*|*.md|*.markdown|*.txt)
+            return 1
+            ;;
+        */competitive/*|*/logs/*)
+            return 1
+            ;;
+    esac
+
+    case "$path" in
+        */)
+            return 0
+            ;;
+        test_*.sh|*/test_*.sh|*.py|*.sh|*.js|*.jsx|*.ts|*.tsx|*.css|*.scss|*.html|*.sql|*.json|*.yml|*.yaml|*.toml|*.ini)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_traditional_dev_proxy_filter_engineering_paths() {
+    local path=""
+    while IFS= read -r path; do
+        path=$(_traditional_dev_proxy_trim_line "$path")
+        [[ -n "$path" ]] || continue
+        path="${path#./}"
+        if _traditional_dev_proxy_is_engineering_path "$path"; then
+            printf '%s\n' "$path"
+        fi
+    done | _traditional_dev_proxy_unique_nonblank_lines
+}
+
+_traditional_dev_proxy_collect_changed_files() {
+    local before_sha="${1:-}"
+    if [[ -n "$before_sha" ]]; then
+        git diff "$before_sha"..HEAD --name-only 2>/dev/null || true
+    fi
+    git diff --cached --name-only 2>/dev/null || true
+    git diff --name-only 2>/dev/null || true
+}
+
+_traditional_dev_proxy_sum_numstat() {
+    local kind="$1"
+    local before_sha="$2"
+    shift 2
+    local -a scope_args=("$@")
+    local output=""
+
+    case "$kind" in
+        committed)
+            [[ -n "$before_sha" ]] || { echo "0 0"; return 0; }
+            if [[ ${#scope_args[@]} -gt 0 ]]; then
+                output=$(git diff --numstat "$before_sha"..HEAD -- "${scope_args[@]}" 2>/dev/null || true)
+            else
+                output=$(git diff --numstat "$before_sha"..HEAD 2>/dev/null || true)
+            fi
+            ;;
+        staged)
+            if [[ ${#scope_args[@]} -gt 0 ]]; then
+                output=$(git diff --cached --numstat -- "${scope_args[@]}" 2>/dev/null || true)
+            else
+                output=$(git diff --cached --numstat 2>/dev/null || true)
+            fi
+            ;;
+        unstaged)
+            if [[ ${#scope_args[@]} -gt 0 ]]; then
+                output=$(git diff --numstat -- "${scope_args[@]}" 2>/dev/null || true)
+            else
+                output=$(git diff --numstat 2>/dev/null || true)
+            fi
+            ;;
+        *)
+            echo "0 0"
+            return 0
+            ;;
+    esac
+
+    printf '%s\n' "$output" | awk '$1!="-"{i+=$1; d+=$2}END{print i+0, d+0}'
+}
+
+_TRADITIONAL_DEV_PROXY_SCOPE_SOURCE=""
+_TRADITIONAL_DEV_PROXY_SCOPE_PATHS=""
+
+_traditional_dev_proxy_resolve_scope_paths() {
+    local task_file="$1"
+    local route="${2:-}"
+    local before_sha="${3:-}"
+    local scope_paths=""
+    local comp_dir=""
+
+    _TRADITIONAL_DEV_PROXY_SCOPE_SOURCE=""
+    _TRADITIONAL_DEV_PROXY_SCOPE_PATHS=""
+    route=$(printf '%s\n' "$route" | tr '[:upper:]' '[:lower:]')
+
+    if [[ -n "$task_file" && -f "$task_file" ]]; then
+        if [[ "$route" == "v2" || ( -z "$route" && -d "$(_traditional_dev_proxy_competitive_dir "$task_file" 2>/dev/null)" ) ]]; then
+            comp_dir=$(_traditional_dev_proxy_competitive_dir "$task_file" 2>/dev/null || true)
+            if [[ -n "$comp_dir" ]]; then
+                scope_paths=$(
+                    {
+                        _traditional_dev_proxy_extract_files_to_modify_paths "$comp_dir/revised-plan.md"
+                        _traditional_dev_proxy_extract_xml_task_paths "$comp_dir/revised-plan.md"
+                        _traditional_dev_proxy_extract_files_to_modify_paths "$comp_dir/fix-plan.md"
+                        _traditional_dev_proxy_extract_xml_task_paths "$comp_dir/fix-plan.md"
+                    } | _traditional_dev_proxy_unique_nonblank_lines
+                )
+                if [[ -n "$scope_paths" ]]; then
+                    _TRADITIONAL_DEV_PROXY_SCOPE_SOURCE="plan-scope"
+                    _TRADITIONAL_DEV_PROXY_SCOPE_PATHS="$scope_paths"
+                    return 0
+                fi
+            fi
+        fi
+
+        if [[ "$route" != "v2" ]]; then
+            scope_paths=$(_traditional_dev_proxy_extract_files_to_modify_paths "$task_file")
+            if [[ -n "$scope_paths" ]]; then
+                _TRADITIONAL_DEV_PROXY_SCOPE_SOURCE="task-files-to-modify"
+                _TRADITIONAL_DEV_PROXY_SCOPE_PATHS="$scope_paths"
+                return 0
+            fi
+        fi
+
+        scope_paths=$(_traditional_dev_proxy_extract_relevant_file_paths "$task_file")
+        if [[ -n "$scope_paths" ]]; then
+            _TRADITIONAL_DEV_PROXY_SCOPE_SOURCE="task-relevant-files"
+            _TRADITIONAL_DEV_PROXY_SCOPE_PATHS="$scope_paths"
+            return 0
+        fi
+    fi
+
+    scope_paths=$(
+        _traditional_dev_proxy_collect_changed_files "$before_sha" \
+            | while IFS= read -r path; do
+                _traditional_dev_proxy_normalize_scope_path "$path" || true
+            done \
+            | _traditional_dev_proxy_unique_nonblank_lines
+    )
+    if [[ -n "$scope_paths" ]]; then
+        _TRADITIONAL_DEV_PROXY_SCOPE_SOURCE="fallback-changed-files"
+        _TRADITIONAL_DEV_PROXY_SCOPE_PATHS="$scope_paths"
+    else
+        _TRADITIONAL_DEV_PROXY_SCOPE_SOURCE="fallback-empty"
+        _TRADITIONAL_DEV_PROXY_SCOPE_PATHS=""
+    fi
+}
+
 # === CHAOS-CRITIC HELPERS ===
 
 # Extract plan content from task file (between ## Current Plan and next ## header)
@@ -2556,37 +2880,57 @@ read_v2_total_cost() {
 
 compute_cocomo_estimate() {
     local before_sha="${1:-}"
-    if [[ -z "$before_sha" ]]; then echo "N/A"; return 0; fi
-
+    local task_file="${2:-}"
+    local route="${3:-}"
     local sloc_rate="${COCOMO_SLOC_PER_HOUR:-20}"
     local hourly_rate="${COCOMO_OFFSHORE_RATE:-55}"
     local sdlc_mult="${COCOMO_SDLC_MULTIPLIER:-1}"
-
-    # Count insertions and deletions: committed + staged + unstaged (skip binary files where numstat shows "-")
-    # Each awk prints "insertions deletions" in one pass
+    local scope_paths=""
     local committed staged unstaged
-    committed=$(git diff --numstat "${before_sha}..HEAD" 2>/dev/null | awk '$1!="-"{i+=$1; d+=$2}END{print i+0, d+0}') || committed="0 0"
-    staged=$(git diff --cached --numstat 2>/dev/null | awk '$1!="-"{i+=$1; d+=$2}END{print i+0, d+0}') || staged="0 0"
-    unstaged=$(git diff --numstat 2>/dev/null | awk '$1!="-"{i+=$1; d+=$2}END{print i+0, d+0}') || unstaged="0 0"
-    local total_ins=$(( ${committed%% *} + ${staged%% *} + ${unstaged%% *} ))
-    local total_del=$(( ${committed##* } + ${staged##* } + ${unstaged##* } ))
+    local total_ins total_del net_sloc
+    local hours cost
+    local -a scope_args=()
+    local path=""
 
-    if [[ "$total_ins" -eq 0 && "$total_del" -eq 0 ]]; then echo "N/A  (no code changes)"; return 0; fi
+    _traditional_dev_proxy_resolve_scope_paths "$task_file" "$route" "$before_sha"
+    scope_paths=$(
+        printf '%s\n' "$_TRADITIONAL_DEV_PROXY_SCOPE_PATHS" | _traditional_dev_proxy_filter_engineering_paths
+    )
+    _TRADITIONAL_DEV_PROXY_SCOPE_PATHS="$scope_paths"
 
-    # Use net SLOC (insertions minus deletions, floored at 0) — deleted code isn't written production code
-    local net_sloc=$(( total_ins - total_del ))
-    if [[ "$net_sloc" -le 0 ]]; then
-        printf 'N/A  (net deletion: +%d/-%d)' "$total_ins" "$total_del"
+    if [[ -z "$scope_paths" ]]; then
+        echo "N/A  (no scoped engineering changes)"
         return 0
     fi
 
-    local hours cost
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        scope_args+=("$path")
+    done <<< "$scope_paths"
+
+    committed=$(_traditional_dev_proxy_sum_numstat committed "$before_sha" "${scope_args[@]}")
+    staged=$(_traditional_dev_proxy_sum_numstat staged "$before_sha" "${scope_args[@]}")
+    unstaged=$(_traditional_dev_proxy_sum_numstat unstaged "$before_sha" "${scope_args[@]}")
+    total_ins=$(( ${committed%% *} + ${staged%% *} + ${unstaged%% *} ))
+    total_del=$(( ${committed##* } + ${staged##* } + ${unstaged##* } ))
+
+    if [[ "$total_ins" -eq 0 && "$total_del" -eq 0 ]]; then
+        echo "N/A  (no scoped engineering changes)"
+        return 0
+    fi
+
+    net_sloc=$(( total_ins - total_del ))
+    if [[ "$net_sloc" -le 0 ]]; then
+        printf 'N/A  (scoped net deletion: +%d/-%d)' "$total_ins" "$total_del"
+        return 0
+    fi
+
     hours=$(echo "scale=2; $net_sloc / $sloc_rate * $sdlc_mult" | bc 2>/dev/null) || { echo "N/A"; return 0; }
     cost=$(echo "scale=2; $hours * $hourly_rate" | bc 2>/dev/null) || { echo "N/A"; return 0; }
     [[ "$hours" == .* ]] && hours="0$hours"
     [[ "$cost" == .* ]] && cost="0$cost"
 
-    local breakdown="net ${net_sloc} lines (+${total_ins}/-${total_del}) / ${sloc_rate} SLOC/hr × \$${hourly_rate}/hr"
+    local breakdown="COCOMO-inspired heuristic; scoped net ${net_sloc} lines (+${total_ins}/-${total_del}) at ${sloc_rate} SLOC/hr × \$${hourly_rate}/hr"
     [[ "$sdlc_mult" != "1" ]] && breakdown="${breakdown} × ${sdlc_mult}x SDLC"
-    printf '$%s  (%s)' "$cost" "$breakdown"
+    printf '~$%s  (%s)' "$cost" "$breakdown"
 }

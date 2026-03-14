@@ -161,6 +161,7 @@ Not applicable.
 **6. Security:** checked
 **7. Performance:** checked
 **8. Caller Impact:** checked
+**9. Design Decision Validity:** checked
 
 ## Verdict
 

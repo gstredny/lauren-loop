@@ -51,7 +51,7 @@ TASK_LOG_DIR="$TMP_ROOT"
 source "$REPO_ROOT/lib/lauren-loop-utils.sh" 2>/dev/null || true
 
 eval "$(
-    sed -n '/^# Pricing rates/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
         | sed '/^setup_azure_context 2>\/dev\/null || true$/d'
 )"
@@ -74,6 +74,12 @@ write_lauren_loop_prompts() {
         exploration-summarizer.md planner-a.md planner-b.md plan-evaluator.md \
         critic.md reviser.md executor.md reviewer.md reviewer-b.md \
         review-evaluator.md fix-plan-author.md fix-executor.md; do
+        case "$prompt" in
+            planner-b.md|reviewer-b.md)
+                cp "$REPO_ROOT/prompts/$prompt" "$runtime_root/prompts/$prompt"
+                continue
+                ;;
+        esac
         cat > "$runtime_root/prompts/$prompt" <<EOF
 # ${prompt}
 
@@ -184,6 +190,84 @@ EOF
     rm -f "$tmp_file"
 }
 
+write_valid_plan_artifact() {
+    local path="$1" title="${2:-Plan Artifact}" change_label="${3:-Update}" fenced="${4:-yes}"
+    local open_fence="" close_fence=""
+    if [[ "$fenced" != "no" ]]; then
+        open_fence='```xml'
+        close_fence='```'
+    fi
+    cat > "$path" <<EOF
+# ${title}
+
+## Files to Modify
+- \`lauren-loop-v2.sh\` — ${change_label}
+
+## Implementation Tasks
+
+${open_fence}
+<wave number="1">
+  <task type="auto">
+    <name>Exercise planner artifact validation</name>
+    <files>lauren-loop-v2.sh</files>
+    <action>Describe the change and the test-first order without writing code.</action>
+    <verify>bash tests/test_cost_tracking.sh</verify>
+    <done>The planner artifact is valid for pipeline evaluation.</done>
+  </task>
+</wave>
+${close_fence}
+
+## Testability Design
+- Exercise the shell pipeline through \`lauren_loop_competitive\`.
+
+## Test Strategy
+- Run the Lauren Loop shell regression suite before and after the change.
+
+## Risk Assessment
+- Ensure artifact validation rejects summary-only files without discarding valid plans.
+
+## Dependencies
+- None.
+EOF
+}
+
+write_valid_reviewer_b_artifact() {
+    local path="$1" verdict="${2:-PASS}" findings="${3:-No findings.}"
+    cat > "$path" <<EOF
+# Review B
+
+**Task:** task.md
+**Focus:** Architecture / Structural Integrity
+**Scope:** lauren-loop-v2.sh
+
+## Findings
+
+${findings}
+
+## Done-Criteria Check
+
+Not applicable.
+
+## Dimension Coverage
+
+**1. Architecture / Structural Integrity:** checked
+**2. Correctness:** checked
+**3. Test Quality:** checked
+**4. Edge Cases:** checked
+**5. Error Handling:** checked
+**6. Security:** checked
+**7. Performance:** checked
+**8. Caller Impact:** checked
+**9. Design Decision Validity:** checked
+
+## Verdict
+
+**VERDICT: ${verdict}**
+**Blocking findings:** None
+**Rationale:** test artifact
+EOF
+}
+
 seed_phase7_resume_artifacts() {
     local slug="$1" critique_verdict="${2:-__missing__}"
     local comp_dir
@@ -194,14 +278,8 @@ seed_phase7_resume_artifacts() {
 ## Exploration Summary
 Ready to resume.
 EOF
-    cat > "$comp_dir/plan-a.md" <<'EOF'
-## Plan A
-- Existing plan A
-EOF
-    cat > "$comp_dir/plan-b.md" <<'EOF'
-## Plan B
-- Existing plan B
-EOF
+    write_valid_plan_artifact "$comp_dir/plan-a.md" "Plan A" "Existing plan A"
+    write_valid_plan_artifact "$comp_dir/plan-b.md" "Plan B" "Existing plan B"
     cat > "$comp_dir/revised-plan.md" <<'EOF'
 ## Revised Plan
 - Approved plan

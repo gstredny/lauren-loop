@@ -106,7 +106,7 @@ notify_terminal_state() {
 }
 
 eval "$(
-    sed -n '/^# Pricing rates/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
         | sed '/^setup_azure_context 2>\/dev\/null || true$/d' \
         | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
@@ -218,7 +218,7 @@ notify_terminal_state() {
 }
 
 eval "$(
-    sed -n '/^# Pricing rates/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
         | sed '/^setup_azure_context 2>\/dev\/null || true$/d' \
         | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
@@ -328,7 +328,7 @@ stop_agent_monitor() { :; }
 notify_terminal_state() { :; }
 
 eval "$(
-    sed -n '/^# Pricing rates/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
         | sed '/^setup_azure_context 2>\/dev\/null || true$/d' \
         | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
@@ -392,7 +392,7 @@ stop_agent_monitor() { :; }
 notify_terminal_state() { :; }
 
 eval "$(
-    sed -n '/^# Pricing rates/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
         | sed '/^setup_azure_context 2>\/dev\/null || true$/d' \
         | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'

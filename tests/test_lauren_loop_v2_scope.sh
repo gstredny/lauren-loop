@@ -818,6 +818,80 @@ EOF
 ) && pass "24. executor-modified in-scope file captured correctly even if pre-existing dirty" \
   || fail "24. executor-modified in-scope file captured correctly even if pre-existing dirty"
 
+# ── Test 25: consolidate flat file into directory ──
+(
+    repo_root="$(setup_scope_repo consolidate-flat)"
+    slug="consolidate-task"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    flat_file="$repo_root/docs/tasks/open/${slug}.md"
+
+    mkdir -p "$repo_root/docs/tasks/open"
+    printf '## Task: %s\n## Status: in progress\n' "$slug" > "$flat_file"
+    git_commit_all "$repo_root" "add flat task file"
+
+    mkdir -p "${task_dir}/competitive" "${task_dir}/logs"
+
+    (
+        cd "$repo_root"
+        SCRIPT_DIR="$repo_root"
+        _consolidate_task_to_dir "$flat_file" "$task_dir"
+
+        [[ ! -f "$flat_file" ]]
+        [[ -f "${task_dir}/task.md" ]]
+        grep -q "## Task: $slug" "${task_dir}/task.md"
+    )
+) && pass "25. consolidate flat task file into directory layout" \
+  || fail "25. consolidate flat task file into directory layout"
+
+# ── Test 26: consolidate pilot file into directory ──
+(
+    repo_root="$(setup_scope_repo consolidate-pilot)"
+    slug="consolidate-pilot-task"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    pilot_file="$repo_root/docs/tasks/open/pilot-${slug}.md"
+
+    mkdir -p "$repo_root/docs/tasks/open"
+    printf '## Task: %s\n## Status: in progress\n' "$slug" > "$pilot_file"
+    git_commit_all "$repo_root" "add pilot task file"
+
+    mkdir -p "${task_dir}/competitive" "${task_dir}/logs"
+
+    (
+        cd "$repo_root"
+        SCRIPT_DIR="$repo_root"
+        _consolidate_task_to_dir "$pilot_file" "$task_dir"
+
+        [[ ! -f "$pilot_file" ]]
+        [[ -f "${task_dir}/task.md" ]]
+        grep -q "## Task: $slug" "${task_dir}/task.md"
+    )
+) && pass "26. consolidate pilot task file into directory layout" \
+  || fail "26. consolidate pilot task file into directory layout"
+
+# ── Test 27: consolidation is no-op when task.md already exists in dir ──
+(
+    repo_root="$(setup_scope_repo consolidate-noop)"
+    slug="consolidate-noop-task"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    flat_file="$repo_root/docs/tasks/open/${slug}.md"
+
+    mkdir -p "$repo_root/docs/tasks/open" "${task_dir}/competitive"
+    printf '## Task: %s (flat)\n' "$slug" > "$flat_file"
+    printf '## Task: %s (dir)\n' "$slug" > "${task_dir}/task.md"
+    git_commit_all "$repo_root" "add both flat and dir task files"
+
+    (
+        cd "$repo_root"
+        SCRIPT_DIR="$repo_root"
+        _consolidate_task_to_dir "$flat_file" "$task_dir"
+
+        [[ -f "$flat_file" ]]
+        [[ -f "${task_dir}/task.md" ]]
+        grep -q "(dir)" "${task_dir}/task.md"
+    )
+) && pass "27. consolidation no-op when task.md already in directory" \
+  || fail "27. consolidation no-op when task.md already in directory"
+
 echo ""
 echo "Passed: $PASSED/$TOTAL"
 [ "$FAILED" -eq 0 ]

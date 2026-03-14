@@ -145,6 +145,7 @@ Not applicable.
 **6. Security:** checked
 **7. Performance:** checked
 **8. Caller Impact:** checked
+**9. Design Decision Validity:** checked
 
 ## Verdict
 
@@ -186,8 +187,82 @@ EOF
     chmod +x "$bin_dir/afplay" "$bin_dir/osascript"
 }
 
+setup_traditional_dev_proxy_repo() {
+    local name="$1"
+    local slug="${2:-proxy-scope}"
+    local root="$TMP_ROOT/$name"
+
+    mkdir -p "$root/docs/tasks/open/$slug/competitive" \
+        "$root/docs/tasks/open/$slug/logs" \
+        "$root/src" "$root/tests" "$root/docs"
+
+    cat > "$root/docs/tasks/open/${slug}.md" <<'EOF'
+## Task: Traditional Dev Proxy Fixture
+## Status: in progress
+## Goal: Exercise scoped traditional-dev proxy behavior
+
+## Relevant Files:
+- `src/relevant_only.py` - relevant-files fallback path
+- `src/in_scope.py` - primary in-scope code path
+- `tests/test_in_scope.py` - primary test path
+- `src/fix_only.py` - fix-plan-only path
+
+## Current Plan
+
+### Files to Modify
+| File | Change |
+|------|--------|
+| `src/in_scope.py` | Update implementation |
+| `tests/test_in_scope.py` | Add verification |
+
+## Execution Log
+EOF
+
+    cat > "$root/docs/tasks/open/$slug/competitive/revised-plan.md" <<'EOF'
+# Revised Plan
+
+## Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/in_scope.py` | Update implementation |
+| `tests/test_in_scope.py` | Add verification |
+EOF
+
+    cat > "$root/docs/tasks/open/$slug/competitive/fix-plan.md" <<'EOF'
+# Fix Plan
+
+## Implementation Tasks
+
+```xml
+<wave number="1">
+  <task type="auto">
+    <name>Expand scoped fix coverage</name>
+    <files>src/fix_only.py</files>
+    <action>Patch the fix-only code path.</action>
+    <verify>bash test_lauren_loop_utils.sh</verify>
+    <done>Fix-only path is included in scoped proxy calculation.</done>
+  </task>
+</wave>
+```
+EOF
+
+    printf 'baseline\n' > "$root/src/in_scope.py"
+    printf 'baseline\n' > "$root/src/relevant_only.py"
+    printf 'baseline\n' > "$root/src/fix_only.py"
+    printf 'baseline\n' > "$root/tests/test_in_scope.py"
+    printf 'baseline\n' > "$root/docs/reference.md"
+
+    git -C "$root" init -q
+    git -C "$root" config user.email "codex@example.com"
+    git -C "$root" config user.name "Codex"
+    git -C "$root" add .
+    git -C "$root" commit -q -m "baseline"
+    printf '%s\n' "$root"
+}
+
 # ============================================================
-# Test 1: Sourcing works — all 28 functions defined
+# Test 1: Sourcing works — all 29 functions defined
 # ============================================================
 (
     # Source in subshell to avoid polluting this script
@@ -203,15 +278,16 @@ EOF
               ensure_review_sections validate_task_file inject_context \
               archive_review_cycle archive_round extract_last_critic_verdict \
               extract_last_review_verdict ensure_retro_placeholder \
-              list_superseded_tasks move_task_to_closed check_diff_scope; do
+              list_superseded_tasks move_task_to_closed check_diff_scope \
+              _promote_latest_valid_attempt; do
         if [ "$(type -t "$fn")" != "function" ]; then
             echo "Missing function: $fn" >&2
             all_ok=false
         fi
     done
     $all_ok
-) && pass "1. Sourcing works — all 28 functions defined" \
-  || fail "1. Sourcing works — all 28 functions defined"
+) && pass "1. Sourcing works — all 29 functions defined" \
+  || fail "1. Sourcing works — all 29 functions defined"
 
 # Source for remaining tests
 . "$REPO_ROOT/lib/lauren-loop-utils.sh"
@@ -1131,7 +1207,7 @@ EOF
         sleep 0.05
         printf "\n## Done-Criteria Check\n\nNot applicable.\n" >> "$artifact"
         sleep 0.05
-        printf "\n## Dimension Coverage\n\n**1. Architecture / Structural Integrity:** checked\n**2. Correctness:** checked\n**3. Test Quality:** checked\n**4. Edge Cases:** checked\n**5. Error Handling:** checked\n**6. Security:** checked\n**7. Performance:** checked\n**8. Caller Impact:** checked\n" >> "$artifact"
+        printf "\n## Dimension Coverage\n\n**1. Architecture / Structural Integrity:** checked\n**2. Correctness:** checked\n**3. Test Quality:** checked\n**4. Edge Cases:** checked\n**5. Error Handling:** checked\n**6. Security:** checked\n**7. Performance:** checked\n**8. Caller Impact:** checked\n**9. Design Decision Validity:** checked\n" >> "$artifact"
         sleep 0.05
         printf "\n## Verdict\n\n**VERDICT: PASS**\n**Blocking findings:** None\n**Rationale:** test artifact\n" >> "$artifact"
         sleep 0.1
@@ -1185,6 +1261,279 @@ EOF
     ! rg -n 'competitive/review-b\.md' "$REPO_ROOT/prompts/reviewer-b.md" >/dev/null 2>&1
 ) && pass "48. reviewer-b prompt is path-agnostic" \
   || fail "48. reviewer-b prompt is path-agnostic"
+
+# ============================================================
+# Test 49: traditional dev proxy — V1 prefers Files to Modify over Relevant Files
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-v1-prefer-files)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+
+    printf 'changed\n' >> "$repo_root/src/relevant_only.py"
+
+    (
+        cd "$repo_root"
+        result=$(compute_cocomo_estimate "HEAD" "$task_file" "V1")
+        [[ "$result" == "N/A  (no scoped engineering changes)" ]]
+    )
+) && pass "49. traditional dev proxy — V1 prefers Files to Modify over Relevant Files" \
+  || fail "49. traditional dev proxy — V1 prefers Files to Modify over Relevant Files"
+
+# ============================================================
+# Test 50: traditional dev proxy — V1 falls back to Relevant Files
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-v1-relevant-fallback)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+
+    cat > "$task_file" <<'EOF'
+## Task: Traditional Dev Proxy Fixture
+## Status: in progress
+## Goal: Exercise scoped traditional-dev proxy behavior
+
+## Relevant Files:
+- `src/relevant_only.py` - relevant-files fallback path
+
+## Current Plan
+
+## Execution Log
+EOF
+
+    printf 'changed\n' >> "$repo_root/src/relevant_only.py"
+
+    (
+        cd "$repo_root"
+        result=$(compute_cocomo_estimate "HEAD" "$task_file" "V1")
+        echo "$result" | grep -q '~\$2.75'
+        echo "$result" | grep -q 'scoped net 1 lines (+1/-0)'
+    )
+) && pass "50. traditional dev proxy — V1 falls back to Relevant Files" \
+  || fail "50. traditional dev proxy — V1 falls back to Relevant Files"
+
+# ============================================================
+# Test 51: traditional dev proxy — docs-only scoped churn returns N/A
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-docs-only)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+
+    printf 'task note\n' >> "$task_file"
+    printf 'doc note\n' >> "$repo_root/docs/reference.md"
+    printf 'plan note\n' >> "$repo_root/docs/tasks/open/proxy-scope/competitive/revised-plan.md"
+
+    (
+        cd "$repo_root"
+        result=$(compute_cocomo_estimate "HEAD" "$task_file" "V1")
+        [[ "$result" == "N/A  (no scoped engineering changes)" ]]
+    )
+) && pass "51. traditional dev proxy — docs-only scoped churn returns N/A" \
+  || fail "51. traditional dev proxy — docs-only scoped churn returns N/A"
+
+# ============================================================
+# Test 52: traditional dev proxy — scoped code change ignores task and plan churn
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-ignore-doc-churn)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+
+    printf 'changed\n' >> "$repo_root/src/in_scope.py"
+    printf 'task note\n' >> "$task_file"
+    printf 'plan note\n' >> "$repo_root/docs/tasks/open/proxy-scope/competitive/revised-plan.md"
+
+    (
+        cd "$repo_root"
+        result=$(compute_cocomo_estimate "HEAD" "$task_file" "V1")
+        echo "$result" | grep -q '~\$2.75'
+        echo "$result" | grep -q 'scoped net 1 lines (+1/-0)'
+    )
+) && pass "52. traditional dev proxy — scoped code change ignores task and plan churn" \
+  || fail "52. traditional dev proxy — scoped code change ignores task and plan churn"
+
+# ============================================================
+# Test 53: traditional dev proxy — V2 includes fix-plan XML scope
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-v2-fix-plan)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+
+    printf 'changed\n' >> "$repo_root/src/fix_only.py"
+
+    (
+        cd "$repo_root"
+        result=$(compute_cocomo_estimate "HEAD" "$task_file" "V2")
+        echo "$result" | grep -q '~\$2.75'
+        echo "$result" | grep -q 'scoped net 1 lines (+1/-0)'
+    )
+) && pass "53. traditional dev proxy — V2 includes fix-plan XML scope" \
+  || fail "53. traditional dev proxy — V2 includes fix-plan XML scope"
+
+# ============================================================
+# Test 54: traditional dev proxy — env vars tune heuristic cost
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-env-tuning)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+
+    printf 'changed\n' >> "$repo_root/src/in_scope.py"
+
+    (
+        cd "$repo_root"
+        COCOMO_SLOC_PER_HOUR=10 COCOMO_OFFSHORE_RATE=100 result=$(compute_cocomo_estimate "HEAD" "$task_file" "V1")
+        echo "$result" | grep -q '~\$10.00'
+        echo "$result" | grep -q '10 SLOC/hr × \$100/hr'
+    )
+) && pass "54. traditional dev proxy — env vars tune heuristic cost" \
+  || fail "54. traditional dev proxy — env vars tune heuristic cost"
+
+# ============================================================
+# Fixture helper: valid reviewer-b artifact
+# ============================================================
+write_valid_reviewer_b_fixture() {
+    local file="$1"
+    cat > "$file" <<'FIXTURE'
+# Review B
+
+## Findings
+
+No critical findings.
+
+## Done-Criteria Check
+
+All done-criteria met.
+
+## Dimension Coverage
+
+**1. Architecture / Structural Integrity:** checked
+**2. Correctness:** checked
+**3. Test Quality:** checked
+**4. Edge Cases:** checked
+**5. Error Handling:** checked
+**6. Security:** checked
+**7. Performance:** checked
+**8. Caller Impact:** checked
+**9. Design Decision Validity:** checked
+
+## Verdict
+
+**VERDICT: PASS**
+**Blocking findings:** None
+**Rationale:** test artifact
+FIXTURE
+}
+
+# ============================================================
+# Test 55: _promote_latest_valid_attempt — canonical exists, no promotion needed
+# ============================================================
+(
+    dir="$TMP_ROOT/promote-canonical-exists"
+    mkdir -p "$dir"
+    write_valid_reviewer_b_fixture "$dir/reviewer-b.raw.md"
+    echo "attempt content" > "$dir/reviewer-b.raw.attempt-1.md"
+
+    _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md"
+    rc=$?
+    [[ "$rc" -eq 0 ]]
+    grep -q '# Review B' "$dir/reviewer-b.raw.md"
+) && pass "55. _promote_latest_valid_attempt — canonical exists, no promotion needed" \
+  || fail "55. _promote_latest_valid_attempt — canonical exists, no promotion needed"
+
+# ============================================================
+# Test 56: _promote_latest_valid_attempt — single valid attempt promoted
+# ============================================================
+(
+    dir="$TMP_ROOT/promote-single-attempt"
+    mkdir -p "$dir"
+    write_valid_reviewer_b_fixture "$dir/reviewer-b.raw.attempt-1.md"
+
+    _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md"
+    rc=$?
+    [[ "$rc" -eq 0 ]]
+    [[ -f "$dir/reviewer-b.raw.md" ]]
+    grep -q '# Review B' "$dir/reviewer-b.raw.md"
+) && pass "56. _promote_latest_valid_attempt — single valid attempt promoted" \
+  || fail "56. _promote_latest_valid_attempt — single valid attempt promoted"
+
+# ============================================================
+# Test 57: _promote_latest_valid_attempt — highest attempt number wins
+# ============================================================
+(
+    dir="$TMP_ROOT/promote-highest-attempt"
+    mkdir -p "$dir"
+    echo "invalid attempt 1" > "$dir/reviewer-b.raw.attempt-1.md"
+    write_valid_reviewer_b_fixture "$dir/reviewer-b.raw.attempt-3.md"
+
+    _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md"
+    rc=$?
+    [[ "$rc" -eq 0 ]]
+    grep -q '# Review B' "$dir/reviewer-b.raw.md"
+) && pass "57. _promote_latest_valid_attempt — highest attempt number wins" \
+  || fail "57. _promote_latest_valid_attempt — highest attempt number wins"
+
+# ============================================================
+# Test 58: _promote_latest_valid_attempt — highest invalid, lower valid promoted
+# ============================================================
+(
+    dir="$TMP_ROOT/promote-fallback-lower"
+    mkdir -p "$dir"
+    write_valid_reviewer_b_fixture "$dir/reviewer-b.raw.attempt-1.md"
+    echo "invalid attempt 3" > "$dir/reviewer-b.raw.attempt-3.md"
+
+    _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md"
+    rc=$?
+    [[ "$rc" -eq 0 ]]
+    grep -q '# Review B' "$dir/reviewer-b.raw.md"
+) && pass "58. _promote_latest_valid_attempt — highest invalid, lower valid promoted" \
+  || fail "58. _promote_latest_valid_attempt — highest invalid, lower valid promoted"
+
+# ============================================================
+# Test 59: _promote_latest_valid_attempt — all attempts invalid
+# ============================================================
+(
+    dir="$TMP_ROOT/promote-all-invalid"
+    mkdir -p "$dir"
+    echo "invalid 1" > "$dir/reviewer-b.raw.attempt-1.md"
+    echo "invalid 2" > "$dir/reviewer-b.raw.attempt-2.md"
+
+    set +e
+    _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md" 2>/dev/null
+    rc=$?
+    set -e
+    [[ "$rc" -ne 0 ]]
+    [[ ! -f "$dir/reviewer-b.raw.md" ]]
+) && pass "59. _promote_latest_valid_attempt — all attempts invalid" \
+  || fail "59. _promote_latest_valid_attempt — all attempts invalid"
+
+# ============================================================
+# Test 60: _promote_latest_valid_attempt — reviewer-b role with full sections
+# ============================================================
+(
+    dir="$TMP_ROOT/promote-reviewer-b-full"
+    mkdir -p "$dir"
+    write_valid_reviewer_b_fixture "$dir/reviewer-b.raw.attempt-2.md"
+
+    _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md"
+    rc=$?
+    [[ "$rc" -eq 0 ]]
+    [[ -f "$dir/reviewer-b.raw.md" ]]
+    _validate_agent_output_for_role "reviewer-b" "$dir/reviewer-b.raw.md"
+) && pass "60. _promote_latest_valid_attempt — reviewer-b role with full sections" \
+  || fail "60. _promote_latest_valid_attempt — reviewer-b role with full sections"
+
+# ============================================================
+# Test 61: _promote_latest_valid_attempt — no attempt files at all
+# ============================================================
+(
+    dir="$TMP_ROOT/promote-no-attempts"
+    mkdir -p "$dir"
+
+    set +e
+    _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md" 2>/dev/null
+    rc=$?
+    set -e
+    [[ "$rc" -ne 0 ]]
+    [[ ! -f "$dir/reviewer-b.raw.md" ]]
+) && pass "61. _promote_latest_valid_attempt — no attempt files at all" \
+  || fail "61. _promote_latest_valid_attempt — no attempt files at all"
 
 # ============================================================
 # Summary

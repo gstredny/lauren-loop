@@ -160,6 +160,7 @@ Not applicable.
 **6. Security:** checked
 **7. Performance:** checked
 **8. Caller Impact:** checked
+**9. Design Decision Validity:** checked
 
 ## Verdict
 
@@ -358,6 +359,8 @@ eval "$(
 
 # Direct V1 legacy coverage for the dormant planner/critic path.
 eval "$(sed -n '/^task_file_stem() {/,/^}/p' "$REPO_ROOT/lauren-loop.sh")"
+eval "$(sed -n '/^format_auto_duration() {/,/^}/p' "$REPO_ROOT/lauren-loop.sh")"
+eval "$(sed -n '/^print_auto_summary() {/,/^}/p' "$REPO_ROOT/lauren-loop.sh")"
 eval "$(sed -n '/^_pick_load_ranked_tasks() {/,/^}/p' "$REPO_ROOT/lauren-loop.sh")"
 eval "$(sed -n '/^run_critic() {/,/^}/p' "$REPO_ROOT/lauren-loop.sh")"
 
@@ -1904,6 +1907,60 @@ EOF
     ! _V2_LOCK_DIR="$lock_dir" _is_slug_running_v2 "stale-slug"
 ) && pass "50. _is_slug_running_v2 returns 1 for dead PID" \
   || fail "50. _is_slug_running_v2 returns 1 for dead PID"
+
+(
+    output="$(print_auto_summary \
+        "V2" \
+        "Complex (V2) — user selected" \
+        "7260" \
+        "17.8278" \
+        "0" \
+        "~\$1196.25  (COCOMO-inspired heuristic; scoped net 435 lines (+675/-240) at 20 SLOC/hr × \$55/hr)" 2>&1)"
+    echo "$output" | grep -q 'Traditional Dev Proxy:'
+    echo "$output" | grep -q 'COCOMO-inspired heuristic'
+    ! echo "$output" | grep -q 'Offshore Dev Cost'
+    ! echo "$output" | grep -q 'industry-standard COCOMO II'
+) && pass "51. auto summary uses traditional dev proxy wording" \
+  || fail "51. auto summary uses traditional dev proxy wording"
+
+# ============================================================
+# Test 52: SINGLE_REVIEWER_POLICY elevated on MEDIUM risk
+# ============================================================
+(
+    SINGLE_REVIEWER_POLICY="synthesis"
+    _diff_risk="MEDIUM"
+    if [[ "${_diff_risk}" != "LOW" && "${SINGLE_REVIEWER_POLICY}" == "synthesis" ]]; then
+        SINGLE_REVIEWER_POLICY="strict"
+    fi
+    [[ "$SINGLE_REVIEWER_POLICY" == "strict" ]]
+) && pass "52. SINGLE_REVIEWER_POLICY elevated to strict on MEDIUM risk" \
+  || fail "52. SINGLE_REVIEWER_POLICY elevated to strict on MEDIUM risk"
+
+# ============================================================
+# Test 53: SINGLE_REVIEWER_POLICY unchanged on LOW risk
+# ============================================================
+(
+    SINGLE_REVIEWER_POLICY="synthesis"
+    _diff_risk="LOW"
+    if [[ "${_diff_risk}" != "LOW" && "${SINGLE_REVIEWER_POLICY}" == "synthesis" ]]; then
+        SINGLE_REVIEWER_POLICY="strict"
+    fi
+    [[ "$SINGLE_REVIEWER_POLICY" == "synthesis" ]]
+) && pass "53. SINGLE_REVIEWER_POLICY unchanged on LOW risk" \
+  || fail "53. SINGLE_REVIEWER_POLICY unchanged on LOW risk"
+
+# ============================================================
+# Test 54: Explicit SINGLE_REVIEWER_POLICY preserved on HIGH risk
+# ============================================================
+(
+    SINGLE_REVIEWER_POLICY="custom"
+    _diff_risk="HIGH"
+    if [[ "${_diff_risk}" != "LOW" && "${SINGLE_REVIEWER_POLICY}" == "synthesis" ]]; then
+        SINGLE_REVIEWER_POLICY="strict"
+    fi
+    [[ "$SINGLE_REVIEWER_POLICY" == "custom" ]]
+) && pass "54. Explicit SINGLE_REVIEWER_POLICY preserved on HIGH risk" \
+  || fail "54. Explicit SINGLE_REVIEWER_POLICY preserved on HIGH risk"
 
 echo ""
 echo "============================="

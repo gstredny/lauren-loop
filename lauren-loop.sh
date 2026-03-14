@@ -1050,11 +1050,21 @@ if [ "${1:-}" = "auto" ]; then
         esac
     fi
 
+    AUTO_PROXY_TASK_FILE=""
+    AUTO_PROXY_RESOLVE_RC=0
+    resolve_task_file "$SLUG" || AUTO_PROXY_RESOLVE_RC=$?
+    case "$AUTO_PROXY_RESOLVE_RC" in
+        0) AUTO_PROXY_TASK_FILE="$TASK_FILE" ;;
+        1) ;;
+        2) exit 1 ;;
+        *) exit "$AUTO_PROXY_RESOLVE_RC" ;;
+    esac
+
     AUTO_DURATION=$(( $(date +%s) - AUTO_START_TS ))
     if [ "$AUTO_DURATION" -lt 0 ]; then
         AUTO_DURATION=0
     fi
-    AUTO_COCOMO=$(compute_cocomo_estimate "$AUTO_PRE_SHA")
+    AUTO_COCOMO=$(compute_cocomo_estimate "$AUTO_PRE_SHA" "$AUTO_PROXY_TASK_FILE" "$AUTO_SUMMARY_ROUTE")
     print_auto_summary "$AUTO_SUMMARY_ROUTE" "$AUTO_REASON" "$AUTO_DURATION" "$AUTO_COST" "$AUTO_CHILD_EXIT" "$AUTO_COCOMO"
     exit "$AUTO_CHILD_EXIT"
 fi

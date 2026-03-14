@@ -19,5 +19,11 @@
 ## Related Context
 (Auto-injected by script)
 
+## Left Off At:
+Not started.
+
+## Attempts:
+(none yet)
+
 ## Execution Log
 (Timestamped round results)

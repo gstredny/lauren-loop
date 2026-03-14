@@ -140,6 +140,23 @@ _require_v2_task_file() {
     esac
 }
 
+_consolidate_task_to_dir() {
+    local flat_file="$1"
+    local task_dir="$2"
+    local dir_task="${task_dir}/task.md"
+
+    [[ -f "$flat_file" ]] || return 0
+    [[ ! -f "$dir_task" ]] || return 0
+
+    mkdir -p "$task_dir"
+    if git ls-files --error-unmatch "$flat_file" &>/dev/null 2>&1; then
+        git mv "$flat_file" "$dir_task"
+    else
+        mv "$flat_file" "$dir_task"
+    fi
+    echo -e "${GREEN}Consolidated: $(basename "$flat_file") → ${task_dir}/task.md${NC}"
+}
+
 _init_run_manifest() {
     local manifest="${comp_dir}/run-manifest.json"
     command -v jq >/dev/null 2>&1 || return 0
@@ -518,6 +535,11 @@ _enforce_codex_phase_backstop() {
             if [[ -n "$live_artifact" ]] && _validate_agent_output_for_role "$role" "$live_artifact" >/dev/null 2>&1; then
                 printf '[codex-backstop] role=%s artifact valid after termination — treating as natural completion\n' \
                     "$role" >> "$log_file"
+                if [[ "$live_artifact" != "$artifact_file" ]]; then
+                    _atomic_promote_file "$live_artifact" "$artifact_file" || true
+                    printf '[codex-attempt-promote] role=%s attempt=%s -> canonical=%s (backstop)\n' \
+                        "$role" "$live_artifact" "$artifact_file" >> "$log_file"
+                fi
                 return 0
             fi
             return 1
@@ -2135,13 +2157,19 @@ lauren_loop_competitive() {
     task_file="$(_resolve_v2_task_file "$slug")" || resolve_rc=$?
     case "$resolve_rc" in
         0) ;;
-        1) task_file="$SCRIPT_DIR/docs/tasks/open/${slug}.md" ;;
+        1) task_file="${task_dir}/task.md" ;;
         2) exit 1 ;;
         *) exit "$resolve_rc" ;;
     esac
+    mkdir -p "$comp_dir" "$TASK_LOG_DIR"
+
+    if [[ -f "$task_file" && "$task_file" != "${task_dir}/"* ]]; then
+        _consolidate_task_to_dir "$task_file" "$task_dir"
+        task_file="${task_dir}/task.md"
+    fi
+
     _CURRENT_TASK_FILE="$task_file"
     _CURRENT_TASK_LOG_DIR="$TASK_LOG_DIR"
-    mkdir -p "$comp_dir" "$TASK_LOG_DIR"
     _clear_active_runtime_state
     if [[ "$FORCE_RERUN" == "true" ]]; then
         _backup_artifacts_on_force "$comp_dir"
@@ -2587,6 +2615,7 @@ Write a detailed implementation plan to ${plan_b_output_path}."
                 return 1
                 ;;
         esac
+        _promote_latest_valid_attempt "planner-b" "${comp_dir}/plan-b.md" || true
         case "$(_phase2_planner_artifact_state "planner-b" "$exit_b" "${comp_dir}/plan-b.md")" in
             valid)
                 plan_b_valid=true
@@ -2634,6 +2663,7 @@ Write a detailed implementation plan to ${plan_b_output_path}."
                 return 1
                 ;;
         esac
+        _promote_latest_valid_attempt "planner-b" "${comp_dir}/plan-b.md" || true
         case "$(_phase2_checkpoint_plan_state "planner-b" "${comp_dir}/plan-b.md")" in
             valid)
                 plan_b_valid=true
@@ -2891,6 +2921,11 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
     _diff_risk=$(_classify_diff_risk)
     log_execution "$task_file" "Phase 4: Diff risk classification: ${_diff_risk}"
 
+    if [[ "${_diff_risk}" != "LOW" && "${SINGLE_REVIEWER_POLICY}" == "synthesis" ]]; then
+        SINGLE_REVIEWER_POLICY="strict"
+        log_execution "$task_file" "Phase 4: Elevated SINGLE_REVIEWER_POLICY to strict (diff_risk=${_diff_risk})"
+    fi
+
     # Cost ceiling check after Phase 4 (most expensive pre-review phase)
     local post_exec_cost_gate=0
     _check_cost_ceiling "$task_file" "$comp_dir" "0" || post_exec_cost_gate=$?
@@ -3009,6 +3044,7 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
         local reviewer_a_log="${log_dir}/${reviewer_a_role}.log"
         local reviewer_b_log="${log_dir}/${reviewer_b_role}.log"
         rm -f "${comp_dir}/reviewer-a.raw.md" "${comp_dir}/reviewer-b.raw.md" "${comp_dir}/review-a.md" "${comp_dir}/review-b.md"
+        rm -f "${comp_dir}"/reviewer-b.raw.attempt-*.md
 
         echo -e "${BLUE}Spawning parallel: ${reviewer_a_role} + ${reviewer_b_role}${NC}"
 
@@ -3065,6 +3101,7 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
         echo -e "${BLUE}Review parallel done: A=$exit_ra, B=$exit_rb${NC}"
         local has_review_a=false has_review_b=false
         _validate_agent_output "${comp_dir}/reviewer-a.raw.md" >/dev/null 2>&1 && has_review_a=true
+        _promote_latest_valid_attempt "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" || true
         _validate_agent_output_for_role "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" >/dev/null 2>&1 && has_review_b=true
 
         if [[ "$has_review_a" == false ]]; then

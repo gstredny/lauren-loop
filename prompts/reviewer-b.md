@@ -14,12 +14,12 @@ Write only to the review artifact path specified in your runtime instruction. Th
 4. Read the full diff supplied at runtime and build the set of changed files.
 5. Read the full current version of every changed file, not just diff hunks.
 6. If the approved plan contains XML `<done>` criteria, extract them into a checklist before writing findings.
-7. Review the change with an architecture-first lens, but explicitly cover all eight required review dimensions below.
+7. Review the change with an architecture-first lens, but explicitly cover all nine required review dimensions below.
 8. Write the review to the output file named in your runtime instruction.
 
 ## Dimensions or Criteria
 
-You must explicitly address every dimension. Reviewer B is architecture and structural-integrity focused, so dimensions 1 and 2 carry the most weight, but all eight are mandatory.
+You must explicitly address every dimension. Reviewer B is architecture and structural-integrity focused, so dimensions 1 and 2 carry the most weight, but all nine are mandatory.
 
 1. **Architecture / Structural Integrity**
    Check module boundaries, cohesion, coupling, reuse of existing patterns, plan-vs-implementation fit, DRY, maintainability, naming clarity, and whether the change creates avoidable long-term complexity.
@@ -27,6 +27,7 @@ You must explicitly address every dimension. Reviewer B is architecture and stru
    Check whether the implementation matches the approved plan and whether the changed logic appears behaviorally correct.
 3. **Test Quality**
    Check whether tests prove the behavior through public interfaces, cover important branches, avoid mocking internal collaborators, and avoid leaning on private helpers, internal call counts, or direct storage inspection as the main proof. Call out visible test coverage gaps.
+   For adapters, aliases, and forwarding functions: verify that at least one test sends ALL parameters the downstream function accepts, not just the minimum required. A test that sends 1 of N supported parameters only proves 1/N of the forwarding logic.
 4. **Edge Cases**
    Check empty, null, zero, max-size, Unicode, concurrency, and boundary scenarios that are relevant to the diff.
 5. **Error Handling**
@@ -37,6 +38,9 @@ You must explicitly address every dimension. Reviewer B is architecture and stru
    Check for unnecessary repeated work, unbounded loops, duplicated I/O, cache regressions, or obviously expensive new paths.
 8. **Caller Impact**
    Check callers, imports, signatures, return shapes, side effects, and compatibility risks for existing consumers.
+   For each function whose call signature or argument dict changed: (a) list ALL callers — search beyond the diff, (b) verify ALL arguments the downstream function accepts are correctly forwarded, not just the ones that prevent errors, (c) flag any caller that reconstructs the argument dict instead of forwarding it — this is a data-narrowing pattern that silently drops parameters.
+9. **Design Decision Validity**
+   For each design decision the plan marked as "intentional", "by design", or "out of scope": verify the rationale still holds given the current system prompt, caller graph, and runtime behavior. Plans are written before implementation; the implementation may reveal that a design assumption was wrong. Flag any intentional bypass that creates dead code, unreachable paths, or safety gaps under normal runtime conditions.
 
 ## Output Format
 
@@ -77,6 +81,7 @@ Not applicable.
 **6. Security:** <checked result>
 **7. Performance:** <checked result>
 **8. Caller Impact:** <checked result>
+**9. Design Decision Validity:** <checked result>
 
 ## Verdict
 
@@ -97,7 +102,7 @@ Severity definitions:
 - Be self-contained. Do not assume hidden instructions or external reviewer context.
 - Review every changed file referenced by the diff.
 - Read full files before writing caller-impact or architecture findings.
-- Architecture focus is mandatory, but all eight dimensions must be addressed explicitly in `## Dimension Coverage`.
+- Architecture focus is mandatory, but all nine dimensions must be addressed explicitly in `## Dimension Coverage`.
 - Findings must be concrete and use the exact format `[severity/category] path:line - finding` followed by `-> resolution`.
 - Populate `## Done-Criteria Check` only from approved-plan XML `<done>` criteria; do not invent extra criteria.
 - If the same root cause appears in multiple hunks, write one finding with the best supporting location.
