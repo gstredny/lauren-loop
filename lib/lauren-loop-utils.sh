@@ -495,6 +495,7 @@ _promote_latest_valid_attempt() {
     local -a attempts=()
 
     [[ -n "$canonical_path" ]] || return 1
+    # If canonical already exists, no promotion needed
     [[ -f "$canonical_path" ]] && return 0
 
     if [[ "$canonical_path" == *.* ]]; then
@@ -504,6 +505,7 @@ _promote_latest_valid_attempt() {
     artifact_dir=$(dirname "$canonical_path")
     artifact_base=$(basename "$stem")
 
+    # Collect valid attempt numbers
     for candidate in "$artifact_dir"/"${artifact_base}.attempt-"*"$extension"; do
         [[ -f "$candidate" ]] || continue
         attempt_number=$(basename "$candidate")
@@ -513,12 +515,14 @@ _promote_latest_valid_attempt() {
         attempts+=("${attempt_number}:${candidate}")
     done
 
+    # No attempts found
     if [[ ${#attempts[@]} -eq 0 ]]; then
         printf '[codex-attempt-promote] role=%s no valid attempts found\n' "$role" >&2
         return 1
     fi
 
-    local sorted=""
+    # Sort descending by attempt number, try highest first
+    local sorted
     sorted=$(printf '%s\n' "${attempts[@]}" | sort -t: -k1 -rn)
     while IFS=: read -r _ path; do
         [[ -n "$path" ]] || continue
@@ -2846,6 +2850,11 @@ _print_cost_summary() {
     printf '  %-28s $%s\n' "Total:" "$total_cost"
     printf '  %-28s ~$%s\n' "Linear equivalent:" "$linear_cost"
     printf '  %-28s +$%s (+%s%%)\n' "Competitive premium:" "$premium" "$pct"
+    local trad_proxy=""
+    trad_proxy=$(compute_cocomo_estimate "${_PIPELINE_PRE_SHA:-}" "${_CURRENT_TASK_FILE:-}" "v2" 2>/dev/null) || trad_proxy=""
+    if [[ -n "$trad_proxy" ]]; then
+        printf '  %-28s %s\n' "Traditional Dev Proxy:" "$trad_proxy"
+    fi
     if [[ "$saw_codex" == true ]]; then
         echo "  Note: Codex token and cost values are estimated from character counts."
     fi

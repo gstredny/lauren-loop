@@ -391,6 +391,8 @@ usage() {
     echo "Usage: $0 <subcommand|slug> [args...]"
     echo ""
     echo "Subcommands:"
+    echo "  list                  List open tasks and pick one to run (instant, no LLM)"
+    echo "  list --status <s>     Filter by status (e.g. 'not started')"
     echo "  next                  Recommend which open task to work on next"
     echo "  pick                  Interactively pick a task (ranked list with numbered selection)"
     echo "  auto <slug> <goal>    Classify once and route to V1 or V2"
@@ -532,6 +534,254 @@ task_file_stem() {
     else
         basename "$task_path" .md
     fi
+}
+
+# ============================================================
+# _list_collect_tasks — Scan open tasks and populate arrays
+# Optional $1: status filter (case-insensitive, e.g. "not started")
+# Sets: LIST_SLUGS, LIST_GOALS, LIST_STATUSES, LIST_FILES, LIST_COUNT
+# ============================================================
+_list_collect_tasks() {
+    local status_filter=""
+    if [ -n "${1:-}" ]; then
+        status_filter=$(echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[[:space:]]*$//')
+    fi
+
+    LIST_SLUGS=()
+    LIST_GOALS=()
+    LIST_STATUSES=()
+    LIST_FILES=()
+    LIST_COUNT=0
+
+    while IFS= read -r file; do
+        local bn
+        bn=$(basename "$file")
+        [[ "$bn" == "INDEX.md" || "$bn" == "FEATURE-ROADMAP.md" ]] && continue
+
+        # Extract status (first 5 lines)
+        local status_line
+        status_line=$(head -5 "$file" | grep -i '^## Status:' | head -1)
+        [ -z "$status_line" ] && continue
+
+        local task_status
+        task_status=$(echo "$status_line" | sed 's/^## [Ss]tatus:[[:space:]]*//' | tr '[:upper:]' '[:lower:]' | sed 's/[[:space:]]*$//')
+
+        # Apply status filter if provided
+        if [ -n "$status_filter" ] && [ "$task_status" != "$status_filter" ]; then
+            continue
+        fi
+
+        # Extract goal (first 10 lines)
+        local goal_text
+        goal_text=$(head -10 "$file" | grep -i '^## Goal:' | head -1 | sed 's/^## [Gg]oal:[[:space:]]*//')
+        [ -z "$goal_text" ] && goal_text="(no goal)"
+
+        local slug
+        slug=$(task_file_stem "$file")
+
+        LIST_SLUGS+=("$slug")
+        LIST_GOALS+=("$goal_text")
+        LIST_STATUSES+=("$task_status")
+        LIST_FILES+=("$file")
+    done < <(find "$SCRIPT_DIR/docs/tasks/open" -name '*.md' -not -path '*/competitive/*' | sort)
+
+    LIST_COUNT=${#LIST_SLUGS[@]}
+}
+
+# ============================================================
+# _list_display_and_select — Show numbered task table + interactive launch
+# ============================================================
+_list_display_and_select() {
+    local running_v2_slugs=""
+    running_v2_slugs=$(_list_running_v2_instances 2>/dev/null | cut -f1 || true)
+
+    if [ "$LIST_COUNT" -eq 0 ]; then
+        echo -e "${YELLOW}No tasks found.${NC}"
+        return 0
+    fi
+
+    # Count by status for summary
+    local count_not_started=0 count_in_progress=0 count_needs_verification=0 count_blocked=0 count_other=0
+    local i
+
+    for (( i=0; i<LIST_COUNT; i++ )); do
+        case "${LIST_STATUSES[$i]}" in
+            "not started")          count_not_started=$((count_not_started + 1)) ;;
+            "in progress")          count_in_progress=$((count_in_progress + 1)) ;;
+            "needs verification")   count_needs_verification=$((count_needs_verification + 1)) ;;
+            blocked)                count_blocked=$((count_blocked + 1)) ;;
+            *)                      count_other=$((count_other + 1)) ;;
+        esac
+    done
+
+    # Print header
+    echo ""
+    printf "  %4s  %-45s  %-20s  %s\n" "#" "SLUG" "STATUS" "GOAL"
+    printf "  %4s  %-45s  %-20s  %s\n" "----" "---------------------------------------------" "--------------------" "---------------------------"
+
+    # Print rows
+    for (( i=0; i<LIST_COUNT; i++ )); do
+        local color="$NC" running_tag="" display_goal display_status
+        case "${LIST_STATUSES[$i]}" in
+            "not started")          color="$GREEN" ;;
+            "in progress")          color="$YELLOW" ;;
+            "needs verification")   color="$BLUE" ;;
+            blocked)                color="$RED" ;;
+        esac
+
+        running_tag=""
+        if echo "$running_v2_slugs" | grep -qx "${LIST_SLUGS[$i]}" 2>/dev/null; then
+            running_tag=" ${YELLOW}[RUNNING]${NC}"
+        fi
+
+        # Truncate goal to 55 chars
+        display_goal="${LIST_GOALS[$i]}"
+        if [ ${#display_goal} -gt 55 ]; then
+            display_goal="${display_goal:0:52}..."
+        fi
+
+        display_status="${LIST_STATUSES[$i]}"
+
+        printf "  %4s) %-45s  %b%-20s%b%b  %s\n" "$((i+1))" "${LIST_SLUGS[$i]}" "$color" "$display_status" "$NC" "$running_tag" "$display_goal"
+    done
+
+    # Summary
+    echo ""
+    local summary="  Total: ${LIST_COUNT} tasks"
+    local parts=()
+    [ "$count_not_started" -gt 0 ]        && parts+=("${count_not_started} not started")
+    [ "$count_in_progress" -gt 0 ]        && parts+=("${count_in_progress} in progress")
+    [ "$count_needs_verification" -gt 0 ] && parts+=("${count_needs_verification} needs verification")
+    [ "$count_blocked" -gt 0 ]            && parts+=("${count_blocked} blocked")
+    [ "$count_other" -gt 0 ]              && parts+=("${count_other} other")
+    if [ ${#parts[@]} -gt 0 ]; then
+        local IFS=", "
+        summary="${summary} (${parts[*]})"
+    fi
+    echo -e "$summary"
+    echo ""
+
+    # Interactive selection
+    local pick_input="" selected_idx="" selected_slug="" selected_goal=""
+    local confirm_running="" pick_confirm="" pick_route=""
+    local -a list_auto_cmd=()
+
+    while true; do
+        printf "  Enter number (0 to cancel): "
+        if ! read -r pick_input </dev/tty; then
+            echo ""
+            echo "  Cancelled."
+            return 0
+        fi
+
+        if [ -z "$pick_input" ]; then
+            continue
+        fi
+        if [ "$pick_input" = "0" ] || [ "$pick_input" = "q" ] || [ "$pick_input" = "Q" ]; then
+            echo "  Cancelled."
+            return 0
+        fi
+
+        if ! [[ "$pick_input" =~ ^[0-9]+$ ]]; then
+            echo -e "  ${RED}Invalid input. Enter a number from the list above, or 0 to cancel.${NC}"
+            continue
+        fi
+
+        if [ "$pick_input" -lt 1 ] || [ "$pick_input" -gt "$LIST_COUNT" ]; then
+            echo -e "  ${RED}Number $pick_input is not in the list. Try again or enter 0 to cancel.${NC}"
+            continue
+        fi
+
+        selected_idx=$((pick_input - 1))
+        selected_slug="${LIST_SLUGS[$selected_idx]}"
+        selected_goal="${LIST_GOALS[$selected_idx]}"
+
+        # Warn if running
+        if _is_slug_running_v2 "$selected_slug" 2>/dev/null; then
+            echo ""
+            echo -e "  ${YELLOW}Warning: '${selected_slug}' is already running under V2.${NC}"
+            printf "  Continue anyway? (y/n): "
+            if ! read -r confirm_running </dev/tty; then
+                echo ""
+                echo "  Cancelled."
+                return 0
+            fi
+            if [[ "$confirm_running" != "y" && "$confirm_running" != "Y" ]]; then
+                continue
+            fi
+        fi
+
+        echo ""
+        echo -e "  ${GREEN}Selected: ${selected_slug}${NC}"
+        echo "    ${selected_goal}"
+        echo ""
+
+        list_auto_cmd=( "$0" auto "$selected_slug" "$selected_goal" )
+        if [ -n "${MODEL:-}" ]; then
+            list_auto_cmd+=( --model "$MODEL" )
+        fi
+        if [ "$DRY_RUN" = true ]; then
+            list_auto_cmd+=( --dry-run )
+        fi
+
+        while true; do
+            printf "  Launch pipeline? (y/n) "
+            if ! read -r pick_confirm </dev/tty; then
+                echo ""
+                echo "  Cancelled."
+                return 0
+            fi
+
+            case "$pick_confirm" in
+                y|Y)
+                    while true; do
+                        printf "  Route: (1) Auto-classify  (2) Simple (V1)  (3) Complex (V2) "
+                        if ! read -r pick_route </dev/tty; then
+                            echo ""
+                            echo "  Cancelled."
+                            return 0
+                        fi
+
+                        case "$pick_route" in
+                            1)
+                                ( "${list_auto_cmd[@]}" )
+                                return $?
+                                ;;
+                            2)
+                                ( "${list_auto_cmd[@]}" --simple )
+                                return $?
+                                ;;
+                            3)
+                                ( "${list_auto_cmd[@]}" --thorough )
+                                return $?
+                                ;;
+                            0|n|N)
+                                break
+                                ;;
+                            "")
+                                echo -e "  ${RED}Enter 1, 2, or 3${NC}"
+                                ;;
+                            *)
+                                echo -e "  ${RED}Enter 1, 2, or 3${NC}"
+                                ;;
+                        esac
+                    done
+                    ;;
+                n|N)
+                    echo ""
+                    echo -e "  ${BLUE}To launch manually:${NC}"
+                    echo "    ./lauren-loop.sh auto \"${selected_slug}\" \"${selected_goal}\""
+                    return 0
+                    ;;
+                "")
+                    echo -e "  ${RED}Enter y or n${NC}"
+                    ;;
+                *)
+                    echo -e "  ${RED}Enter y or n${NC}"
+                    ;;
+            esac
+        done
+    done
 }
 
 _pick_load_ranked_tasks() {
@@ -821,7 +1071,7 @@ format_auto_duration() {
 
 print_auto_summary() {
     local route="$1" reason="$2" duration="$3" cost="$4" exit_code="$5"
-    local cocomo="${6:-N/A}"
+    local traditional_proxy="${6:-N/A}"
     local display_duration
 
     display_duration=$(format_auto_duration "$duration")
@@ -835,10 +1085,57 @@ print_auto_summary() {
     echo "  Reason:   ${reason}"
     echo "  Duration: ${display_duration}"
     echo "  Cost:     ${cost}"
-    echo "  Offshore Dev Cost: ${cocomo}"
-    echo "            Traditional development estimate using industry-standard COCOMO II productivity model."
+    echo "  Traditional Dev Proxy: ${traditional_proxy}"
     echo "  Exit:     ${exit_code}"
 }
+
+# ============================================================
+# No-args default: show list
+# ============================================================
+if [ $# -eq 0 ]; then
+    set -- list
+fi
+
+# ============================================================
+# Subcommand: list — List open tasks and pick one to run
+# ============================================================
+if [ "${1:-}" = "list" ]; then
+    shift
+
+    LIST_STATUS_FILTER=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            -h|--help)
+                echo "Usage: $0 list [--status <status>]"
+                echo ""
+                echo "List all open tasks and interactively pick one to launch."
+                echo "Instant — no LLM calls required."
+                echo ""
+                echo "Options:"
+                echo "  --status <status>   Filter by status (e.g. 'not started', 'in progress', 'blocked')"
+                echo "  -h, --help          Show this help"
+                exit 0
+                ;;
+            --status)
+                if [ $# -lt 2 ]; then
+                    echo -e "${RED}--status requires a value (e.g. --status 'not started')${NC}"
+                    exit 1
+                fi
+                LIST_STATUS_FILTER="$2"
+                shift 2
+                ;;
+            *)
+                echo -e "${RED}Unknown option for 'list': $1${NC}"
+                echo "Usage: $0 list [--status <status>]"
+                exit 1
+                ;;
+        esac
+    done
+
+    _list_collect_tasks "$LIST_STATUS_FILTER"
+    _list_display_and_select
+    exit $?
+fi
 
 # ============================================================
 # Subcommand: auto — Classify and route to V1 or V2
@@ -1064,8 +1361,8 @@ if [ "${1:-}" = "auto" ]; then
     if [ "$AUTO_DURATION" -lt 0 ]; then
         AUTO_DURATION=0
     fi
-    AUTO_COCOMO=$(compute_cocomo_estimate "$AUTO_PRE_SHA" "$AUTO_PROXY_TASK_FILE" "$AUTO_SUMMARY_ROUTE")
-    print_auto_summary "$AUTO_SUMMARY_ROUTE" "$AUTO_REASON" "$AUTO_DURATION" "$AUTO_COST" "$AUTO_CHILD_EXIT" "$AUTO_COCOMO"
+    AUTO_TRADITIONAL_PROXY=$(compute_cocomo_estimate "$AUTO_PRE_SHA" "$AUTO_PROXY_TASK_FILE" "$AUTO_SUMMARY_ROUTE")
+    print_auto_summary "$AUTO_SUMMARY_ROUTE" "$AUTO_REASON" "$AUTO_DURATION" "$AUTO_COST" "$AUTO_CHILD_EXIT" "$AUTO_TRADITIONAL_PROXY"
     exit "$AUTO_CHILD_EXIT"
 fi
 

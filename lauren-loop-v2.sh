@@ -84,6 +84,7 @@ _CLEANUP_V2_RUNNING=false
 _CLEANUP_V2_DONE=false
 _COST_CEILING_WARNED=false
 _COST_CEILING_INTERRUPT_WARNED=false
+_PIPELINE_PRE_SHA=""
 
 _v2_task_artifact_dir() {
     printf '%s/docs/tasks/open/%s\n' "$SCRIPT_DIR" "$1"
@@ -535,6 +536,7 @@ _enforce_codex_phase_backstop() {
             if [[ -n "$live_artifact" ]] && _validate_agent_output_for_role "$role" "$live_artifact" >/dev/null 2>&1; then
                 printf '[codex-backstop] role=%s artifact valid after termination — treating as natural completion\n' \
                     "$role" >> "$log_file"
+                # Promote attempt to canonical so downstream finds it
                 if [[ "$live_artifact" != "$artifact_file" ]]; then
                     _atomic_promote_file "$live_artifact" "$artifact_file" || true
                     printf '[codex-attempt-promote] role=%s attempt=%s -> canonical=%s (backstop)\n' \
@@ -2163,6 +2165,7 @@ lauren_loop_competitive() {
     esac
     mkdir -p "$comp_dir" "$TASK_LOG_DIR"
 
+    # Consolidate flat/pilot task files into directory layout
     if [[ -f "$task_file" && "$task_file" != "${task_dir}/"* ]]; then
         _consolidate_task_to_dir "$task_file" "$task_dir"
         task_file="${task_dir}/task.md"
@@ -2178,6 +2181,7 @@ lauren_loop_competitive() {
     _ensure_cost_csv_header "${TASK_LOG_DIR}/cost.csv"
     _merge_cost_csvs || true
     _init_run_manifest || true
+    _PIPELINE_PRE_SHA=$(git rev-parse HEAD 2>/dev/null || true)
 
     # Task file creation (if not resuming)
     if [[ ! -f "$task_file" ]]; then
