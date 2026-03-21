@@ -22,7 +22,36 @@ Write only to the review artifact path specified in your runtime instruction. Th
 You must explicitly address every dimension. Reviewer B is architecture and structural-integrity focused, so dimensions 1 and 2 carry the most weight, but all nine are mandatory.
 
 1. **Architecture / Structural Integrity**
-   Check module boundaries, cohesion, coupling, reuse of existing patterns, plan-vs-implementation fit, DRY, maintainability, naming clarity, and whether the change creates avoidable long-term complexity.
+   Treat the four sub-dimensions below as the required architectural checklist for this dimension. Also check reuse of existing patterns, plan-vs-implementation fit, DRY, maintainability, naming clarity, and whether the change creates avoidable long-term complexity.
+   Explicitly check these sub-dimensions:
+   - Dependency direction: `src/core/`, `src/models/`, `src/services/core/`,
+     `src/services/utils/`, and `src/utils/` must not import higher layers such as
+     `src/services/handlers/`, `src/services/agent/handlers/`, or `src/api/routers/`.
+     Allow legitimate assembly points to aggregate across layers when they are DI
+     containers, dispatchers/executors, integration/bootstrap modules,
+     orchestrators, or package-export `__init__.py` files.
+   - Import hygiene: flag circular imports, runtime handler-to-handler imports
+     inside `src/services/handlers/` or `src/services/agent/handlers/`, and
+     runtime peer-router imports inside `src/api/routers/`. Ignore imports inside
+     `if TYPE_CHECKING:` blocks. Ignore package-export imports in `__init__.py`
+     unless they execute runtime business logic.
+     Known violation example: `src/api/routers/teams.py` importing from `src/api/routers/chat.py`.
+   - Layering conformance: enforce lower/shared module -> service module under
+     `src/services/*` -> handler module under `src/services/handlers/` or
+     `src/services/agent/handlers/` -> API router under `src/api/routers/` flow.
+     Apply the same assembly-point exceptions for DI containers,
+     dispatchers/executors, integration/bootstrap modules, orchestrators, and
+     package-export `__init__.py` files. Treat
+     `src/services/agent/handlers/_utils.py` as a shared module despite its
+     location, so non-handler imports of `_utils.py` are permitted. Flag inverted
+     flow outside those exceptions.
+   - Module cohesion: flag runtime imports where a non-`__init__.py`,
+     non-orchestrator, non-dispatcher file under `src/services/handlers/`,
+     `src/services/agent/handlers/`, or `src/api/routers/` imports business logic
+     from a peer handler/router. If 2+ peers need the same helper, require
+     extraction to `src/services/agent/handlers/_utils.py`,
+     `src/services/utils/`, or `src/utils/`. Keep `src/api/routers/teams.py`
+     importing from `src/api/routers/chat.py` as the canonical peer-router case.
 2. **Correctness**
    Check whether the implementation matches the approved plan and whether the changed logic appears behaviorally correct.
 3. **Test Quality**

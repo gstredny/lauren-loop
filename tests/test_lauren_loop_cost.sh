@@ -290,6 +290,41 @@ EOF
   || fail "17. read_v1_total_cost — legacy 13-col CSV migrated"
 
 # ============================================================
+# Test 18: _print_cost_summary — Duration line when _PIPELINE_START_TS set
+# ============================================================
+(
+    cost_csv="$TMP_ROOT/summary-duration-cost.csv"
+    SLUG="duration-test"
+    printf '%s\n' "$COST_CSV_HEADER" > "$cost_csv"
+    printf '2026-03-20T00:00:00+0000,duration-test,executor,claude,opus,n/a,5000,1000,500,2000,0.0837,60,0,completed\n' >> "$cost_csv"
+
+    # Set _PIPELINE_START_TS to 90 minutes ago
+    _PIPELINE_START_TS=$(( $(date +%s) - 5400 ))
+    export _PIPELINE_START_TS
+
+    output=$(_print_cost_summary "$cost_csv" 2>&1)
+    echo "$output" | grep -q 'Duration:'
+    echo "$output" | grep -q '1h 30m'
+) && pass "18. _print_cost_summary — Duration line appears when _PIPELINE_START_TS is set" \
+  || fail "18. _print_cost_summary — Duration line appears when _PIPELINE_START_TS is set"
+
+# ============================================================
+# Test 19: _print_cost_summary — no Duration line when _PIPELINE_START_TS unset
+# ============================================================
+(
+    cost_csv="$TMP_ROOT/summary-nodur-cost.csv"
+    SLUG="nodur-test"
+    printf '%s\n' "$COST_CSV_HEADER" > "$cost_csv"
+    printf '2026-03-20T00:00:00+0000,nodur-test,executor,claude,opus,n/a,5000,1000,500,2000,0.0837,60,0,completed\n' >> "$cost_csv"
+
+    unset _PIPELINE_START_TS
+
+    output=$(_print_cost_summary "$cost_csv" 2>&1)
+    ! echo "$output" | grep -q 'Duration:'
+) && pass "19. _print_cost_summary — no Duration line when _PIPELINE_START_TS is unset" \
+  || fail "19. _print_cost_summary — no Duration line when _PIPELINE_START_TS is unset"
+
+# ============================================================
 # Summary
 # ============================================================
 echo ""

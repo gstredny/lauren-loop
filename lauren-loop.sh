@@ -666,6 +666,11 @@ _list_display_and_select() {
     local confirm_running="" pick_confirm="" pick_route=""
     local -a list_auto_cmd=()
 
+    if [[ "${LAUREN_LOOP_NONINTERACTIVE:-}" == "1" || ! -t 0 || ! -t 1 ]]; then
+        echo "  Cancelled."
+        return 0
+    fi
+
     while true; do
         printf "  Enter number (0 to cancel): "
         if ! read -r pick_input </dev/tty; then
@@ -888,6 +893,11 @@ _pick_interactive_select_task() {
     echo "   0) Cancel"
     echo ""
 
+    if [[ "${LAUREN_LOOP_NONINTERACTIVE:-}" == "1" || ! -t 0 || ! -t 1 ]]; then
+        echo "Cancelled."
+        return 0
+    fi
+
     while true; do
         printf "Enter number: "
         if ! read -r pick_input </dev/tty; then
@@ -1048,25 +1058,6 @@ extract_classifier_rationale() {
         /^## / { if (capture) exit }
         capture { print }
     ' "$output_file" | sed '/^[[:space:]]*$/d' | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//'
-}
-
-format_auto_duration() {
-    local duration="$1"
-    local hours minutes
-
-    if [ "$duration" -lt 60 ]; then
-        echo "<1m"
-        return 0
-    fi
-
-    hours=$((duration / 3600))
-    minutes=$(((duration % 3600) / 60))
-
-    if [ "$hours" -gt 0 ]; then
-        printf '%sh %sm\n' "$hours" "$minutes"
-    else
-        printf '%sm\n' "$minutes"
-    fi
 }
 
 print_auto_summary() {
@@ -1317,8 +1308,10 @@ if [ "${1:-}" = "auto" ]; then
         AUTO_CMD+=( --model "$MODEL" )
         # Routed V1 auto stops after execution handoff for human verification.
         AUTO_CMD+=( --no-review --no-close )
+        export _LAUREN_LOOP_V1_AUTO_WRAPPER=1
         "${AUTO_CMD[@]}"
         AUTO_CHILD_EXIT=$?
+        unset _LAUREN_LOOP_V1_AUTO_WRAPPER 2>/dev/null || true
         AUTO_COST=$(read_v1_total_cost "$SLUG")
     else
         AUTO_SUMMARY_ROUTE="V2"
@@ -1329,6 +1322,12 @@ if [ "${1:-}" = "auto" ]; then
         AUTO_CMD+=( --model "$MODEL" )
         if [ "$AUTO_FORCE" = true ]; then
             AUTO_CMD+=( --force )
+        fi
+        export _LAUREN_LOOP_AUTO_WRAPPER=1
+        if [ "$RESUME" = true ]; then
+            export _LAUREN_LOOP_RESUME_HINT=1
+        else
+            unset _LAUREN_LOOP_RESUME_HINT 2>/dev/null || true
         fi
         "${AUTO_CMD[@]}"
         AUTO_CHILD_EXIT=$?
@@ -1361,7 +1360,7 @@ if [ "${1:-}" = "auto" ]; then
     if [ "$AUTO_DURATION" -lt 0 ]; then
         AUTO_DURATION=0
     fi
-    AUTO_TRADITIONAL_PROXY=$(compute_cocomo_estimate "$AUTO_PRE_SHA" "$AUTO_PROXY_TASK_FILE" "$AUTO_SUMMARY_ROUTE")
+    AUTO_TRADITIONAL_PROXY=$(resolve_traditional_dev_proxy_summary "$AUTO_PRE_SHA" "$AUTO_PROXY_TASK_FILE" "$AUTO_SUMMARY_ROUTE")
     print_auto_summary "$AUTO_SUMMARY_ROUTE" "$AUTO_REASON" "$AUTO_DURATION" "$AUTO_COST" "$AUTO_CHILD_EXIT" "$AUTO_TRADITIONAL_PROXY"
     exit "$AUTO_CHILD_EXIT"
 fi
@@ -1635,6 +1634,11 @@ if [ "${1:-}" = "execute" ]; then
         echo -e "Use: ${BLUE}./lauren-loop-v2.sh ${SLUG}${NC}"
         exit 1
     fi
+    CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
+    if _task_is_timeout_verification_retry_eligible "$TASK_FILE" "$CURRENT_STATUS"; then
+        run_v1_verifier "$TASK_FILE" "$SLUG" "$CURRENT_STATUS"
+        exit $?
+    fi
     if [ ! -f "$EXECUTOR_PROMPT" ]; then
         echo -e "${RED}Executor prompt not found: $EXECUTOR_PROMPT${NC}"
         exit 1
@@ -1645,7 +1649,6 @@ if [ "${1:-}" = "execute" ]; then
     fi
 
     # Verify status
-    CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
     if [ "$CURRENT_STATUS" = "needs verification" ]; then
         echo -e "${GREEN}Task already executed and awaiting verification. Run: ./lauren-loop.sh review ${SLUG} or ./lauren-loop.sh verify ${SLUG}${NC}"
         log_execution "$TASK_FILE" "Execute skipped — task already awaiting verification"
@@ -1664,6 +1667,10 @@ if [ "${1:-}" = "execute" ]; then
 
     acquire_lock
 
+    if ! _normalize_verify_tags_with_timeout_in_file "$TASK_FILE" "V1 execute task plan"; then
+        exit 1
+    fi
+
     # Tag current git SHA for diff later
     PRE_EXEC_SHA=$(git rev-parse HEAD)
     echo -e "${BLUE}Pre-execution SHA: $PRE_EXEC_SHA${NC}"
@@ -1679,13 +1686,16 @@ if [ "${1:-}" = "execute" ]; then
     LOG_FILE="$LOG_DIR/pilot-${SLUG}-executor.log"
 
     # Build task instruction
-    TASK_INSTRUCTION="Read the task file at ${TASK_FILE}. Execute the implementation plan in ## Current Plan using TDD vertical slices. Log every RED-GREEN cycle to ## Execution Log."
+    TASK_INSTRUCTION="Read the task file at ${TASK_FILE}. Execute the implementation plan in ## Current Plan using TDD vertical slices. Log every RED-GREEN cycle to ## Execution Log. If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_message) - <command>' and stop."
 
     # Inject placeholders into prompt
+    runtime_test_cmd=""
+    runtime_test_cmd=$(_timeout_wrapped_verification_command "$TEST_CMD") || exit 1
     PROMPT_CONTENT=$(cat "$EXECUTOR_PROMPT")
-    PROMPT_CONTENT=$(echo "$PROMPT_CONTENT" | sed "s|\$PROJECT_NAME|$PROJECT_NAME|g")
-    PROMPT_CONTENT=$(echo "$PROMPT_CONTENT" | sed "s|\$TEST_CMD|$TEST_CMD|g")
-    PROMPT_CONTENT=$(echo "$PROMPT_CONTENT" | sed "s|\$LINT_CMD|$LINT_CMD|g")
+    PROMPT_CONTENT=${PROMPT_CONTENT//\$PROJECT_NAME/$PROJECT_NAME}
+    PROMPT_CONTENT=${PROMPT_CONTENT//\$TEST_CMD/$runtime_test_cmd}
+    PROMPT_CONTENT=${PROMPT_CONTENT//\$LINT_CMD/$LINT_CMD}
+    PROMPT_CONTENT=$(printf '%s' "$PROMPT_CONTENT" | _normalize_executor_prompt_timeout_content "V1 execute prompt") || exit 1
     PROMPT_CONTENT="${PROJECT_RULES}
 
 ${PROMPT_CONTENT}"
@@ -1701,6 +1711,7 @@ ${PROMPT_CONTENT}"
     START_LINE=$(prepare_attempt_log "$LOG_FILE" "execute" "na")
     EXIT_CODE=0
     _COST_START=$(date +%s)
+    PRE_TIMEOUT_BLOCK_COUNT=$(_timeout_block_count_in_file "$TASK_FILE")
     SKIP_SUMMARY_HOOK=1 _timeout "$EXECUTOR_TIMEOUT" env -u CLAUDECODE claude --settings "$AGENT_SETTINGS" --disable-slash-commands -p "$TASK_INSTRUCTION" \
         --system-prompt "$PROMPT_CONTENT" \
         --model "$MODEL" \
@@ -1710,11 +1721,22 @@ ${PROMPT_CONTENT}"
         --verbose --output-format stream-json \
         >> "$LOG_FILE" 2>&1 || EXIT_CODE=$?
     _append_cost_row "$V1_COST_CSV" "executor" "claude" "$_COST_START" "$EXIT_CODE" "$LOG_FILE"
+    POST_TIMEOUT_BLOCK_COUNT=$(_timeout_block_count_in_file "$TASK_FILE")
 
     if [[ "$EXIT_CODE" -eq 124 ]]; then
         echo -e "${RED}Executor timed out after $EXECUTOR_TIMEOUT${NC}"
         log_execution "$TASK_FILE" "Executor timed out after $EXECUTOR_TIMEOUT"
         _sed_i 's/^## Status: .*/## Status: timed-out/' "$TASK_FILE"
+        echo "  Log: $LOG_FILE"
+        exit 1
+    fi
+
+    if [[ "${POST_TIMEOUT_BLOCK_COUNT:-0}" -gt "${PRE_TIMEOUT_BLOCK_COUNT:-0}" ]]; then
+        BLOCKED_REASON=$(_latest_timeout_block_line "$TASK_FILE")
+        echo -e "${YELLOW}$(_verification_timeout_message)${NC}"
+        log_execution "$TASK_FILE" "Executor BLOCKED: $(_verification_timeout_message)"
+        _sed_i 's/^## Status: .*/## Status: execution-blocked/' "$TASK_FILE"
+        echo "  Reason: ${BLOCKED_REASON:-$(_verification_timeout_message)}"
         echo "  Log: $LOG_FILE"
         exit 1
     fi
@@ -2380,6 +2402,11 @@ if [ "${1:-}" = "fix" ]; then
         echo -e "Use: ${BLUE}./lauren-loop-v2.sh ${SLUG}${NC}"
         exit 1
     fi
+    CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
+    if _task_is_timeout_verification_retry_eligible "$TASK_FILE" "$CURRENT_STATUS"; then
+        run_v1_verifier "$TASK_FILE" "$SLUG" "$CURRENT_STATUS"
+        exit $?
+    fi
     if [ ! -f "$FIX_PROMPT" ]; then
         echo -e "${RED}Fix agent prompt not found: $FIX_PROMPT${NC}"
         exit 1
@@ -2390,7 +2417,6 @@ if [ "${1:-}" = "fix" ]; then
     fi
 
     # Status gate: only "review-findings-pending" or "fixing" (stuck) tasks can be fixed
-    CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
     if [ "$CURRENT_STATUS" != "review-findings-pending" ] && [ "$CURRENT_STATUS" != "fixing" ]; then
         echo -e "${RED}Task status is '$CURRENT_STATUS', expected 'review-findings-pending' or 'fixing'${NC}"
         echo "Only review-findings-pending or fixing (stuck) tasks can be fixed."
@@ -2413,13 +2439,15 @@ if [ "${1:-}" = "fix" ]; then
     LOG_FILE="$LOG_DIR/pilot-${SLUG}-fix.log"
 
     # Build task instruction
-    TASK_INSTRUCTION="Read the task file at ${TASK_FILE}. Apply fixes for all findings in ## Review Findings using TDD. Log fixes to ## Fixes Applied."
+    TASK_INSTRUCTION="Read the task file at ${TASK_FILE}. Apply fixes for all findings in ## Review Findings using TDD. Log fixes to ## Fixes Applied. If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_message) - <command>' and stop."
 
     # Inject placeholders
+    runtime_test_cmd=""
+    runtime_test_cmd=$(_timeout_wrapped_verification_command "$TEST_CMD") || exit 1
     PROMPT_CONTENT=$(cat "$FIX_PROMPT")
-    PROMPT_CONTENT=$(echo "$PROMPT_CONTENT" | sed "s|\$PROJECT_NAME|$PROJECT_NAME|g")
-    PROMPT_CONTENT=$(echo "$PROMPT_CONTENT" | sed "s|\$TEST_CMD|$TEST_CMD|g")
-    PROMPT_CONTENT=$(echo "$PROMPT_CONTENT" | sed "s|\$LINT_CMD|$LINT_CMD|g")
+    PROMPT_CONTENT=${PROMPT_CONTENT//\$PROJECT_NAME/$PROJECT_NAME}
+    PROMPT_CONTENT=${PROMPT_CONTENT//\$TEST_CMD/$runtime_test_cmd}
+    PROMPT_CONTENT=${PROMPT_CONTENT//\$LINT_CMD/$LINT_CMD}
     PROMPT_CONTENT="${PROJECT_RULES}
 
 ${PROMPT_CONTENT}"
@@ -2431,6 +2459,7 @@ ${PROMPT_CONTENT}"
     START_LINE=$(prepare_attempt_log "$LOG_FILE" "fix" "na")
     EXIT_CODE=0
     _COST_START=$(date +%s)
+    PRE_TIMEOUT_BLOCK_COUNT=$(_timeout_block_count_in_file "$TASK_FILE")
     SKIP_SUMMARY_HOOK=1 _timeout "$FIX_TIMEOUT" env -u CLAUDECODE claude --settings "$AGENT_SETTINGS" --disable-slash-commands -p "$TASK_INSTRUCTION" \
         --system-prompt "$PROMPT_CONTENT" \
         --model "$MODEL" \
@@ -2440,11 +2469,22 @@ ${PROMPT_CONTENT}"
         --verbose --output-format stream-json \
         >> "$LOG_FILE" 2>&1 || EXIT_CODE=$?
     _append_cost_row "$V1_COST_CSV" "fix" "claude" "$_COST_START" "$EXIT_CODE" "$LOG_FILE"
+    POST_TIMEOUT_BLOCK_COUNT=$(_timeout_block_count_in_file "$TASK_FILE")
 
     if [[ "$EXIT_CODE" -eq 124 ]]; then
         echo -e "${RED}Fix agent timed out after $FIX_TIMEOUT${NC}"
         log_execution "$TASK_FILE" "Fix agent timed out after $FIX_TIMEOUT"
         _sed_i 's/^## Status: .*/## Status: timed-out/' "$TASK_FILE"
+        echo "  Log: $LOG_FILE"
+        exit 1
+    fi
+
+    if [[ "${POST_TIMEOUT_BLOCK_COUNT:-0}" -gt "${PRE_TIMEOUT_BLOCK_COUNT:-0}" ]]; then
+        BLOCKED_REASON=$(_latest_timeout_block_line "$TASK_FILE")
+        echo -e "${YELLOW}$(_verification_timeout_message)${NC}"
+        log_execution "$TASK_FILE" "Fix agent BLOCKED: $(_verification_timeout_message)"
+        _sed_i 's/^## Status: .*/## Status: fix-blocked/' "$TASK_FILE"
+        echo "  Reason: ${BLOCKED_REASON:-$(_verification_timeout_message)}"
         echo "  Log: $LOG_FILE"
         exit 1
     fi
@@ -2621,6 +2661,118 @@ ${PROMPT_CONTENT}"
     exit 0
 fi
 
+run_v1_verifier() {
+    local task_file="$1"
+    local slug="$2"
+    local current_status="${3:-}"
+    local verify_prompt="$SCRIPT_DIR/prompts/verifier.md"
+    local goal_text=""
+    local done_criteria=""
+    local prompt_content=""
+    local verify_output=""
+    local exit_code=0
+    local pass_count=0
+    local fail_count=0
+    local total=0
+    local timeout_retry=false
+    local original_status=""
+
+    if [ -z "$current_status" ]; then
+        current_status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    fi
+
+    if [ ! -f "$verify_prompt" ]; then
+        echo -e "${RED}Verifier prompt not found: $verify_prompt${NC}"
+        return 1
+    fi
+    if ! command -v claude &>/dev/null; then
+        echo -e "${RED}claude CLI not found. Install Claude Code first.${NC}"
+        return 1
+    fi
+
+    goal_text=$(_verify_extract_goal "$task_file")
+    done_criteria=$(_verify_extract_done_criteria "$task_file")
+
+    if [ -z "$goal_text" ]; then
+        echo -e "${RED}No goal found in task file${NC}"
+        return 1
+    fi
+
+    if _task_is_timeout_verification_retry_eligible "$task_file" "$current_status"; then
+        timeout_retry=true
+        original_status="$current_status"
+        echo -e "${BLUE}Resuming from verification timeout — retrying verification${NC}"
+        log_execution "$task_file" "Resuming from verification timeout — retrying verification"
+        _sed_i 's/^## Status: .*/## Status: needs verification/' "$task_file"
+    fi
+
+    echo -e "${BLUE}Running goal verifier (model: $MODEL)...${NC}"
+
+    mkdir -p "$LOG_DIR"
+    LOG_FILE="$LOG_DIR/pilot-${slug}-verify.log"
+
+    TASK_INSTRUCTION="Verify the task outcomes against the goal and done criteria.
+
+Goal: ${goal_text}
+
+Done Criteria:
+${done_criteria}
+
+Task file: ${task_file}
+
+Examine the codebase to determine if each criterion is met. For each criterion, emit PASS or FAIL with evidence."
+
+    prompt_content=$(cat "$verify_prompt")
+    prompt_content="${PROJECT_RULES}
+
+${prompt_content}"
+
+    verify_output=$(mktemp)
+    SKIP_SUMMARY_HOOK=1 _timeout "$CRITIC_TIMEOUT" env -u CLAUDECODE claude --settings "$AGENT_SETTINGS" --disable-slash-commands -p "$TASK_INSTRUCTION" \
+        --system-prompt "$prompt_content" \
+        --model "$MODEL" \
+        --max-turns 15 \
+        --dangerously-skip-permissions \
+        --disallowedTools "WebFetch,WebSearch" \
+        --output-format text \
+        2>"$LOG_FILE" | tee "$verify_output" || exit_code=$?
+
+    if [[ "$exit_code" -eq 124 ]]; then
+        echo -e "${RED}Verifier timed out after $CRITIC_TIMEOUT${NC}"
+        if [[ "$timeout_retry" == true ]]; then
+            _sed_i "s/^## Status: .*/## Status: ${original_status}/" "$task_file"
+            log_execution "$task_file" "Verification retry timed out after $CRITIC_TIMEOUT"
+        fi
+        rm -f "$verify_output"
+        return 1
+    fi
+
+    pass_count=$(_verify_count_results "$verify_output" "PASS")
+    fail_count=$(_verify_count_results "$verify_output" "FAIL")
+    total=$((pass_count + fail_count))
+
+    _verify_append_results "$task_file" "$verify_output" "$pass_count" "$fail_count"
+
+    echo ""
+    echo -e "${BLUE}Verification results:${NC}"
+    echo "  PASS: $pass_count / $total"
+    echo "  FAIL: $fail_count / $total"
+
+    if [ "$fail_count" -gt 0 ]; then
+        echo ""
+        echo -e "${RED}Verification failed — $fail_count criteria not met${NC}"
+        log_execution "$task_file" "Verification: $pass_count PASS, $fail_count FAIL"
+        rm -f "$verify_output"
+        return 1
+    fi
+
+    log_execution "$task_file" "Verification: $pass_count PASS, $fail_count FAIL — all criteria met"
+    echo ""
+    echo -e "${GREEN}All criteria verified${NC}"
+    rm -f "$verify_output"
+    return 0
+}
+
 # ============================================================
 # Subcommand: verify — Goal-backward verification of task outcomes
 # ============================================================
@@ -2654,91 +2806,24 @@ if [ "${1:-}" = "verify" ]; then
         echo -e "Use: ${BLUE}./lauren-loop-v2.sh ${SLUG}${NC}"
         exit 1
     fi
-    if [ ! -f "$VERIFY_PROMPT" ]; then
-        echo -e "${RED}Verifier prompt not found: $VERIFY_PROMPT${NC}"
-        exit 1
-    fi
 
-    # Status gate: only executed/fixed/review-passed tasks
     CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
     case "$CURRENT_STATUS" in
         executed|fixed|review-passed|needs\ verification) ;;
-        *) echo -e "${RED}Task status is '$CURRENT_STATUS', expected 'executed', 'fixed', 'review-passed', or 'needs verification'${NC}"; exit 1 ;;
+        execution-blocked|fix-blocked)
+            if ! _task_is_timeout_verification_retry_eligible "$TASK_FILE" "$CURRENT_STATUS"; then
+                echo -e "${RED}Task status is '$CURRENT_STATUS', but the latest BLOCKED reason is not a verification timeout${NC}"
+                exit 1
+            fi
+            ;;
+        *)
+            echo -e "${RED}Task status is '$CURRENT_STATUS', expected 'executed', 'fixed', 'review-passed', 'needs verification', or timeout-blocked verification retry${NC}"
+            exit 1
+            ;;
     esac
 
-    # Extract goal and done criteria
-    GOAL_TEXT=$(_verify_extract_goal "$TASK_FILE")
-    DONE_CRITERIA=$(_verify_extract_done_criteria "$TASK_FILE")
-
-    if [ -z "$GOAL_TEXT" ]; then
-        echo -e "${RED}No goal found in task file${NC}"
-        exit 1
-    fi
-
-    echo -e "${BLUE}Running goal verifier (model: $MODEL)...${NC}"
-
-    mkdir -p "$LOG_DIR"
-    LOG_FILE="$LOG_DIR/pilot-${SLUG}-verify.log"
-
-    TASK_INSTRUCTION="Verify the task outcomes against the goal and done criteria.
-
-Goal: ${GOAL_TEXT}
-
-Done Criteria:
-${DONE_CRITERIA}
-
-Task file: ${TASK_FILE}
-
-Examine the codebase to determine if each criterion is met. For each criterion, emit PASS or FAIL with evidence."
-
-    PROMPT_CONTENT=$(cat "$VERIFY_PROMPT")
-    PROMPT_CONTENT="${PROJECT_RULES}
-
-${PROMPT_CONTENT}"
-
-    VERIFY_OUTPUT=$(mktemp)
-    EXIT_CODE=0
-    SKIP_SUMMARY_HOOK=1 _timeout "$CRITIC_TIMEOUT" env -u CLAUDECODE claude --settings "$AGENT_SETTINGS" --disable-slash-commands -p "$TASK_INSTRUCTION" \
-        --system-prompt "$PROMPT_CONTENT" \
-        --model "$MODEL" \
-        --max-turns 15 \
-        --dangerously-skip-permissions \
-        --disallowedTools "WebFetch,WebSearch" \
-        --output-format text \
-        2>"$LOG_FILE" | tee "$VERIFY_OUTPUT" || EXIT_CODE=$?
-
-    if [[ "$EXIT_CODE" -eq 124 ]]; then
-        echo -e "${RED}Verifier timed out after $CRITIC_TIMEOUT${NC}"
-        rm -f "$VERIFY_OUTPUT"
-        exit 1
-    fi
-
-    # Parse results
-    PASS_COUNT=$(_verify_count_results "$VERIFY_OUTPUT" "PASS")
-    FAIL_COUNT=$(_verify_count_results "$VERIFY_OUTPUT" "FAIL")
-    TOTAL=$((PASS_COUNT + FAIL_COUNT))
-
-    # Append verification results to task file
-    _verify_append_results "$TASK_FILE" "$VERIFY_OUTPUT" "$PASS_COUNT" "$FAIL_COUNT"
-
-    echo ""
-    echo -e "${BLUE}Verification results:${NC}"
-    echo "  PASS: $PASS_COUNT / $TOTAL"
-    echo "  FAIL: $FAIL_COUNT / $TOTAL"
-
-    if [ "$FAIL_COUNT" -gt 0 ]; then
-        echo ""
-        echo -e "${RED}Verification failed — $FAIL_COUNT criteria not met${NC}"
-        log_execution "$TASK_FILE" "Verification: $PASS_COUNT PASS, $FAIL_COUNT FAIL"
-        rm -f "$VERIFY_OUTPUT"
-        exit 1
-    fi
-
-    log_execution "$TASK_FILE" "Verification: $PASS_COUNT PASS, $FAIL_COUNT FAIL — all criteria met"
-    echo ""
-    echo -e "${GREEN}All criteria verified${NC}"
-    rm -f "$VERIFY_OUTPUT"
-    exit 0
+    run_v1_verifier "$TASK_FILE" "$SLUG" "$CURRENT_STATUS"
+    exit $?
 fi
 
 # ============================================================
@@ -3279,16 +3364,19 @@ run_lead() {
     local task_instruction="Read the task file at ${task_file}. \
 Follow the three-phase workflow in your system prompt: \
 (1) explore and plan, (2) spawn critic and handle feedback, \
-(3) execute via TDD. The critic prompt is at ${SCRIPT_DIR}/prompts/critic.md."
+(3) execute via TDD. The critic prompt is at ${SCRIPT_DIR}/prompts/critic.md. \
+If any verification command exits 124 during execution, log BLOCKED with '$(_verification_timeout_message)' and stop."
 
     # Inject variables into prompt
     local prompt_content
+    local runtime_test_cmd
     prompt_content=$(cat "$LEAD_PROMPT")
-    prompt_content=$(echo "$prompt_content" | sed "s|\$PROJECT_NAME|$PROJECT_NAME|g")
-    prompt_content=$(echo "$prompt_content" | sed "s|\$TEST_CMD|$TEST_CMD|g")
-    prompt_content=$(echo "$prompt_content" | sed "s|\$LINT_CMD|$LINT_CMD|g")
-    prompt_content=$(echo "$prompt_content" | sed "s|\$CRITIC_PROMPT_PATH|${SCRIPT_DIR}/prompts/critic.md|g")
-    prompt_content=$(echo "$prompt_content" | sed "s|\$MAX_ROUNDS|${MAX_ROUNDS}|g")
+    runtime_test_cmd=$(_timeout_wrapped_verification_command "$TEST_CMD") || return 1
+    prompt_content=${prompt_content//\$PROJECT_NAME/$PROJECT_NAME}
+    prompt_content=${prompt_content//\$TEST_CMD/$runtime_test_cmd}
+    prompt_content=${prompt_content//\$LINT_CMD/$LINT_CMD}
+    prompt_content=${prompt_content//\$CRITIC_PROMPT_PATH/${SCRIPT_DIR}/prompts/critic.md}
+    prompt_content=${prompt_content//\$MAX_ROUNDS/${MAX_ROUNDS}}
     prompt_content="${PROJECT_RULES}
 
 ${prompt_content}"
@@ -3301,7 +3389,10 @@ ${prompt_content}"
     PHASE="lead"
     local exit_code=0
     local _cost_start
+    local pre_timeout_block_count
+    local post_timeout_block_count
     _cost_start=$(date +%s)
+    pre_timeout_block_count=$(_timeout_block_count_in_file "$task_file")
     SKIP_SUMMARY_HOOK=1 _timeout "$LEAD_TIMEOUT" env -u CLAUDECODE claude --settings "$AGENT_SETTINGS" --disable-slash-commands -p "$task_instruction" \
         --system-prompt "$prompt_content" \
         --model "$MODEL" \
@@ -3311,6 +3402,7 @@ ${prompt_content}"
         --verbose --output-format stream-json \
         >> "$log_file" 2>&1 || exit_code=$?
     _append_cost_row "$V1_COST_CSV" "lead" "claude" "$_cost_start" "$exit_code" "$log_file"
+    post_timeout_block_count=$(_timeout_block_count_in_file "$task_file")
 
     if [[ "$exit_code" -eq 124 ]]; then
         stop_lead_monitor
@@ -3322,6 +3414,12 @@ ${prompt_content}"
     fi
 
     stop_lead_monitor
+
+    if [[ "${post_timeout_block_count:-0}" -gt "${pre_timeout_block_count:-0}" ]]; then
+        echo -e "${YELLOW}$(_verification_timeout_message)${NC}"
+        log_execution "$task_file" "Lead execution BLOCKED: $(_verification_timeout_message)"
+        _sed_i 's/^## Status: .*/## Status: execution-blocked/' "$task_file"
+    fi
 
     # Standard checks: exit code, max-turns exhaustion
     if [ $exit_code -ne 0 ]; then
@@ -3439,9 +3537,17 @@ main_lead() {
         exit 0
     fi
 
+    if _should_enforce_task_file_content_gate "$DRY_RUN" "$RESUME"; then
+        _validate_task_file_content "$TASK_FILE" || exit 1
+    fi
+
     # Status gate for --resume: only allow resuming from known states
     if [ "$RESUME" = true ]; then
         CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
+        if _task_is_timeout_verification_retry_eligible "$TASK_FILE" "$CURRENT_STATUS"; then
+            run_v1_verifier "$TASK_FILE" "$SLUG" "$CURRENT_STATUS"
+            exit $?
+        fi
         case "$CURRENT_STATUS" in
             not-started|lead-running|planning-round-*|plan-approved|executing)
                 echo -e "${BLUE}Resuming from status: $CURRENT_STATUS${NC}"

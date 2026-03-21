@@ -61,7 +61,7 @@ write_prompt_fixtures() {
     local root="$1"
     mkdir -p "$root/prompts"
     local prompt
-    for prompt in exploration-summarizer planner-a planner-b plan-evaluator critic reviser executor reviewer reviewer-b review-evaluator fix-plan-author fix-executor project-rules; do
+    for prompt in exploration-summarizer planner-a planner-b plan-evaluator critic reviser executor scope-triage reviewer reviewer-b review-evaluator fix-plan-author fix-executor project-rules; do
         case "$prompt" in
             planner-b|reviewer-b)
                 cp "$REPO_ROOT/prompts/${prompt}.md" "$root/prompts/${prompt}.md"
@@ -196,6 +196,30 @@ EOF
     rm -f "$replacement"
 }
 
+write_reviewer_a_section_without_verdict() {
+    local task_file="$1" findings="$2"
+    local replacement="$TMP_ROOT/review-findings-invalid.$$.txt"
+    cat > "$replacement" <<EOF
+### Review (Round 1)
+
+**Scope:** src/main.py
+
+**Findings:**
+
+${findings}
+
+**Done-criteria check:**
+Not applicable (plan uses numbered steps).
+
+**What was checked:** test branch
+**What was NOT checked:** none
+
+safe
+EOF
+    rewrite_section "$task_file" "## Review Findings" "$replacement"
+    rm -f "$replacement"
+}
+
 write_review_synthesis_artifact() {
     local path="$1" verdict="$2" critical="$3" major="$4" minor="$5" nit="$6"
     cat > "$path" <<EOF
@@ -243,6 +267,11 @@ Not applicable.
 EOF
     printf '{"verdict":"%s","critical_count":%s,"major_count":%s,"minor_count":%s,"nit_count":%s}\n' \
         "$verdict" "$critical" "$major" "$minor" "$nit" > "${path%.*}.contract.json"
+}
+
+commit_executor_change() {
+    local role="$1"
+    printf 'modified by %s\n' "$role" >> "src/main.py"
 }
 
 write_fix_plan_artifact() {
@@ -305,6 +334,18 @@ declare -f lauren_loop_competitive >/dev/null 2>&1 || {
     exit 1
 }
 
+REAL_INIT_RUN_MANIFEST_DEF="$(declare -f _init_run_manifest)"
+REAL_UPDATE_RUN_MANIFEST_STATE_DEF="$(declare -f _update_run_manifest_state)"
+REAL_APPEND_MANIFEST_PHASE_DEF="$(declare -f _append_manifest_phase)"
+REAL_FINALIZE_RUN_MANIFEST_DEF="$(declare -f _finalize_run_manifest)"
+
+restore_real_manifest_hooks() {
+    eval "$REAL_INIT_RUN_MANIFEST_DEF"
+    eval "$REAL_UPDATE_RUN_MANIFEST_STATE_DEF"
+    eval "$REAL_APPEND_MANIFEST_PHASE_DEF"
+    eval "$REAL_FINALIZE_RUN_MANIFEST_DEF"
+}
+
 # ============================================================
 # Global stubs — external functions not needed in test context
 # ============================================================
@@ -349,6 +390,17 @@ MOCKEOF
     printf '%s\n' "$root"
 }
 
+seed_medium_risk_diff() {
+    local root="$1"
+    local target="$root/prompts/project-rules.md"
+    local i=1
+    : > "$target"
+    while [[ "$i" -le 520 ]]; do
+        printf 'medium risk fixture line %04d\n' "$i" >> "$target"
+        i=$((i + 1))
+    done
+}
+
 set_integration_globals() {
     local root="$1"
     export PATH="$root/bin:$PATH"
@@ -376,7 +428,9 @@ set_integration_globals() {
     CRITIC_TIMEOUT="5s"
     EXECUTOR_TIMEOUT="5s"
     REVIEWER_TIMEOUT="5s"
+    REVIEWER_TIMEOUT_EXPLICIT="true"
     SYNTHESIZE_TIMEOUT="5s"
+    LAUREN_LOOP_AGENT_POLL_INTERVAL_SEC="1"
     SINGLE_REVIEWER_POLICY="synthesis"
 }
 
@@ -385,7 +439,28 @@ set_integration_globals() {
 # ============================================================
 
 set_integration_stubs() {
-    prepare_agent_request() { AGENT_PROMPT_BODY="$3"; AGENT_SYSTEM_PROMPT=""; }
+    prepare_agent_request() {
+        local engine="$1" prompt_file="$2" instruction="$3"
+        local prompt_stub="placeholder prompt for $(basename "$prompt_file")"
+        case "$(basename "$prompt_file")" in
+            executor.md|fix-executor.md)
+                prompt_stub="Run verification with .venv/bin/python -m pytest tests/ -x -q before finishing."
+                ;;
+        esac
+
+        AGENT_PROMPT_BODY=""
+        AGENT_SYSTEM_PROMPT=""
+        if [[ "$engine" == "claude" ]]; then
+            AGENT_SYSTEM_PROMPT="$prompt_stub"
+            AGENT_PROMPT_BODY="$instruction"
+        else
+            AGENT_PROMPT_BODY="${prompt_stub}
+
+---
+
+${instruction}"
+        fi
+    }
     capture_diff_artifact() { printf 'diff --git a/x b/x\n--- a/src/main.py\n+++ b/src/main.py\n@@ -1 +1 @@\n-baseline\n+modified\n' > "$2"; }
     _classify_diff_risk() { printf 'LOW\n'; }
     _block_on_untracked_files() { return 0; }
@@ -442,9 +517,8 @@ mock_run_agent() {
                 > "${comp_dir}/revised-plan.md"
             ;;
         executor|fix-executor*)
-            # Make real git changes so capture_diff_artifact has something
-            printf 'modified by %s\n' "$role" >> "${_FIXTURE_ROOT}/src/main.py"
-            (cd "${_FIXTURE_ROOT}" && git add src/main.py && git commit -q -m "$role changes")
+            # Make real git changes inside the active execution worktree.
+            commit_executor_change "$role"
             ;;
         reviewer-a*)
             # Pipeline extracts ## Review Findings from task file to reviewer-a.raw.md
@@ -761,8 +835,7 @@ EOF
                 write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
                 ;;
             executor|fix-executor*)
-                printf 'modified by %s\n' "$role" >> "${_FIXTURE_ROOT}/src/main.py"
-                (cd "${_FIXTURE_ROOT}" && git add src/main.py && git commit -q -m "$role changes")
+                commit_executor_change "$role"
                 ;;
             reviewer-a*)
                 write_reviewer_a_section "$task_file" "PASS" "No issues found."
@@ -892,8 +965,7 @@ EOF
                 return 65
                 ;;
             executor|fix-executor*)
-                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
-                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                commit_executor_change "$role"
                 ;;
             reviewer-a*)
                 write_reviewer_a_section "$task_file" "PASS" "No issues found."
@@ -948,8 +1020,7 @@ EOF
                 write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
                 ;;
             executor|fix-executor*)
-                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
-                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                commit_executor_change "$role"
                 ;;
             reviewer-a*)
                 write_reviewer_a_section "$task_file" "PASS" "No issues found."
@@ -972,19 +1043,19 @@ EOF
     status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
     [[ "$status" == "needs verification" ]]
     grep -q 'review-b=absent' "${comp_dir}/.review-mapping"
-    grep -q '^ARTIFACT_WRITTEN$' "${comp_dir}/reviewer-b.raw.md"
+    [[ ! -f "${comp_dir}/reviewer-b.raw.md" ]]
 ) && pass "7. Reviewer B watcher fallback — pipeline continues with reviewer A only" \
   || fail "7. Reviewer B watcher fallback — pipeline continues with reviewer A only"
 
 # ============================================================
-# Test 8: Planner B backstop — slow Codex planner is killed after 2x Claude
+# Test 8: Planner B backstop — slow Codex planner is killed at full planner timeout
 # ============================================================
 (
     root="$(setup_integration_fixture "planner-b-backstop")"
     slug="integ-planner-b-backstop"
     set_integration_globals "$root"
     ENGINE_PLANNER_B="codex"
-    PLANNER_TIMEOUT="10s"
+    PLANNER_TIMEOUT="3s"
     task_dir="$root/docs/tasks/open/$slug"
     comp_dir="$task_dir/competitive"
     log_dir="$task_dir/logs"
@@ -1007,8 +1078,7 @@ EOF
                 sleep 10
                 ;;
             executor|fix-executor*)
-                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
-                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                commit_executor_change "$role"
                 ;;
             reviewer-a*)
                 write_reviewer_a_section "$task_file" "PASS" "No issues found."
@@ -1028,21 +1098,22 @@ EOF
 
     status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
     [[ "$status" == "needs verification" ]]
+    [[ "$duration" -ge 3 ]]
     [[ "$duration" -lt 6 ]]
     [[ -f "$kill_marker" ]]
     grep -q '\[codex-backstop\]' "${log_dir}/planner-b.log"
-) && pass "8. Planner B backstop — slow Codex planner is killed after 2x Claude" \
-  || fail "8. Planner B backstop — slow Codex planner is killed after 2x Claude"
+) && pass "8. Planner B backstop — slow Codex planner is killed at full planner timeout" \
+  || fail "8. Planner B backstop — slow Codex planner is killed at full planner timeout"
 
 # ============================================================
-# Test 9: Reviewer B backstop — slow Codex reviewer is killed after 2x Claude
+# Test 9: Reviewer B backstop — slow Codex reviewer is killed at full reviewer timeout
 # ============================================================
 (
     root="$(setup_integration_fixture "reviewer-b-backstop")"
     slug="integ-reviewer-b-backstop"
     set_integration_globals "$root"
     ENGINE_REVIEWER_B="codex"
-    REVIEWER_TIMEOUT="10s"
+    REVIEWER_TIMEOUT="3s"
     task_dir="$root/docs/tasks/open/$slug"
     comp_dir="$task_dir/competitive"
     log_dir="$task_dir/logs"
@@ -1069,8 +1140,7 @@ EOF
                 write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
                 ;;
             executor|fix-executor*)
-                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
-                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                commit_executor_change "$role"
                 ;;
             reviewer-a*)
                 write_reviewer_a_section "$task_file" "PASS" "No issues found."
@@ -1095,15 +1165,96 @@ EOF
 
     status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
     [[ "$status" == "needs verification" ]]
-    [[ "$duration" -lt 7 ]]
+    [[ "$duration" -ge 3 ]]
+    [[ "$duration" -lt 6 ]]
     [[ -f "$kill_marker" ]]
     grep -q '\[codex-backstop\]' "${log_dir}/reviewer-b.log"
     grep -q 'review-b=absent' "${comp_dir}/.review-mapping"
-) && pass "9. Reviewer B backstop — slow Codex reviewer is killed after 2x Claude" \
-  || fail "9. Reviewer B backstop — slow Codex reviewer is killed after 2x Claude"
+) && pass "9. Reviewer B backstop — slow Codex reviewer is killed at full reviewer timeout" \
+  || fail "9. Reviewer B backstop — slow Codex reviewer is killed at full reviewer timeout"
 
 # ============================================================
-# Test 10: Claude planner fails — Codex gets full phase timeout, no backstop arms
+# Test 9b: MEDIUM reviewer diff risk scales timeout and persists manifest state
+# ============================================================
+(
+    root="$(setup_integration_fixture "reviewer-timeout-manifest")"
+    slug="integ-reviewer-timeout-manifest"
+    set_integration_globals "$root"
+    ENGINE_REVIEWER_B="codex"
+    REVIEWER_TIMEOUT="15m"
+    REVIEWER_TIMEOUT_EXPLICIT="false"
+    seed_medium_risk_diff "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    log_dir="$task_dir/logs"
+    task_file="$task_dir/task.md"
+    timeout_log="$TMP_ROOT/reviewer-timeout-manifest.timeouts"
+    backstop_timeout_log="$TMP_ROOT/reviewer-timeout-manifest.backstop"
+    : > "$timeout_log"
+    : > "$backstop_timeout_log"
+
+    set_integration_stubs
+    restore_real_manifest_hooks
+    _enforce_codex_phase_backstop() {
+        printf '%s\n' "$4" > "$backstop_timeout_log"
+        return 0
+    }
+    run_agent() {
+        local role="$1" _engine="$2" _prompt="$3" _system="$4" output="$5" log_file="$6" timeout="$7"
+        mkdir -p "$(dirname "$log_file")"
+        : > "$log_file"
+        printf '%s\t%s\n' "$role" "$timeout" >> "$timeout_log"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                sleep 2
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Reviewer timeout manifest test") >/dev/null 2>&1
+
+    manifest="${comp_dir}/run-manifest.json"
+    [[ -f "$manifest" ]]
+    grep -Eq '^reviewer-a\t30m$' "$timeout_log"
+    grep -Eq '^reviewer-b\t30m$' "$timeout_log"
+    [[ "$(cat "$backstop_timeout_log")" == "30m" ]]
+    jq -e '
+        .current_phase == "phase-5" and
+        .diff_risk == "MEDIUM" and
+        .effective_timeouts.reviewer == "30m" and
+        .final_status == "success" and
+        .active_engines.reviewer_b == "codex"
+    ' "$manifest" >/dev/null
+) && pass "9b. MEDIUM reviewer diff risk scales timeout and persists manifest state" \
+  || fail "9b. MEDIUM reviewer diff risk scales timeout and persists manifest state"
+
+# ============================================================
+# Test 10: Claude planner fails — no backstop arms and fallback is attempted before single-plan seed
 # ============================================================
 (
     root="$(setup_integration_fixture "no-backstop-on-claude-fail")"
@@ -1116,10 +1267,12 @@ EOF
     comp_dir="$task_dir/competitive"
     log_dir="$task_dir/logs"
     task_file="$task_dir/task.md"
+    call_log="$TMP_ROOT/no-backstop-on-claude-fail.calls"
 
     set_integration_stubs
     run_agent() {
         local role="$1"
+        printf '%s\n' "$role" >> "$call_log"
         case "$role" in
             explorer)
                 printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
@@ -1135,6 +1288,9 @@ EOF
                 sleep 1
                 write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Codex plan"
                 ;;
+            planner-a-claude-fallback)
+                return 17
+                ;;
             evaluator)
                 write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
                 ;;
@@ -1142,8 +1298,7 @@ EOF
                 write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
                 ;;
             executor|fix-executor*)
-                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
-                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                commit_executor_change "$role"
                 ;;
             reviewer-a*)
                 write_reviewer_a_section "$task_file" "PASS" "No issues found."
@@ -1167,11 +1322,97 @@ EOF
     ! grep -q '\[codex-backstop\]' "${log_dir}/planner-b.log" || {
         echo "backstop should not have armed when Claude planner failed" >&2; exit 1; }
 
-    # Assert: pipeline completed (Codex plan survived as single-plan path)
+    grep -q '^planner-a-claude-fallback$' "$call_log" || {
+        echo "planner-a Claude fallback was not attempted" >&2; exit 1; }
+
+    # Assert: pipeline completed after fallback failure via the single-plan path
     status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
     [[ "$status" == "needs verification" ]]
-) && pass "10. Claude planner fails — Codex gets full timeout, no backstop arms" \
-  || fail "10. Claude planner fails — Codex gets full timeout, no backstop arms"
+    grep -q 'Phase 2: planner-a failed, launching Claude fallback with original persona' "$task_file"
+    grep -q 'Single plan (plan-b.md) seeded' "$task_file"
+) && pass "10. Claude planner fails — no backstop arms and fallback is attempted before single-plan seed" \
+  || fail "10. Claude planner fails — no backstop arms and fallback is attempted before single-plan seed"
+
+# ============================================================
+# Test 10a: Planner B fallback rebuilds a Claude-safe prompt and restores evaluation
+# ============================================================
+(
+    root="$(setup_integration_fixture "planner-b-fallback-success")"
+    slug="integ-planner-b-fallback-success"
+    set_integration_globals "$root"
+    ENGINE_PLANNER_A="claude"
+    ENGINE_PLANNER_B="codex"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+    call_log="$TMP_ROOT/planner-b-fallback-success.calls"
+    placeholder_leak="$TMP_ROOT/planner-b-fallback-success.placeholder"
+    missing_canonical_path="$TMP_ROOT/planner-b-fallback-success.missing-path"
+    unexpected_output_path="$TMP_ROOT/planner-b-fallback-success.output-path"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1" engine="$2" prompt_body="$3" system_prompt="$4" output_file="$5"
+        printf '%s\n' "$role" >> "$call_log"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Claude survivor"
+                ;;
+            planner-b)
+                return 17
+                ;;
+            planner-b-claude-fallback)
+                [[ "$prompt_body" == *"__LAUREN_LOOP_ARTIFACT_PATH__"* ]] && {
+                    printf 'placeholder leaked\n' > "$placeholder_leak"
+                    return 99
+                }
+                [[ "$prompt_body" == *"${comp_dir}/plan-b.md"* ]] || {
+                    printf 'canonical path missing\n' > "$missing_canonical_path"
+                    return 98
+                }
+                [[ "$output_file" == "${comp_dir}/plan-b.md" ]] || {
+                    printf '%s\n' "$output_file" > "$unexpected_output_path"
+                    return 97
+                }
+                write_valid_plan_artifact "$output_file" "Plan B Fallback" "Claude fallback"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Planner B Claude fallback success") >/dev/null 2>&1
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    [[ ! -f "$placeholder_leak" ]]
+    [[ ! -f "$missing_canonical_path" ]]
+    [[ ! -f "$unexpected_output_path" ]]
+    grep -q '^planner-b-claude-fallback$' "$call_log"
+) && pass "10a. Planner B fallback rebuilds a Claude-safe prompt and restores evaluation" \
+  || fail "10a. Planner B fallback rebuilds a Claude-safe prompt and restores evaluation"
 
 # ============================================================
 # Test 10b: review cycle artifacts are snapshotted with cycle-numbered filenames
@@ -1204,8 +1445,7 @@ EOF
                 write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
                 ;;
             executor|fix-executor*)
-                printf 'modified by %s\n' "$role" >> "${root}/src/main.py"
-                (cd "${root}" && git add src/main.py && git commit -q -m "$role changes")
+                commit_executor_change "$role"
                 ;;
             reviewer-a*)
                 write_reviewer_a_section "$task_file" "PASS" "No issues found."
@@ -1231,6 +1471,452 @@ EOF
     grep -q '^# Review B$' "${comp_dir}/reviewer-b.raw.cycle1.md"
 ) && pass "10b. review cycle artifacts are snapshotted with cycle-numbered filenames" \
   || fail "10b. review cycle artifacts are snapshotted with cycle-numbered filenames"
+
+# ============================================================
+# Test 10c: Fallback timeout — log tail captured and full PLANNER_TIMEOUT used
+# ============================================================
+(
+    root="$(setup_integration_fixture "fallback-timeout-diag")"
+    slug="integ-fallback-timeout-diag"
+    set_integration_globals "$root"
+    ENGINE_PLANNER_B="codex"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    log_dir="$task_dir/logs"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1" engine="$2" prompt_body="$3" system_prompt="$4" output_file="$5" log_file="$6"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Claude survivor"
+                ;;
+            planner-b)
+                return 17
+                ;;
+            planner-b-claude-fallback)
+                # Simulate a failed fallback with log output
+                printf 'Starting agent run...\nProcessing task...\nERROR: agent timed out waiting for response\nFinal cleanup done.\n' > "$log_file"
+                return 1
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Fallback timeout diagnostics") >/dev/null 2>&1
+
+    # Assert: pipeline completed via single-plan path
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    # Assert: task file contains exit=1 and output=missing
+    grep -q 'exit=1' "$task_file"
+    grep -q 'output=missing' "$task_file"
+    # Assert: task file contains the agent log tail
+    grep -q 'ERROR: agent timed out' "$task_file"
+    grep -q 'Fallback agent log tail' "$task_file"
+) && pass "10c. Fallback timeout — log tail captured in diagnostics" \
+  || fail "10c. Fallback timeout — log tail captured in diagnostics"
+
+# ============================================================
+# Test 10d: Fallback output fails validation — validation reason logged
+# ============================================================
+(
+    root="$(setup_integration_fixture "fallback-validation-diag")"
+    slug="integ-fallback-validation-diag"
+    set_integration_globals "$root"
+    ENGINE_PLANNER_B="codex"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1" engine="$2" prompt_body="$3" system_prompt="$4" output_file="$5"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Claude survivor"
+                ;;
+            planner-b)
+                return 17
+                ;;
+            planner-b-claude-fallback)
+                # Write an invalid plan (missing required sections) — exit 0
+                printf 'This is not a valid plan artifact.\nJust some random text.\n' > "$output_file"
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Fallback validation diagnostics") >/dev/null 2>&1
+
+    # Assert: pipeline completed via single-plan path
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    # Assert: output file state shows it exists with a byte count
+    grep -q 'output=exists' "$task_file"
+    grep -Eq 'output=exists \([0-9]+ bytes\)' "$task_file"
+    # Assert: single-plan path was used (evaluator skipped)
+    grep -q 'Single plan (plan-a.md) seeded' "$task_file"
+) && pass "10d. Fallback output fails validation — validation reason logged" \
+  || fail "10d. Fallback output fails validation — validation reason logged"
+
+# ============================================================
+# Test 10e: Fallback succeeds slowly — plan promoted and duration logged
+# ============================================================
+(
+    root="$(setup_integration_fixture "fallback-slow-success")"
+    slug="integ-fallback-slow-success"
+    set_integration_globals "$root"
+    ENGINE_PLANNER_B="codex"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1" engine="$2" prompt_body="$3" system_prompt="$4" output_file="$5"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Claude survivor"
+                ;;
+            planner-b)
+                return 17
+                ;;
+            planner-b-claude-fallback)
+                sleep 1
+                write_valid_plan_artifact "$output_file" "Plan B Fallback" "Claude slow fallback"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Fallback slow success") >/dev/null 2>&1
+
+    # Assert: pipeline completed successfully (not via single-plan path)
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    # Assert: fallback succeeded — both plans available, evaluator was called
+    grep -q 'Claude fallback for planner-b succeeded' "$task_file"
+    # Assert: evaluator ran (plan-evaluation artifact exists)
+    [[ -f "${comp_dir}/plan-evaluation.md" ]]
+    # Assert: no single-plan seed (both plans valid)
+    ! grep -q 'Single plan.*seeded' "$task_file"
+) && pass "10e. Fallback succeeds slowly — plan promoted and duration logged" \
+  || fail "10e. Fallback succeeds slowly — plan promoted and duration logged"
+
+# ============================================================
+# Test 10f: Reviewer B fallback exit failure — log tail captured
+# ============================================================
+(
+    root="$(setup_integration_fixture "reviewer-b-fallback-timeout-diag")"
+    slug="integ-reviewer-b-fallback-timeout-diag"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    log_dir="$task_dir/logs"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1" engine="$2" prompt_body="$3" system_prompt="$4" output_file="$5" log_file="$6"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b-claude-fallback*)
+                printf 'Starting reviewer-b fallback\nERROR: reviewer fallback timed out\nCleanup complete\n' > "$log_file"
+                return 1
+                ;;
+            reviewer-b*)
+                return 65
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Reviewer B fallback timeout diagnostics") >/dev/null 2>&1
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    grep -q 'Phase 5: reviewer-b fallback failed (prepared=true, exit=1' "$task_file"
+    grep -q 'output=missing' "$task_file"
+    grep -q 'Phase 5: Fallback agent log tail (last 20 lines):' "$task_file"
+    grep -q 'ERROR: reviewer fallback timed out' "$task_file"
+    grep -q 'review-b=absent' "${comp_dir}/.review-mapping"
+) && pass "10f. Reviewer B fallback exit failure — log tail captured" \
+  || fail "10f. Reviewer B fallback exit failure — log tail captured"
+
+# ============================================================
+# Test 10g: Reviewer B fallback invalid artifact — validation reason logged
+# ============================================================
+(
+    root="$(setup_integration_fixture "reviewer-b-fallback-validation-diag")"
+    slug="integ-reviewer-b-fallback-validation-diag"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1" engine="$2" prompt_body="$3" system_prompt="$4" output_file="$5"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a*)
+                write_reviewer_a_section "$task_file" "PASS" "No issues found."
+                ;;
+            reviewer-b-claude-fallback*)
+                cat > "$output_file" <<'EOF'
+# Review B
+
+## Findings
+
+This artifact is missing required sections.
+EOF
+                ;;
+            reviewer-b*)
+                return 65
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Reviewer B fallback validation diagnostics") >/dev/null 2>&1
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    grep -q 'Phase 5: reviewer-b fallback failed (prepared=true, exit=0' "$task_file"
+    grep -Eq 'output=exists \([0-9]+ bytes\)' "$task_file"
+    grep -q "Fallback validation failure: WARN: reviewer-b artifact missing '## Done-Criteria Check' heading" "$task_file"
+    grep -q 'review-b=absent' "${comp_dir}/.review-mapping"
+) && pass "10g. Reviewer B fallback invalid artifact — validation reason logged" \
+  || fail "10g. Reviewer B fallback invalid artifact — validation reason logged"
+
+# ============================================================
+# Test 10h: Reviewer A fallback missing section — extraction reason logged
+# ============================================================
+(
+    root="$(setup_integration_fixture "reviewer-a-fallback-missing-section-diag")"
+    slug="integ-reviewer-a-fallback-missing-section-diag"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a-codex-fallback*)
+                ;;
+            reviewer-a*)
+                return 17
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Reviewer A missing-section diagnostics") >/dev/null 2>&1
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    grep -q 'Phase 5: reviewer-a fallback failed (prepared=true, exit=0' "$task_file"
+    grep -q 'output=missing' "$task_file"
+    grep -q "Fallback validation failure: WARN: reviewer-a raw artifact extraction failed: missing or empty '## Review Findings' section" "$task_file"
+    grep -q 'review-a=absent' "${comp_dir}/.review-mapping"
+) && pass "10h. Reviewer A fallback missing section — extraction reason logged" \
+  || fail "10h. Reviewer A fallback missing section — extraction reason logged"
+
+# ============================================================
+# Test 10i: Reviewer A fallback invalid artifact — validation reason logged
+# ============================================================
+(
+    root="$(setup_integration_fixture "reviewer-a-fallback-validation-diag")"
+    slug="integ-reviewer-a-fallback-validation-diag"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor|fix-executor*)
+                commit_executor_change "$role"
+                ;;
+            reviewer-a-codex-fallback*)
+                write_reviewer_a_section_without_verdict "$task_file" "Missing verdict contract."
+                ;;
+            reviewer-a*)
+                return 17
+                ;;
+            reviewer-b*)
+                write_review_artifact "${comp_dir}/reviewer-b.raw.md" "PASS" "No findings."
+                ;;
+            review-evaluator*)
+                write_review_synthesis_artifact "${comp_dir}/review-synthesis.md" "PASS" 0 0 0 0
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Reviewer A validation diagnostics") >/dev/null 2>&1
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "needs verification" ]]
+    grep -q 'Phase 5: reviewer-a fallback failed (prepared=true, exit=0' "$task_file"
+    grep -Eq 'output=exists \([0-9]+ bytes\)' "$task_file"
+    grep -Fq "Fallback validation failure: WARN: reviewer-a artifact missing '**VERDICT:**' contract line" "$task_file"
+    grep -q 'review-a=absent' "${comp_dir}/.review-mapping"
+) && pass "10i. Reviewer A fallback invalid artifact — validation reason logged" \
+  || fail "10i. Reviewer A fallback invalid artifact — validation reason logged"
 
 # ============================================================
 # Summary

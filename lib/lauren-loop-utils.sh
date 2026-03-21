@@ -96,6 +96,599 @@ _timeout() {
     return "$exit_code"
 }
 
+_verification_timeout_message() {
+    printf '%s\n' "Verification timed out after 20m"
+}
+
+_should_enforce_task_file_content_gate() {
+    local dry_run="${1:-false}"
+    local resume_flag="${2:-false}"
+    local resume_hint="${3:-${_LAUREN_LOOP_RESUME_HINT:-0}}"
+    local v1_auto_wrapper="${4:-${_LAUREN_LOOP_V1_AUTO_WRAPPER:-0}}"
+
+    [[ "$dry_run" == "true" ]] && return 1
+    [[ "$resume_flag" == "true" ]] && return 1
+    case "$v1_auto_wrapper" in
+        1|true|TRUE|yes|YES) return 1 ;;
+    esac
+    case "$resume_hint" in
+        1|true|TRUE|yes|YES) return 1 ;;
+    esac
+    return 0
+}
+
+_trim_nonblank_lines() {
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line != "") {
+                lines[++count] = line
+            }
+        }
+        END {
+            for (i = 1; i <= count; i++) {
+                printf "%s", lines[i]
+                if (i < count) {
+                    printf "\n"
+                }
+            }
+        }
+    '
+}
+
+_trim_joined_text() {
+    awk '
+        {
+            line = $0
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            if (line != "") {
+                lines[++count] = line
+            }
+        }
+        END {
+            for (i = 1; i <= count; i++) {
+                printf "%s", lines[i]
+                if (i < count) {
+                    printf " "
+                }
+            }
+        }
+    '
+}
+
+_task_goal_content() {
+    local task_file="$1"
+    local inline_goal=""
+
+    inline_goal=$(grep '^## Goal:' "$task_file" | head -1 | sed 's/^## Goal:[[:space:]]*//')
+    if [[ -n "${inline_goal:-}" ]] || grep -q '^## Goal:' "$task_file"; then
+        printf '%s\n' "$inline_goal"
+        return 0
+    fi
+
+    if grep -q -E '^## Goal[[:space:]]*$' "$task_file"; then
+        section_body "$task_file" "## Goal" 2>/dev/null || true
+        return 0
+    fi
+
+    return 1
+}
+
+_goal_content_is_placeholder() {
+    local goal_text="$1"
+    local trimmed=""
+    local normalized=""
+
+    trimmed=$(printf '%s\n' "$goal_text" | _trim_nonblank_lines)
+    normalized=$(printf '%s\n' "$trimmed" | _trim_joined_text | tr '[:upper:]' '[:lower:]')
+
+    [[ -z "$trimmed" ]] && return 0
+
+    case "$normalized" in
+        todo|tbd|placeholder|goal|{{goal}}|"[goal]"|"[name]")
+            return 0
+            ;;
+    esac
+
+    if printf '%s\n' "$trimmed" | grep -Fq 'One sentence: the observable outcome when this is done.'; then
+        return 0
+    fi
+
+    if printf '%s\n' "$trimmed" | grep -Fq 'Write as a behavior: "Users can X" or "System does Y when Z"'; then
+        return 0
+    fi
+
+    return 1
+}
+
+_task_file_looks_like_v1_shell_skeleton() {
+    local task_file="$1"
+    local current_plan=""
+    local critique=""
+    local plan_history=""
+    local left_off=""
+    local attempts=""
+
+    current_plan=$(section_body "$task_file" "## Current Plan" 2>/dev/null | _trim_nonblank_lines || true)
+    critique=$(section_body "$task_file" "## Critique" 2>/dev/null | _trim_nonblank_lines || true)
+    plan_history=$(section_body "$task_file" "## Plan History" 2>/dev/null | _trim_nonblank_lines || true)
+    left_off=$(section_body "$task_file" "## Left Off At:" 2>/dev/null | _trim_nonblank_lines || true)
+    attempts=$(section_body "$task_file" "## Attempts:" 2>/dev/null | _trim_nonblank_lines || true)
+
+    [[ "$current_plan" == "(Planner writes here)" ]] || return 1
+    [[ "$critique" == "(Critic writes here)" ]] || return 1
+    [[ "$plan_history" == "(Archived plan+critique rounds)" ]] || return 1
+    [[ "$left_off" == "Not started." ]] || return 1
+    [[ "$attempts" == "(none yet)" ]] || return 1
+    return 0
+}
+
+_task_file_looks_like_v2_shell_skeleton() {
+    local task_file="$1"
+    local status_line=""
+    local context_body=""
+    local done_body=""
+    local left_off=""
+    local attempts=""
+    local current_plan=""
+    local execution_log=""
+    local relevant_files=""
+
+    status_line=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status:[[:space:]]*//')
+    [[ "$status_line" == "in progress" ]] || return 1
+
+    context_body=$(section_body "$task_file" "## Context:" 2>/dev/null | _trim_nonblank_lines || true)
+    done_body=$(section_body "$task_file" "## Done Criteria:" 2>/dev/null | _trim_nonblank_lines || true)
+    left_off=$(section_body "$task_file" "## Left Off At:" 2>/dev/null | _trim_nonblank_lines || true)
+    attempts=$(section_body "$task_file" "## Attempts:" 2>/dev/null | _trim_nonblank_lines || true)
+    current_plan=$(section_body "$task_file" "## Current Plan" 2>/dev/null | _trim_nonblank_lines || true)
+    execution_log=$(section_body "$task_file" "## Execution Log" 2>/dev/null | _trim_nonblank_lines || true)
+    relevant_files=$(section_body "$task_file" "## Relevant Files:" 2>/dev/null | _trim_nonblank_lines || true)
+
+    [[ "$context_body" == "Created by lauren-loop-v2 for a new competitive run." ]] || return 1
+    [[ "$done_body" == "- [ ] Competitive run completes and leaves task in needs verification or blocked with artifacts preserved" ]] || return 1
+    [[ "$left_off" == "Competitive run has started." ]] || return 1
+    [[ "$attempts" == "(none yet)" ]] || return 1
+    [[ -z "$current_plan" ]] || return 1
+    [[ -z "$execution_log" ]] || return 1
+    [[ "$relevant_files" == *'`lauren-loop-v2.sh` — competitive Lauren Loop flow'* ]] || return 1
+    [[ "$relevant_files" == *'`lib/lauren-loop-utils.sh` — shared task-file logging and state helpers'* ]] || return 1
+    return 0
+}
+
+_validate_task_file_content() {
+    local task_file="$1"
+    local goal_text=""
+    local trimmed_goal=""
+
+    if ! goal_text=$(_task_goal_content "$task_file"); then
+        echo "## Goal section is missing" >&2
+        return 1
+    fi
+
+    trimmed_goal=$(printf '%s\n' "$goal_text" | _trim_nonblank_lines)
+    if [[ -z "$trimmed_goal" ]]; then
+        echo "## Goal section is empty" >&2
+        return 1
+    fi
+
+    if _goal_content_is_placeholder "$trimmed_goal"; then
+        echo "## Goal section still contains placeholder text" >&2
+        return 1
+    fi
+
+    if _task_file_looks_like_v1_shell_skeleton "$task_file" || _task_file_looks_like_v2_shell_skeleton "$task_file"; then
+        echo "Task file is still an untouched Lauren Loop skeleton. Replace the generated boilerplate before starting a live run." >&2
+        return 1
+    fi
+
+    return 0
+}
+
+_timeout_wrapped_verification_command() {
+    local command_text="$1"
+    local helper_path inner_script=""
+
+    helper_path="$(_lauren_loop_repo_root)/lib/lauren-loop-utils.sh"
+    printf -v inner_script 'source %q && _timeout 20m bash -lc %q' "$helper_path" "$command_text"
+    printf 'bash -lc %q\n' "$inner_script"
+}
+
+_is_implementation_tasks_heading() {
+    local line="$1"
+    [[ "$line" =~ ^##[[:space:]]+Implementation[[:space:]]+Tasks:?[[:space:]]*$ ]]
+}
+
+_trim_verify_fragment() {
+    local text="$1"
+
+    text="${text#"${text%%[![:space:]]*}"}"
+    text="${text%"${text##*[![:space:]]}"}"
+    printf '%s' "$text"
+}
+
+_append_verify_fragment() {
+    local joined="$1"
+    local fragment="$2"
+    local separator=" && "
+
+    fragment=$(_trim_verify_fragment "$fragment")
+    [[ -n "$fragment" ]] || {
+        printf '%s' "$joined"
+        return 0
+    }
+
+    if [[ "$fragment" == \#* ]]; then
+        printf '%s' "$joined"
+        return 0
+    fi
+
+    if [[ -z "$joined" ]]; then
+        printf '%s' "$fragment"
+        return 0
+    fi
+
+    case "$joined" in
+        (*'&&'|*'||'|*';') separator=" " ;;
+    esac
+    case "$fragment" in
+        ('&&'*|'||'*|';'*) separator=" " ;;
+    esac
+
+    printf '%s%s%s' "$joined" "$separator" "$fragment"
+}
+
+_lauren_loop_repo_root() {
+    if [[ -n "${SCRIPT_DIR:-}" ]]; then
+        printf '%s\n' "$SCRIPT_DIR"
+    else
+        printf '%s\n' "${LAUREN_LOOP_UTILS_DIR%/lib}"
+    fi
+}
+
+_command_requires_repo_pytest_timeout() {
+    local command_text="$1"
+
+    printf '%s\n' "$command_text" | grep -Eq '(^|[^[:alnum:]_])pytest([^[:alnum:]_]|$)' || return 1
+    printf '%s\n' "$command_text" | grep -Eq '(^|[[:space:]])tests/([[:space:]]|$)' || return 1
+    printf '%s\n' "$command_text" | grep -Eq '(^|[[:space:]])-x([[:space:]]|$)' || return 1
+    printf '%s\n' "$command_text" | grep -Eq '(^|[[:space:]])-q([[:space:]]|$)' || return 1
+    return 0
+}
+
+_command_uses_timeout_wrapper() {
+    local command_text="$1"
+    local helper_path=""
+    local helper_path_q=""
+    local plain_prefix=""
+    local escaped_prefix=""
+
+    helper_path="$(_lauren_loop_repo_root)/lib/lauren-loop-utils.sh"
+    printf -v helper_path_q '%q' "$helper_path"
+    plain_prefix="source ${helper_path} && _timeout 20m bash -lc "
+    escaped_prefix="source\\ ${helper_path_q}\\ \\&\\&\\ _timeout\\ 20m\\ bash\\ -lc\\ "
+
+    [[ "$command_text" == bash\ -lc\ * ]] || return 1
+    [[ "$command_text" == *"$plain_prefix"* || "$command_text" == *"$escaped_prefix"* ]]
+}
+
+_task_is_timeout_verification_retry_eligible() {
+    local task_file="$1"
+    local current_status="${2:-}"
+    local blocked_line=""
+    local timeout_message=""
+
+    if [[ -z "$current_status" ]]; then
+        current_status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    fi
+
+    case "$current_status" in
+        execution-blocked|fix-blocked) ;;
+        *) return 1 ;;
+    esac
+
+    blocked_line=$(grep 'BLOCKED:' "$task_file" 2>/dev/null | tail -1 || true)
+    [[ -n "$blocked_line" ]] || return 1
+
+    timeout_message=$(_verification_timeout_message)
+    printf '%s\n' "$blocked_line" | grep -Fq "$timeout_message"
+}
+
+_normalize_executor_prompt_timeout_content() {
+    local context="$1"
+    local prompt_content=""
+    local canonical_pytest='.venv/bin/python -m pytest tests/ -x -q'
+    local replacement=""
+    local match_count=0
+
+    prompt_content=$(cat)
+    replacement=$(_timeout_wrapped_verification_command "$canonical_pytest") || return 1
+    match_count=$(printf '%s' "$prompt_content" | grep -oF "$canonical_pytest" | wc -l | tr -d ' ')
+    if [[ "${match_count:-0}" -eq 0 ]]; then
+        echo "ERROR: ${context}: expected repo-standard pytest verification command in executor prompt but found none" >&2
+        return 1
+    fi
+
+    prompt_content=${prompt_content//"$canonical_pytest"/"$replacement"}
+    if printf '%s' "$prompt_content" | grep -qF "$canonical_pytest"; then
+        echo "ERROR: ${context}: unwrapped repo-standard pytest verification command remained after timeout normalization" >&2
+        return 1
+    fi
+
+    printf '%s' "$prompt_content"
+}
+
+_normalize_verify_tags_with_timeout_in_file() {
+    local target_file="$1"
+    local context="$2"
+    local tmp_file=""
+    local saw_verify_line=0
+    local saw_wrapped_candidate=0
+    local saw_timeout_candidate=0
+    local in_implementation_tasks=0
+    local accumulating_verify=0
+    local verify_prefix=""
+    local verify_joined=""
+    local opener_remainder=""
+    local closing_prefix=""
+    local suffix=""
+
+    [[ -f "$target_file" ]] || {
+        echo "ERROR: ${context}: file not found: ${target_file}" >&2
+        return 1
+    }
+
+    tmp_file=$(same_dir_temp_file "$target_file")
+    while IFS= read -r verify_line || [[ -n "$verify_line" ]]; do
+        if [[ "$accumulating_verify" -eq 1 ]]; then
+            if [[ "$verify_line" =~ ^##[[:space:]]+ ]]; then
+                rm -f "$tmp_file"
+                echo "ERROR: ${context}: unterminated multi-line <verify> tag crossed a section boundary" >&2
+                return 1
+            fi
+
+            if [[ "$verify_line" == *"<verify>"* ]]; then
+                rm -f "$tmp_file"
+                echo "ERROR: ${context}: nested <verify> tags are not supported" >&2
+                return 1
+            fi
+
+            if [[ "$verify_line" == *"</verify>"* ]]; then
+                closing_prefix="${verify_line%%</verify>*}"
+                verify_joined=$(_append_verify_fragment "$verify_joined" "$closing_prefix")
+
+                suffix="${verify_line#*</verify>}"
+                verify_line="${verify_prefix}<verify>${verify_joined}</verify>${suffix}"
+                accumulating_verify=0
+                verify_prefix=""
+                verify_joined=""
+                closing_prefix=""
+                suffix=""
+            else
+                verify_joined=$(_append_verify_fragment "$verify_joined" "$verify_line")
+                continue
+            fi
+        fi
+
+        if _is_implementation_tasks_heading "$verify_line"; then
+            in_implementation_tasks=1
+        elif [[ "$in_implementation_tasks" -eq 1 && "$verify_line" =~ ^##[[:space:]]+ ]]; then
+            in_implementation_tasks=0
+        fi
+
+        if [[ "$in_implementation_tasks" -eq 1 ]]; then
+            if [[ "$verify_line" == *"<verify>"* ]] && [[ "$verify_line" != *"</verify>"* ]]; then
+                verify_prefix="${verify_line%%<verify>*}"
+                opener_remainder="${verify_line#*<verify>}"
+                if [[ "$opener_remainder" == *"<verify>"* ]]; then
+                    rm -f "$tmp_file"
+                    echo "ERROR: ${context}: nested <verify> tags are not supported" >&2
+                    return 1
+                fi
+
+                verify_joined=""
+                verify_joined=$(_append_verify_fragment "$verify_joined" "$opener_remainder")
+                accumulating_verify=1
+                continue
+            fi
+
+            if [[ "$verify_line" == *"</verify>"* ]] && [[ "$verify_line" != *"<verify>"* ]]; then
+                rm -f "$tmp_file"
+                echo "ERROR: ${context}: timeout normalization found a closing </verify> tag without a matching opener" >&2
+                return 1
+            fi
+
+            if [[ "$verify_line" == *"<verify>"*"</verify>"* ]]; then
+                local prefix=""
+                local verify_body=""
+                local suffix=""
+                local wrapped=""
+
+                prefix="${verify_line%%<verify>*}"
+                verify_body="${verify_line#*<verify>}"
+                verify_body="${verify_body%%</verify>*}"
+                suffix="${verify_line#*</verify>}"
+                if _command_requires_repo_pytest_timeout "$verify_body"; then
+                    saw_timeout_candidate=1
+                    if ! _command_uses_timeout_wrapper "$verify_body"; then
+                        wrapped=$(_timeout_wrapped_verification_command "$verify_body") || {
+                            rm -f "$tmp_file"
+                            return 1
+                        }
+                        verify_line="${prefix}<verify>${wrapped}</verify>${suffix}"
+                    fi
+                fi
+            fi
+        fi
+
+        printf '%s\n' "$verify_line" >> "$tmp_file"
+    done < "$target_file"
+
+    if [[ "$accumulating_verify" -eq 1 ]]; then
+        rm -f "$tmp_file"
+        echo "ERROR: ${context}: unterminated multi-line <verify> tag" >&2
+        return 1
+    fi
+
+    mv "$tmp_file" "$target_file"
+
+    in_implementation_tasks=0
+    while IFS= read -r verify_line || [[ -n "$verify_line" ]]; do
+        if _is_implementation_tasks_heading "$verify_line"; then
+            in_implementation_tasks=1
+        elif [[ "$in_implementation_tasks" -eq 1 && "$verify_line" =~ ^##[[:space:]]+ ]]; then
+            in_implementation_tasks=0
+        fi
+
+        if [[ "$in_implementation_tasks" -eq 1 ]]; then
+            if { [[ "$verify_line" == *"<verify>"* ]] || [[ "$verify_line" == *"</verify>"* ]]; } && [[ "$verify_line" != *"<verify>"*"</verify>"* ]]; then
+                echo "ERROR: ${context}: multi-line <verify> tags remained after timeout normalization" >&2
+                return 1
+            fi
+
+            if [[ "$verify_line" == *"<verify>"*"</verify>"* ]]; then
+                saw_verify_line=1
+                local verify_body=""
+                verify_body="${verify_line#*<verify>}"
+                verify_body="${verify_body%%</verify>*}"
+                if _command_uses_timeout_wrapper "$verify_body"; then
+                    saw_wrapped_candidate=1
+                fi
+                if _command_requires_repo_pytest_timeout "$verify_body"; then
+                    if ! _command_uses_timeout_wrapper "$verify_body"; then
+                        echo "ERROR: ${context}: repo-standard pytest verification command remained unwrapped in ${target_file}" >&2
+                        return 1
+                    fi
+                    saw_wrapped_candidate=1
+                fi
+            fi
+        fi
+    done < "$target_file"
+
+    if [[ "$saw_verify_line" -eq 0 ]]; then
+        return 0
+    fi
+
+    if [[ "$saw_timeout_candidate" -eq 1 && "$saw_wrapped_candidate" -eq 0 ]]; then
+        echo "ERROR: ${context}: timeout normalization did not wrap a repo-standard pytest verify command" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+_latest_timeout_block_line() {
+    local source_file="$1"
+    local sentinel=""
+
+    [[ -f "$source_file" ]] || return 1
+    sentinel=$(_verification_timeout_message)
+    grep 'BLOCKED:' "$source_file" 2>/dev/null | grep -F "$sentinel" | tail -1
+}
+
+_timeout_block_count_in_file() {
+    local source_file="$1"
+    local sentinel=""
+
+    [[ -f "$source_file" ]] || {
+        printf '0\n'
+        return 0
+    }
+
+    sentinel=$(_verification_timeout_message)
+    grep 'BLOCKED:' "$source_file" 2>/dev/null | grep -F "$sentinel" | wc -l | tr -d ' '
+}
+
+_validate_single_verify_command() {
+    local cmd="$1"
+    local context="$2"
+    local line_number="${3:-?}"
+    local trimmed first_token
+
+    # Trim whitespace
+    trimmed="${cmd#"${cmd%%[![:space:]]*}"}"
+    trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+
+    if [[ -z "$trimmed" ]]; then
+        echo "ERROR: ${context} (line ${line_number}): empty verify command" >&2
+        return 1
+    fi
+
+    # Check for unbalanced quotes
+    local single_count double_count
+    single_count=$(printf '%s' "$trimmed" | tr -cd "'" | wc -c | tr -d ' ')
+    double_count=$(printf '%s' "$trimmed" | tr -cd '"' | wc -c | tr -d ' ')
+    if [[ $((single_count % 2)) -ne 0 ]]; then
+        echo "ERROR: ${context} (line ${line_number}): unbalanced single quotes in verify command: ${trimmed}" >&2
+        return 1
+    fi
+    if [[ $((double_count % 2)) -ne 0 ]]; then
+        echo "ERROR: ${context} (line ${line_number}): unbalanced double quotes in verify command: ${trimmed}" >&2
+        return 1
+    fi
+
+    # For compound commands, validate only the first segment
+    local first_segment="$trimmed"
+    if [[ "$first_segment" == *" && "* ]]; then
+        first_segment="${first_segment%% && *}"
+    elif [[ "$first_segment" == *" || "* ]]; then
+        first_segment="${first_segment%% || *}"
+    elif [[ "$first_segment" == *" | "* ]]; then
+        first_segment="${first_segment%% | *}"
+    fi
+
+    # Extract first token (the command name)
+    first_token="${first_segment%% *}"
+
+    # Allowed command prefixes
+    case "$first_token" in
+        pytest|python|bash|sh|npm|npx|node|make|cd|timeout|env) return 0 ;;
+        .venv/bin/python|.venv/bin/pytest) return 0 ;;
+    esac
+
+    echo "ERROR: ${context} (line ${line_number}): unknown command prefix '${first_token}' in verify command: ${trimmed}" >&2
+    return 1
+}
+
+_validate_verify_commands_in_file() {
+    local target_file="$1"
+    local context="$2"
+    local in_implementation_tasks=0
+    local line_number=0
+    local has_error=0
+    local vline cmd
+
+    [[ -f "$target_file" ]] || {
+        echo "ERROR: ${context}: file not found: ${target_file}" >&2
+        return 1
+    }
+
+    while IFS= read -r vline || [[ -n "$vline" ]]; do
+        line_number=$((line_number + 1))
+
+        if _is_implementation_tasks_heading "$vline"; then
+            in_implementation_tasks=1
+        elif [[ "$in_implementation_tasks" -eq 1 && "$vline" =~ ^##[[:space:]]+ ]]; then
+            in_implementation_tasks=0
+        fi
+
+        if [[ "$in_implementation_tasks" -eq 1 ]]; then
+            if [[ "$vline" == *"<verify>"*"</verify>"* ]]; then
+                cmd="${vline#*<verify>}"
+                cmd="${cmd%%</verify>*}"
+                if ! _validate_single_verify_command "$cmd" "$context" "$line_number"; then
+                    has_error=1
+                fi
+            fi
+        fi
+    done < "$target_file"
+
+    return "$has_error"
+}
+
 notify_terminal_state() {
     local category="$1"
     local message="${2:-Lauren Loop update}"
@@ -307,7 +900,7 @@ _agent_output_requires_semantic_validation() {
 
 _codex_role_uses_tool_written_artifact() {
     case "$1" in
-        planner-b|reviewer-b*)
+        planner-b|reviewer-b*|scope-triage)
             return 0
             ;;
         *)
@@ -432,8 +1025,7 @@ _reviewer_b_dimension_specs() {
     prompt_file=$(_reviewer_b_prompt_path)
     [[ -f "$prompt_file" ]] || return 1
 
-    sed -n '/^## Dimension Coverage$/,/^## Verdict$/p' "$prompt_file" \
-        | sed -nE 's/^\*\*([0-9][0-9]*)\.[[:space:]]+([^*]+):\*\*.*/\1|\2/p'
+    sed -nE 's/^\*\*([0-9][0-9]*)\.[[:space:]]+([^*]+):\*\*.*/\1|\2/p' "$prompt_file"
 }
 
 _reviewer_b_artifact_has_required_sections() {
@@ -441,31 +1033,73 @@ _reviewer_b_artifact_has_required_sections() {
     local spec_count=0
     local number="" label="" label_pattern=""
 
-    grep -Eq '^#[[:space:]]+Review B[[:space:]]*$' "$file" \
-        && grep -Eq '^##[[:space:]]+Findings[[:space:]]*$' "$file" \
-        && _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Findings[[:space:]]*$' \
-        && grep -Eq '^##[[:space:]]+Done-Criteria Check[[:space:]]*$' "$file" \
-        && _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Done-Criteria Check[[:space:]]*$' \
-        && grep -Eq '^##[[:space:]]+Dimension Coverage[[:space:]]*$' "$file" \
-        && _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Dimension Coverage[[:space:]]*$' \
-        && grep -Eq '^##[[:space:]]+Verdict[[:space:]]*$' "$file" \
-        && _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Verdict[[:space:]]*$' \
-        || return 1
+    if ! grep -Eq '^#[[:space:]]+Review B[[:space:]]*$' "$file"; then
+        echo "WARN: reviewer-b artifact missing '# Review B' heading: $file" >&2
+        return 1
+    fi
+    if ! grep -Eq '^##[[:space:]]+Findings[[:space:]]*$' "$file"; then
+        echo "WARN: reviewer-b artifact missing '## Findings' heading: $file" >&2
+        return 1
+    fi
+    if ! _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Findings[[:space:]]*$'; then
+        echo "WARN: reviewer-b artifact has empty '## Findings' section: $file" >&2
+        return 1
+    fi
+    if ! grep -Eq '^##[[:space:]]+Done-Criteria Check[[:space:]]*$' "$file"; then
+        echo "WARN: reviewer-b artifact missing '## Done-Criteria Check' heading: $file" >&2
+        return 1
+    fi
+    if ! _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Done-Criteria Check[[:space:]]*$'; then
+        echo "WARN: reviewer-b artifact has empty '## Done-Criteria Check' section: $file" >&2
+        return 1
+    fi
+    if ! grep -Eq '^##[[:space:]]+Dimension Coverage[[:space:]]*$' "$file"; then
+        echo "WARN: reviewer-b artifact missing '## Dimension Coverage' heading: $file" >&2
+        return 1
+    fi
+    if ! _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Dimension Coverage[[:space:]]*$'; then
+        echo "WARN: reviewer-b artifact has empty '## Dimension Coverage' section: $file" >&2
+        return 1
+    fi
+    if ! grep -Eq '^##[[:space:]]+Verdict[[:space:]]*$' "$file"; then
+        echo "WARN: reviewer-b artifact missing '## Verdict' heading: $file" >&2
+        return 1
+    fi
+    if ! _markdown_section_has_nonblank_body "$file" '^##[[:space:]]+Verdict[[:space:]]*$'; then
+        echo "WARN: reviewer-b artifact has empty '## Verdict' section: $file" >&2
+        return 1
+    fi
 
     while IFS='|' read -r number label; do
         [[ -n "$number" && -n "$label" ]] || continue
         label_pattern=$(_regex_escape_ere "$label")
-        grep -Eq "^\\*\\*${number}\\.[[:space:]]+${label_pattern}:\\*\\*[[:space:]]+.+$" "$file" || return 1
+        if ! grep -Eq "^\\*\\*${number}\\.[[:space:]]+${label_pattern}:\\*\\*[[:space:]]+.+$" "$file"; then
+            echo "WARN: reviewer-b artifact missing dimension coverage line for '${number}. ${label}': $file" >&2
+            return 1
+        fi
         spec_count=$((spec_count + 1))
     done < <(_reviewer_b_dimension_specs)
 
-    (( spec_count > 0 )) \
-        && grep -Eq '^\*\*VERDICT:[[:space:]]*(PASS|FAIL|CONDITIONAL)\*\*$' "$file"
+    if (( spec_count <= 0 )); then
+        echo "WARN: reviewer-b dimension coverage spec list is empty: $file" >&2
+        return 1
+    fi
+    if ! grep -Eq '^\*\*VERDICT:[[:space:]]*(PASS|FAIL|CONDITIONAL)\*\*$' "$file"; then
+        echo "WARN: reviewer-b artifact missing '**VERDICT:**' contract line: $file" >&2
+        return 1
+    fi
+
+    return 0
 }
 
 _reviewer_a_artifact_has_required_sections() {
     local file="$1"
-    grep -Eq '\*\*VERDICT:[[:space:]]*(PASS|FAIL|CONDITIONAL)\*\*' "$file"
+    if ! grep -Eq '\*\*VERDICT:[[:space:]]*(PASS|FAIL|CONDITIONAL)\*\*' "$file"; then
+        echo "WARN: reviewer-a artifact missing '**VERDICT:**' contract line: $file" >&2
+        return 1
+    fi
+
+    return 0
 }
 
 _validate_agent_output_for_role() {
@@ -1244,6 +1878,138 @@ finalize_v1_verification_handoff() {
     set_task_status "$task_file" "needs verification" || return 1
     set_task_left_off_at "$task_file" "$left_off_message" || return 1
     append_task_attempt "$task_file" "$attempt_entry" || return 1
+}
+
+finalize_v2_task_metadata() {
+    local task_file="$1"
+    local final_phase="$2"
+    local final_status="$3"
+    local fix_cycles="$4"
+    local extra_context="${5:-}"
+    local script_dir="${SCRIPT_DIR:-.}"
+
+    [[ -f "$task_file" ]] || return 0
+
+    ensure_task_workflow_sections "$task_file" || return 0
+
+    # Determine next-step hint
+    local hint=""
+    case "$final_status" in
+        success|"needs verification")
+            hint="Review execution diff and test results, then close." ;;
+        human_review|needs-human-review)
+            hint="See human-review-handoff.md or review-synthesis.md before proceeding." ;;
+        blocked|pipeline-error)
+            hint="Debug using execution-log.md and run-manifest.json, then retry." ;;
+        interrupted)
+            hint="Pipeline was interrupted. Resume or retry." ;;
+        *)
+            hint="Check artifacts and determine next steps." ;;
+    esac
+
+    if [[ -n "$extra_context" ]]; then
+        hint="${hint} ${extra_context}"
+    fi
+
+    # Scan for artifacts
+    local comp_dir=""
+    local task_dir=""
+    task_dir="$(dirname "$task_file")"
+    comp_dir="${task_dir}/competitive"
+    local artifacts=""
+    local artifact_names=("execution-diff.patch" "execution-log.md" "review-synthesis.md" "fix-plan.md" "fix-execution.md" "revised-plan.md" "run-manifest.json")
+    for af in "${artifact_names[@]}"; do
+        if [[ -f "${comp_dir}/${af}" ]]; then
+            if [[ -n "$artifacts" ]]; then
+                artifacts="${artifacts}, ${af}"
+            else
+                artifacts="${af}"
+            fi
+        fi
+    done
+    [[ -n "$artifacts" ]] || artifacts="none"
+
+    local left_off_msg="V2 competitive pipeline reached ${final_phase} (status: ${final_status}, fix cycles: ${fix_cycles}). Artifacts: ${artifacts}. Next: ${hint}"
+
+    # Build Attempts entry
+    local today=""
+    today=$(date '+%Y-%m-%d')
+
+    # Sum cost from logs/cost.csv
+    local cost_clause=""
+    local cost_csv="${task_dir}/logs/cost.csv"
+    if [[ -f "$cost_csv" ]]; then
+        local total_cost=""
+        total_cost=$(awk -F',' 'NR > 1 && $11 != "" { sum += $11 } END { printf "%.4f", sum + 0 }' "$cost_csv")
+        if [[ -n "$total_cost" && "$total_cost" != "0.0000" ]]; then
+            cost_clause=", cost: \$${total_cost}"
+        fi
+    fi
+
+    local attempt_entry="- ${today}: V2 competitive run → reached ${final_phase}, status: ${final_status}, fix cycles: ${fix_cycles}${cost_clause} → ${final_status}"
+
+    set_task_left_off_at "$task_file" "$left_off_msg" || true
+    append_task_attempt "$task_file" "$attempt_entry" || true
+}
+
+_preflight_dependency_check() {
+    local task_file="$1"
+    local force="${2:-false}"
+    local open_root dep_body own_status slug dep_file dep_status
+    local script_dir="${SCRIPT_DIR:-.}"
+
+    [[ -f "$task_file" ]] || return 0
+
+    open_root="$script_dir/docs/tasks/open"
+
+    # Parse ## Depends On section via section_body, fall back to inline grep
+    dep_body=$(section_body "$task_file" "## Depends On" 2>/dev/null || true)
+    if [[ -z "$dep_body" ]]; then
+        # Try inline Depends On: field
+        dep_body=$(grep -i '^Depends On:' "$task_file" 2>/dev/null | head -1 | sed 's/^[Dd]epends [Oo]n:[[:space:]]*//' || true)
+    fi
+
+    [[ -n "$dep_body" ]] || return 0
+
+    local has_error=0
+    local slug_list=""
+    # Extract slugs: strip bullets, backticks, commas, trim
+    slug_list=$(printf '%s\n' "$dep_body" \
+        | sed 's/^[[:space:]]*[-*][[:space:]]*//' \
+        | sed 's/`//g' \
+        | tr ',' '\n' \
+        | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+        | grep -v '^$')
+
+    while IFS= read -r slug; do
+        [[ -n "$slug" ]] || continue
+
+        # Resolve dep task file
+        dep_file=""
+        if [[ -f "${open_root}/${slug}/task.md" ]]; then
+            dep_file="${open_root}/${slug}/task.md"
+        elif [[ -f "${open_root}/${slug}.md" ]]; then
+            dep_file="${open_root}/${slug}.md"
+        elif [[ -f "$script_dir/docs/tasks/closed/${slug}.md" ]]; then
+            dep_file="$script_dir/docs/tasks/closed/${slug}.md"
+        else
+            # Not found anywhere — pass conservatively
+            continue
+        fi
+
+        dep_status=$(grep '^## Status: ' "$dep_file" 2>/dev/null | head -1 | sed 's/^## Status: //')
+
+        if [[ "$dep_status" != "closed" ]]; then
+            if [[ "$force" == "true" ]]; then
+                echo "WARN: Dependency '${slug}' has status '${dep_status}' (not closed) — force flag overrides" >&2
+            else
+                echo "ERROR: Dependency '${slug}' has status '${dep_status}' (expected 'closed')" >&2
+                has_error=1
+            fi
+        fi
+    done <<< "$slug_list"
+
+    return "$has_error"
 }
 
 ensure_review_sections() {
@@ -2584,6 +3350,7 @@ CODEX_INPUT_RATE=2.50
 CODEX_OUTPUT_RATE=15.00
 COST_CSV_HEADER="timestamp,task,agent_role,engine,model,reasoning_effort,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,cost_usd,duration_sec,exit_code,status"
 LEGACY_COST_CSV_HEADER="timestamp,task,agent_role,engine,model,input_tokens,cache_write_tokens,cache_read_tokens,output_tokens,cost_usd,duration_sec,exit_code,status"
+TRADITIONAL_DEV_PROXY_VERSION="v2-cocomo-frozen-snapshot-1"
 
 _model_name_for_engine() {
     [[ "$1" == "claude" ]] && echo "$MODEL" || echo "$LAUREN_LOOP_CODEX_MODEL"
@@ -2847,11 +3614,16 @@ _print_cost_summary() {
     fi
 
     echo "  ─────────────────────────────────────────"
+    if [[ -n "${_PIPELINE_START_TS:-}" ]]; then
+        local wall_dur=$(( $(date +%s) - _PIPELINE_START_TS ))
+        [[ "$wall_dur" -lt 0 ]] && wall_dur=0
+        printf '  %-28s %s\n' "Duration:" "$(format_auto_duration "$wall_dur")"
+    fi
     printf '  %-28s $%s\n' "Total:" "$total_cost"
     printf '  %-28s ~$%s\n' "Linear equivalent:" "$linear_cost"
     printf '  %-28s +$%s (+%s%%)\n' "Competitive premium:" "$premium" "$pct"
     local trad_proxy=""
-    trad_proxy=$(compute_cocomo_estimate "${_PIPELINE_PRE_SHA:-}" "${_CURRENT_TASK_FILE:-}" "v2" 2>/dev/null) || trad_proxy=""
+    trad_proxy=$(resolve_traditional_dev_proxy_summary "${_PIPELINE_PRE_SHA:-}" "${_CURRENT_TASK_FILE:-}" "v2" 2>/dev/null) || trad_proxy=""
     if [[ -n "$trad_proxy" ]]; then
         printf '  %-28s %s\n' "Traditional Dev Proxy:" "$trad_proxy"
     fi
@@ -2887,19 +3659,460 @@ read_v2_total_cost() {
     awk -F',' 'NR > 1 && $11 != "" { sum += $11; found = 1 } END { if (found) printf "%.4f", sum + 0; else print "N/A" }' "$cost_csv" 2>/dev/null || echo "N/A"
 }
 
+_traditional_dev_proxy_points_per_hour() {
+    if [[ -n "${TRADITIONAL_DEV_PROXY_POINTS_PER_HOUR:-}" ]]; then
+        printf '%s\n' "$TRADITIONAL_DEV_PROXY_POINTS_PER_HOUR"
+    elif [[ -n "${COCOMO_SLOC_PER_HOUR:-}" ]]; then
+        printf '%s\n' "$COCOMO_SLOC_PER_HOUR"
+    else
+        printf '%s\n' "20"
+    fi
+}
+
+_traditional_dev_proxy_hourly_rate_usd() {
+    if [[ -n "${TRADITIONAL_DEV_PROXY_HOURLY_RATE_USD:-}" ]]; then
+        printf '%s\n' "$TRADITIONAL_DEV_PROXY_HOURLY_RATE_USD"
+    elif [[ -n "${COCOMO_OFFSHORE_RATE:-}" ]]; then
+        printf '%s\n' "$COCOMO_OFFSHORE_RATE"
+    else
+        printf '%s\n' "55"
+    fi
+}
+
+_traditional_dev_proxy_multiplier() {
+    if [[ -n "${TRADITIONAL_DEV_PROXY_MULTIPLIER:-}" ]]; then
+        printf '%s\n' "$TRADITIONAL_DEV_PROXY_MULTIPLIER"
+    elif [[ -n "${COCOMO_SDLC_MULTIPLIER:-}" ]]; then
+        printf '%s\n' "$COCOMO_SDLC_MULTIPLIER"
+    else
+        printf '%s\n' "1"
+    fi
+}
+
+_traditional_dev_proxy_format_decimal() {
+    local value="${1:-0}" decimals="${2:-2}"
+    awk -v value="$value" -v decimals="$decimals" 'BEGIN { printf "%.*f", decimals, value + 0 }' \
+        | sed -E 's/(\.[0-9]*[1-9])0+$/\1/; s/\.0+$//'
+}
+
+_traditional_dev_proxy_standard_numstat_files_for_task() {
+    local task_file="$1"
+    local comp_dir=""
+    comp_dir=$(_traditional_dev_proxy_competitive_dir "$task_file" 2>/dev/null || true)
+    [[ -n "$comp_dir" && -d "$comp_dir" ]] || return 0
+    find "$comp_dir" -maxdepth 1 -type f \( -name 'execution-diff.numstat.tsv' -o -name 'fix-diff-cycle*.numstat.tsv' \) | sort
+}
+
+_traditional_dev_proxy_estimate_numstat_files_for_task() {
+    local task_file="$1"
+    local comp_dir=""
+    comp_dir=$(_traditional_dev_proxy_competitive_dir "$task_file" 2>/dev/null || true)
+    [[ -n "$comp_dir" && -d "$comp_dir" ]] || return 0
+    find "$comp_dir" -maxdepth 1 -type f \( -name 'execution-diff.estimate.numstat.tsv' -o -name 'fix-diff-cycle*.estimate.numstat.tsv' \) | sort
+}
+
+_traditional_dev_proxy_numstat_mode_for_task() {
+    local task_file="$1"
+    if _traditional_dev_proxy_estimate_numstat_files_for_task "$task_file" | grep -q .; then
+        printf '%s\n' "estimate"
+        return 0
+    fi
+    if _traditional_dev_proxy_standard_numstat_files_for_task "$task_file" | grep -q .; then
+        printf '%s\n' "standard"
+        return 0
+    fi
+    printf '%s\n' "none"
+}
+
+_traditional_dev_proxy_numstat_files_for_task() {
+    local task_file="$1" mode="${2:-}"
+    case "$mode" in
+        estimate)
+            _traditional_dev_proxy_estimate_numstat_files_for_task "$task_file"
+            ;;
+        standard)
+            _traditional_dev_proxy_standard_numstat_files_for_task "$task_file"
+            ;;
+        *)
+            if _traditional_dev_proxy_estimate_numstat_files_for_task "$task_file" | grep -q .; then
+                _traditional_dev_proxy_estimate_numstat_files_for_task "$task_file"
+            else
+                _traditional_dev_proxy_standard_numstat_files_for_task "$task_file"
+            fi
+            ;;
+    esac
+}
+
+_traditional_dev_proxy_rollup_numstats() {
+    local task_file="$1" mode="${2:-}"
+    local -a numstat_files=()
+    local path=""
+
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        numstat_files+=("$path")
+    done < <(_traditional_dev_proxy_numstat_files_for_task "$task_file" "$mode")
+
+    [[ ${#numstat_files[@]} -gt 0 ]] || return 1
+
+    awk -F'\t' '
+        function is_test_path(path, lower) {
+            lower = tolower(path)
+            return (lower ~ /(^|\/)tests\// || lower ~ /(^|\/)__tests__\// || lower ~ /\.test\.[^\/]+$/ || lower ~ /(^|\/)test_[^\/]+\.sh$/)
+        }
+
+        function is_config_like(path, lower) {
+            lower = tolower(path)
+            return (lower ~ /\.(json|yml|yaml|toml|ini|css|scss|html)$/)
+        }
+
+        function is_engineering(path, lower) {
+            lower = tolower(path)
+            if (lower ~ /^docs\// || lower ~ /^logs\// || lower ~ /^competitive\// || lower ~ /\/competitive\// || lower ~ /\/logs\//) {
+                return 0
+            }
+            if (lower ~ /\.(md|markdown|txt)$/) {
+                return 0
+            }
+            return (is_test_path(path) || is_config_like(path) || lower ~ /\.(py|sh|js|jsx|ts|tsx|sql)$/)
+        }
+
+        NF >= 3 {
+            ins = $1
+            del = $2
+            path = $3
+
+            if (ins == "-" || del == "-") {
+                next
+            }
+            if (!is_engineering(path)) {
+                next
+            }
+
+            insertions += ins + 0
+            deletions += del + 0
+            seen[path] = 1
+        }
+
+        END {
+            files_count = 0
+            for (path in seen) {
+                files_count++
+            }
+            if (files_count == 0 && insertions == 0 && deletions == 0) {
+                exit 1
+            }
+            printf "%d\t%d\t%d\t%d\n", files_count, insertions + 0, deletions + 0, (insertions + 0) - (deletions + 0)
+        }
+    ' "${numstat_files[@]}"
+}
+
+_traditional_dev_proxy_summary_text() {
+    local scope_label="$1" base_hours="$2" base_cost="$3" loaded_hours="$4" loaded_cost="$5"
+    local net_sloc="$6" insertions="$7" deletions="$8" points_per_hour="$9" hourly_rate="${10}" loaded_multiplier="${11}"
+    local hours_display cost_display
+
+    hours_display=$(_traditional_dev_proxy_format_decimal "$base_hours" 1)
+    cost_display=$(_traditional_dev_proxy_format_decimal "$base_cost" 0)
+    local points_display rate_display
+    points_display=$(_traditional_dev_proxy_format_decimal "$points_per_hour" 0)
+    rate_display=$(_traditional_dev_proxy_format_decimal "$hourly_rate" 0)
+
+    if [[ "$loaded_multiplier" != "1" && "$loaded_multiplier" != "1.0" && "$loaded_multiplier" != "1.00" ]]; then
+        local loaded_hours_display loaded_cost_display mult_display
+        loaded_hours_display=$(_traditional_dev_proxy_format_decimal "$loaded_hours" 1)
+        loaded_cost_display=$(_traditional_dev_proxy_format_decimal "$loaded_cost" 0)
+        mult_display=$(_traditional_dev_proxy_format_decimal "$loaded_multiplier" 1)
+        printf '~%sh / ~$%s; loaded ~%sh / ~$%s (COCOMO-inspired heuristic; %s net lines at %s SLOC/hr × $%s/hr; %sx SDLC)' \
+            "$hours_display" "$cost_display" "$loaded_hours_display" "$loaded_cost_display" "$net_sloc" "$points_display" "$rate_display" "$mult_display"
+    else
+        printf '~%sh / ~$%s (COCOMO-inspired heuristic; %s net lines at %s SLOC/hr × $%s/hr)' \
+            "$hours_display" "$cost_display" "$net_sloc" "$points_display" "$rate_display"
+    fi
+}
+
+_traditional_dev_proxy_no_changes_summary_text() {
+    printf 'N/A  (no scoped engineering changes)'
+}
+
+_traditional_dev_proxy_net_deletion_summary_text() {
+    local insertions="$1" deletions="$2" scope_label="${3:-scoped}"
+    printf 'N/A  (%s net deletion: +%d/-%d)' "$scope_label" "$insertions" "$deletions"
+}
+
+_traditional_dev_proxy_artifact_path() {
+    local task_file="$1"
+    local comp_dir=""
+    comp_dir=$(_traditional_dev_proxy_competitive_dir "$task_file" 2>/dev/null || true)
+    [[ -n "$comp_dir" ]] || return 1
+    printf '%s/traditional-dev-proxy.json\n' "$comp_dir"
+}
+
+write_persisted_v2_traditional_dev_proxy_json() {
+    local task_file="$1" proxy_json="$2"
+    local artifact="" tmp_file=""
+
+    [[ -n "$proxy_json" && "$proxy_json" != "null" ]] || return 0
+    artifact=$(_traditional_dev_proxy_artifact_path "$task_file" 2>/dev/null || true)
+    [[ -n "$artifact" ]] || return 0
+
+    mkdir -p "$(dirname "$artifact")" || return 1
+    tmp_file=$(same_dir_temp_file "$artifact") || return 1
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s\n' "$proxy_json" | jq '.' > "$tmp_file" 2>/dev/null || {
+            rm -f "$tmp_file"
+            return 1
+        }
+    else
+        printf '%s\n' "$proxy_json" > "$tmp_file"
+    fi
+    mv "$tmp_file" "$artifact" || { rm -f "$tmp_file"; return 1; }
+}
+
+read_persisted_v2_traditional_dev_proxy_json() {
+    local task_file="$1"
+    local comp_dir="" manifest="" artifact="" persisted_json=""
+
+    command -v jq >/dev/null 2>&1 || return 0
+
+    artifact=$(_traditional_dev_proxy_artifact_path "$task_file" 2>/dev/null || true)
+    if [[ -n "$artifact" && -f "$artifact" ]]; then
+        jq -c '.' "$artifact" 2>/dev/null || true
+        return 0
+    fi
+
+    comp_dir=$(_traditional_dev_proxy_competitive_dir "$task_file" 2>/dev/null || true)
+    [[ -n "$comp_dir" ]] || return 0
+    manifest="${comp_dir}/run-manifest.json"
+    [[ -f "$manifest" ]] || return 0
+
+    persisted_json=$(jq -c '.traditional_dev_proxy // empty | select(type == "object")' "$manifest" 2>/dev/null || true)
+    if [[ -n "$persisted_json" ]]; then
+        write_persisted_v2_traditional_dev_proxy_json "$task_file" "$persisted_json" || true
+        printf '%s\n' "$persisted_json"
+    fi
+}
+
+build_v2_traditional_dev_proxy_json() {
+    local task_file="$1" fix_cycles="${2:-0}"
+    local numstat_mode=""
+    local rollup=""
+    local files_count=0 total_ins=0 total_del=0 rolled_net_lines=0
+    local sloc_rate hourly_rate loaded_multiplier
+    local net_sloc="" base_hours="" base_cost="" loaded_hours="" loaded_cost="" summary_text=""
+    local scope_source="frozen-v2-numstat"
+
+    command -v jq >/dev/null 2>&1 || { printf '%s\n' "null"; return 0; }
+
+    numstat_mode=$(_traditional_dev_proxy_numstat_mode_for_task "$task_file")
+    case "$numstat_mode" in
+        estimate)
+            scope_source="frozen-v2-estimate-numstat"
+            ;;
+        standard)
+            scope_source="frozen-v2-numstat"
+            ;;
+        none)
+            printf '%s\n' "null"
+            return 0
+            ;;
+    esac
+
+    rollup=$(_traditional_dev_proxy_rollup_numstats "$task_file" "$numstat_mode" 2>/dev/null) || {
+        sloc_rate=$(_traditional_dev_proxy_points_per_hour)
+        hourly_rate=$(_traditional_dev_proxy_hourly_rate_usd)
+        loaded_multiplier=$(_traditional_dev_proxy_multiplier)
+        summary_text=$(_traditional_dev_proxy_no_changes_summary_text)
+        jq -n \
+            --arg version "$TRADITIONAL_DEV_PROXY_VERSION" \
+            --arg scope_source "$scope_source" \
+            --arg summary_text "$summary_text" \
+            --argjson files_count 0 \
+            --argjson insertions 0 \
+            --argjson deletions 0 \
+            --argjson net_lines 0 \
+            --argjson sloc_per_hour "$sloc_rate" \
+            --argjson hourly_rate_usd "$hourly_rate" \
+            --argjson loaded_multiplier "$loaded_multiplier" \
+            --argjson estimated_hours_base 0 \
+            --argjson estimated_cost_usd_base 0 \
+            --argjson estimated_hours_loaded 0 \
+            --argjson estimated_cost_usd_loaded 0 \
+            --argjson fix_cycles "$fix_cycles" \
+            '{
+                version: $version,
+                scope_source: $scope_source,
+                files_count: $files_count,
+                insertions: $insertions,
+                deletions: $deletions,
+                net_lines: $net_lines,
+                sloc_per_hour: $sloc_per_hour,
+                hourly_rate_usd: $hourly_rate_usd,
+                loaded_multiplier: $loaded_multiplier,
+                estimated_hours_base: $estimated_hours_base,
+                estimated_cost_usd_base: $estimated_cost_usd_base,
+                estimated_hours_loaded: $estimated_hours_loaded,
+                estimated_cost_usd_loaded: $estimated_cost_usd_loaded,
+                fix_cycles: $fix_cycles,
+                summary_text: $summary_text
+            }'
+        return 0
+    }
+    IFS=$'\t' read -r files_count total_ins total_del rolled_net_lines <<< "$rollup"
+
+    sloc_rate=$(_traditional_dev_proxy_points_per_hour)
+    hourly_rate=$(_traditional_dev_proxy_hourly_rate_usd)
+    loaded_multiplier=$(_traditional_dev_proxy_multiplier)
+    net_sloc=$(( rolled_net_lines ))
+
+    if [[ "$net_sloc" -le 0 ]]; then
+        summary_text=$(_traditional_dev_proxy_net_deletion_summary_text "$total_ins" "$total_del" "frozen scoped")
+        jq -n \
+            --arg version "$TRADITIONAL_DEV_PROXY_VERSION" \
+            --arg scope_source "$scope_source" \
+            --arg summary_text "$summary_text" \
+            --argjson files_count "$files_count" \
+            --argjson insertions "$total_ins" \
+            --argjson deletions "$total_del" \
+            --argjson net_lines "$net_sloc" \
+            --argjson sloc_per_hour "$sloc_rate" \
+            --argjson hourly_rate_usd "$hourly_rate" \
+            --argjson loaded_multiplier "$loaded_multiplier" \
+            --argjson estimated_hours_base 0 \
+            --argjson estimated_cost_usd_base 0 \
+            --argjson estimated_hours_loaded 0 \
+            --argjson estimated_cost_usd_loaded 0 \
+            --argjson fix_cycles "$fix_cycles" \
+            '{
+                version: $version,
+                scope_source: $scope_source,
+                files_count: $files_count,
+                insertions: $insertions,
+                deletions: $deletions,
+                net_lines: $net_lines,
+                sloc_per_hour: $sloc_per_hour,
+                hourly_rate_usd: $hourly_rate_usd,
+                loaded_multiplier: $loaded_multiplier,
+                estimated_hours_base: $estimated_hours_base,
+                estimated_cost_usd_base: $estimated_cost_usd_base,
+                estimated_hours_loaded: $estimated_hours_loaded,
+                estimated_cost_usd_loaded: $estimated_cost_usd_loaded,
+                fix_cycles: $fix_cycles,
+                summary_text: $summary_text
+            }'
+        return 0
+    fi
+
+    base_hours=$(awk -v net_sloc="$net_sloc" -v sloc_rate="$sloc_rate" \
+        'BEGIN { if ((sloc_rate + 0) <= 0) exit 1; printf "%.2f", (net_sloc + 0) / (sloc_rate + 0) }') || {
+        printf '%s\n' "null"
+        return 0
+    }
+    base_cost=$(awk -v hours="$base_hours" -v hourly_rate="$hourly_rate" \
+        'BEGIN { printf "%.2f", (hours + 0) * (hourly_rate + 0) }')
+    loaded_hours=$(awk -v base_hours="$base_hours" -v loaded_multiplier="$loaded_multiplier" \
+        'BEGIN { printf "%.2f", (base_hours + 0) * (loaded_multiplier + 0) }')
+    loaded_cost=$(awk -v base_cost="$base_cost" -v loaded_multiplier="$loaded_multiplier" \
+        'BEGIN { printf "%.2f", (base_cost + 0) * (loaded_multiplier + 0) }')
+    summary_text=$(_traditional_dev_proxy_summary_text "frozen scoped" "$base_hours" "$base_cost" "$loaded_hours" "$loaded_cost" "$net_sloc" "$total_ins" "$total_del" "$sloc_rate" "$hourly_rate" "$loaded_multiplier")
+
+    jq -n \
+        --arg version "$TRADITIONAL_DEV_PROXY_VERSION" \
+        --arg scope_source "$scope_source" \
+        --arg summary_text "$summary_text" \
+        --argjson files_count "$files_count" \
+        --argjson insertions "$total_ins" \
+        --argjson deletions "$total_del" \
+        --argjson net_lines "$net_sloc" \
+        --argjson sloc_per_hour "$sloc_rate" \
+        --argjson hourly_rate_usd "$hourly_rate" \
+        --argjson loaded_multiplier "$loaded_multiplier" \
+        --argjson estimated_hours_base "$base_hours" \
+        --argjson estimated_cost_usd_base "$base_cost" \
+        --argjson estimated_hours_loaded "$loaded_hours" \
+        --argjson estimated_cost_usd_loaded "$loaded_cost" \
+        --argjson fix_cycles "$fix_cycles" \
+        '{
+            version: $version,
+            scope_source: $scope_source,
+            files_count: $files_count,
+            insertions: $insertions,
+            deletions: $deletions,
+            net_lines: $net_lines,
+            sloc_per_hour: $sloc_per_hour,
+            hourly_rate_usd: $hourly_rate_usd,
+            loaded_multiplier: $loaded_multiplier,
+            estimated_hours_base: $estimated_hours_base,
+            estimated_cost_usd_base: $estimated_cost_usd_base,
+            estimated_hours_loaded: $estimated_hours_loaded,
+            estimated_cost_usd_loaded: $estimated_cost_usd_loaded,
+            fix_cycles: $fix_cycles,
+            summary_text: $summary_text
+        }'
+}
+
+persist_v2_traditional_dev_proxy_json() {
+    local task_file="$1" fix_cycles="${2:-0}"
+    local proxy_json="null"
+
+    command -v jq >/dev/null 2>&1 || {
+        printf '%s\n' "$proxy_json"
+        return 0
+    }
+
+    proxy_json=$(build_v2_traditional_dev_proxy_json "$task_file" "$fix_cycles" 2>/dev/null || echo "null")
+    if [[ -n "$proxy_json" && "$proxy_json" != "null" ]]; then
+        write_persisted_v2_traditional_dev_proxy_json "$task_file" "$proxy_json" || true
+    fi
+    printf '%s\n' "$proxy_json"
+}
+
+read_persisted_v2_traditional_dev_proxy_summary() {
+    local task_file="$1"
+    local persisted_json=""
+
+    command -v jq >/dev/null 2>&1 || return 0
+
+    persisted_json=$(read_persisted_v2_traditional_dev_proxy_json "$task_file")
+    [[ -n "$persisted_json" ]] || return 0
+    printf '%s\n' "$persisted_json" | jq -r '.summary_text // empty' 2>/dev/null || true
+}
+
+resolve_traditional_dev_proxy_summary() {
+    local before_sha="${1:-}" task_file="${2:-}" route="${3:-}"
+    local route_lc="" persisted_summary=""
+
+    route_lc=$(printf '%s\n' "$route" | tr '[:upper:]' '[:lower:]')
+    if [[ "$route_lc" == "v2" && -n "$task_file" ]]; then
+        persisted_summary=$(read_persisted_v2_traditional_dev_proxy_summary "$task_file")
+        if [[ -n "$persisted_summary" ]]; then
+            printf '%s\n' "$persisted_summary"
+            return 0
+        fi
+        printf '%s\n' "N/A  (traditional dev proxy unavailable before V2 diff capture)"
+        return 0
+    fi
+
+    compute_cocomo_estimate "$before_sha" "$task_file" "$route"
+}
+
 compute_cocomo_estimate() {
     local before_sha="${1:-}"
     local task_file="${2:-}"
     local route="${3:-}"
-    local sloc_rate="${COCOMO_SLOC_PER_HOUR:-20}"
-    local hourly_rate="${COCOMO_OFFSHORE_RATE:-55}"
-    local sdlc_mult="${COCOMO_SDLC_MULTIPLIER:-1}"
+    local sloc_rate=""
+    local hourly_rate=""
+    local loaded_multiplier=""
     local scope_paths=""
     local committed staged unstaged
     local total_ins total_del net_sloc
-    local hours cost
+    local base_hours base_cost loaded_hours loaded_cost
     local -a scope_args=()
     local path=""
+
+    sloc_rate=$(_traditional_dev_proxy_points_per_hour)
+    hourly_rate=$(_traditional_dev_proxy_hourly_rate_usd)
+    loaded_multiplier=$(_traditional_dev_proxy_multiplier)
 
     _traditional_dev_proxy_resolve_scope_paths "$task_file" "$route" "$before_sha"
     scope_paths=$(
@@ -2934,12 +4147,40 @@ compute_cocomo_estimate() {
         return 0
     fi
 
-    hours=$(echo "scale=2; $net_sloc / $sloc_rate * $sdlc_mult" | bc 2>/dev/null) || { echo "N/A"; return 0; }
-    cost=$(echo "scale=2; $hours * $hourly_rate" | bc 2>/dev/null) || { echo "N/A"; return 0; }
-    [[ "$hours" == .* ]] && hours="0$hours"
-    [[ "$cost" == .* ]] && cost="0$cost"
+    base_hours=$(awk -v net_sloc="$net_sloc" -v sloc_rate="$sloc_rate" \
+        'BEGIN { if ((sloc_rate + 0) <= 0) exit 1; printf "%.2f", (net_sloc + 0) / (sloc_rate + 0) }') || {
+        echo "N/A"
+        return 0
+    }
+    base_cost=$(awk -v hours="$base_hours" -v hourly_rate="$hourly_rate" \
+        'BEGIN { printf "%.2f", (hours + 0) * (hourly_rate + 0) }')
+    loaded_hours=$(awk -v base_hours="$base_hours" -v loaded_multiplier="$loaded_multiplier" \
+        'BEGIN { printf "%.2f", (base_hours + 0) * (loaded_multiplier + 0) }')
+    loaded_cost=$(awk -v base_cost="$base_cost" -v loaded_multiplier="$loaded_multiplier" \
+        'BEGIN { printf "%.2f", (base_cost + 0) * (loaded_multiplier + 0) }')
 
-    local breakdown="COCOMO-inspired heuristic; scoped net ${net_sloc} lines (+${total_ins}/-${total_del}) at ${sloc_rate} SLOC/hr × \$${hourly_rate}/hr"
-    [[ "$sdlc_mult" != "1" ]] && breakdown="${breakdown} × ${sdlc_mult}x SDLC"
-    printf '~$%s  (%s)' "$cost" "$breakdown"
+    _traditional_dev_proxy_summary_text "scoped" "$base_hours" "$base_cost" "$loaded_hours" "$loaded_cost" "$net_sloc" "$total_ins" "$total_del" "$sloc_rate" "$hourly_rate" "$loaded_multiplier"
+}
+
+# ============================================================
+# Duration formatting
+# ============================================================
+
+format_auto_duration() {
+    local duration="$1"
+    local hours minutes
+
+    if [ "$duration" -lt 60 ]; then
+        echo "<1m"
+        return 0
+    fi
+
+    hours=$((duration / 3600))
+    minutes=$(((duration % 3600) / 60))
+
+    if [ "$hours" -gt 0 ]; then
+        printf '%sh %sm\n' "$hours" "$minutes"
+    else
+        printf '%sm\n' "$minutes"
+    fi
 }

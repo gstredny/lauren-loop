@@ -65,13 +65,14 @@ ENGINE_EXECUTOR="${ENGINE_EXECUTOR:-claude}"      # TODO: switch to codex when s
 ENGINE_REVIEWER_A="${ENGINE_REVIEWER_A:-claude}"  # Phase 6a
 ENGINE_REVIEWER_B="${ENGINE_REVIEWER_B:-codex}"   # Phase 6b
 ENGINE_FIX="${ENGINE_FIX:-claude}"                # TODO: switch to codex when stream disconnection fix is merged
-SINGLE_REVIEWER_POLICY="${SINGLE_REVIEWER_POLICY:-synthesis}"
 # Timeouts (env-overridable)
 EXPLORE_TIMEOUT="${EXPLORE_TIMEOUT:-15m}"
 PLANNER_TIMEOUT="${PLANNER_TIMEOUT:-10m}"
 EVALUATE_TIMEOUT="${EVALUATE_TIMEOUT:-10m}"
 CRITIC_TIMEOUT="${CRITIC_TIMEOUT:-15m}"
 EXECUTOR_TIMEOUT="${EXECUTOR_TIMEOUT:-120m}"
+REVIEWER_TIMEOUT_EXPLICIT="false"
+[[ -n "${REVIEWER_TIMEOUT:-}" ]] && REVIEWER_TIMEOUT_EXPLICIT="true"
 REVIEWER_TIMEOUT="${REVIEWER_TIMEOUT:-15m}"
 SYNTHESIZE_TIMEOUT="${SYNTHESIZE_TIMEOUT:-10m}"
 
@@ -85,6 +86,9 @@ _CLEANUP_V2_DONE=false
 _COST_CEILING_WARNED=false
 _COST_CEILING_INTERRUPT_WARNED=false
 _PIPELINE_PRE_SHA=""
+_PIPELINE_START_TS=""
+_V2_EXEC_WORKTREE_PATH=""
+_V2_EXEC_WORKTREE_BRANCH=""
 
 _v2_task_artifact_dir() {
     printf '%s/docs/tasks/open/%s\n' "$SCRIPT_DIR" "$1"
@@ -158,6 +162,30 @@ _consolidate_task_to_dir() {
     echo -e "${GREEN}Consolidated: $(basename "$flat_file") → ${task_dir}/task.md${NC}"
 }
 
+_resolve_reviewer_timeout() {
+    local diff_risk="${1:-LOW}"
+
+    if [[ "${REVIEWER_TIMEOUT_EXPLICIT:-false}" == "true" ]] && [[ -n "${REVIEWER_TIMEOUT:-}" ]]; then
+        printf '%s\n' "$REVIEWER_TIMEOUT"
+        return 0
+    fi
+
+    case "$diff_risk" in
+        HIGH) printf '45m\n' ;;
+        MEDIUM) printf '30m\n' ;;
+        LOW|"") printf '15m\n' ;;
+        *) printf '15m\n' ;;
+    esac
+}
+
+_reviewer_timeout_resolution_source() {
+    if [[ "${REVIEWER_TIMEOUT_EXPLICIT:-false}" == "true" ]] && [[ -n "${REVIEWER_TIMEOUT:-}" ]]; then
+        printf 'explicit-override\n'
+    else
+        printf 'diff-risk-scaling\n'
+    fi
+}
+
 _init_run_manifest() {
     local manifest="${comp_dir}/run-manifest.json"
     command -v jq >/dev/null 2>&1 || return 0
@@ -195,8 +223,61 @@ _init_run_manifest() {
                 fix: $engine_fix
             },
             force_rerun: $force_rerun,
+            current_phase: null,
+            active_engines: {
+                explore: $engine_explore,
+                planner_a: $engine_planner_a,
+                planner_b: $engine_planner_b,
+                evaluator: $engine_evaluator,
+                executor: $engine_executor,
+                reviewer_a: $engine_reviewer_a,
+                reviewer_b: $engine_reviewer_b,
+                fix: $engine_fix
+            },
+            diff_risk: null,
+            effective_timeouts: {
+                reviewer: null
+            },
             phases: []
         }' > "$tmp" && mv "$tmp" "$manifest" || { rm -f "$tmp"; return 1; }
+}
+
+_update_run_manifest_state() {
+    local current_phase="$1" diff_risk="${2:-}" reviewer_timeout="${3:-}"
+    local reviewer_a_engine="${4:-$ENGINE_REVIEWER_A}" reviewer_b_engine="${5:-$ENGINE_REVIEWER_B}"
+    local manifest="${comp_dir}/run-manifest.json"
+    command -v jq >/dev/null 2>&1 || return 0
+    [[ -f "$manifest" ]] || return 0
+    local tmp
+    tmp=$(same_dir_temp_file "$manifest") || return 1
+    jq --arg current_phase "$current_phase" \
+       --arg engine_explore "$ENGINE_EXPLORE" \
+       --arg engine_planner_a "$ENGINE_PLANNER_A" \
+       --arg engine_planner_b "$ENGINE_PLANNER_B" \
+       --arg engine_evaluator "$ENGINE_EVALUATOR" \
+       --arg engine_executor "$ENGINE_EXECUTOR" \
+       --arg engine_reviewer_a "$reviewer_a_engine" \
+       --arg engine_reviewer_b "$reviewer_b_engine" \
+       --arg engine_fix "$ENGINE_FIX" \
+       --arg diff_risk "$diff_risk" \
+       --arg reviewer_timeout "$reviewer_timeout" \
+       '(.diff_risk // null) as $existing_diff_risk |
+        (.effective_timeouts // {}) as $existing_timeouts |
+        .current_phase = $current_phase |
+        .active_engines = {
+            explore: $engine_explore,
+            planner_a: $engine_planner_a,
+            planner_b: $engine_planner_b,
+            evaluator: $engine_evaluator,
+            executor: $engine_executor,
+            reviewer_a: $engine_reviewer_a,
+            reviewer_b: $engine_reviewer_b,
+            fix: $engine_fix
+        } |
+        .diff_risk = (if $diff_risk == "" then $existing_diff_risk else $diff_risk end) |
+        .effective_timeouts = ($existing_timeouts + {
+            reviewer: (if $reviewer_timeout == "" then ($existing_timeouts.reviewer // null) else $reviewer_timeout end)
+        })' "$manifest" > "$tmp" && mv "$tmp" "$manifest" || { rm -f "$tmp"; return 1; }
 }
 
 _append_manifest_phase() {
@@ -228,6 +309,7 @@ _append_manifest_phase() {
 _finalize_run_manifest() {
     local final_status="$1" fix_cycles="$2"
     local manifest="${comp_dir}/run-manifest.json"
+    local traditional_proxy_json="null"
     command -v jq >/dev/null 2>&1 || return 0
     [[ -f "$manifest" ]] || return 0
     _merge_cost_csvs || true
@@ -236,17 +318,26 @@ _finalize_run_manifest() {
     if [[ -f "$cost_csv" ]]; then
         total_cost=$(awk -F',' 'NR > 1 && $11 != "" { sum += $11 } END { printf "%.4f", sum + 0 }' "$cost_csv" 2>/dev/null || echo "0.0000")
     fi
+    if [[ -n "${_CURRENT_TASK_FILE:-}" ]]; then
+        traditional_proxy_json=$(persist_v2_traditional_dev_proxy_json "$_CURRENT_TASK_FILE" "$fix_cycles" 2>/dev/null || echo "null")
+        if [[ -z "$traditional_proxy_json" || "$traditional_proxy_json" == "null" ]]; then
+            traditional_proxy_json=$(read_persisted_v2_traditional_dev_proxy_json "$_CURRENT_TASK_FILE" 2>/dev/null || echo "null")
+            [[ -z "$traditional_proxy_json" ]] && traditional_proxy_json="null"
+        fi
+    fi
     local tmp
     tmp=$(same_dir_temp_file "$manifest") || return 1
     jq --arg completed_at "$(_iso_timestamp)" \
        --arg total_cost_usd "$total_cost" \
        --arg final_status "$final_status" \
        --argjson fix_cycles "$fix_cycles" \
+       --argjson traditional_dev_proxy "$traditional_proxy_json" \
        '. + {
            completed_at: $completed_at,
            total_cost_usd: $total_cost_usd,
            final_status: $final_status,
-           fix_cycles: $fix_cycles
+           fix_cycles: $fix_cycles,
+           traditional_dev_proxy: $traditional_dev_proxy
        }' "$manifest" > "$tmp" && mv "$tmp" "$manifest" || { rm -f "$tmp"; return 1; }
 }
 
@@ -513,16 +604,11 @@ _run_codex_agent_attempt() {
 
 _enforce_codex_phase_backstop() {
     local pid="$1" role="$2" codex_start_ts="$3" timeout="$4" claude_duration="$5" log_file="$6" artifact_file="${7:-}"
-    local timeout_seconds phase_deadline claude_deadline cutoff_epoch poll_interval now live_artifact=""
+    local timeout_seconds phase_deadline cutoff_epoch poll_interval now live_artifact=""
 
-    (( claude_duration < 1 )) && claude_duration=1
     timeout_seconds=$(_duration_to_seconds "$timeout")
     phase_deadline=$((codex_start_ts + timeout_seconds))
-    claude_deadline=$((codex_start_ts + (claude_duration * 2)))
     cutoff_epoch=$phase_deadline
-    if (( claude_deadline < cutoff_epoch )); then
-        cutoff_epoch=$claude_deadline
-    fi
     poll_interval=$(_agent_poll_interval_seconds)
 
     while kill -0 "$pid" 2>/dev/null; do
@@ -803,6 +889,75 @@ release_lock() {
     _LOCK_ACQUIRED=false
 }
 
+# ============================================================
+# Execution worktree helpers — isolate Phase 4/7 execution
+# ============================================================
+
+_v2_create_execution_worktree() {
+    local branch_name="ll-exec-${SLUG:-unknown}-${RANDOM}"
+    local worktree_path="/tmp/lauren-loop-wt-${SLUG:-unknown}-$$"
+
+    # Clean up stale worktree from a previous crash at the same path
+    if [[ -d "$worktree_path" ]]; then
+        echo -e "${YELLOW}Cleaning stale worktree at ${worktree_path}${NC}"
+        git worktree remove "$worktree_path" --force 2>/dev/null || rm -rf "$worktree_path"
+    fi
+
+    # Prune any stale worktree bookkeeping entries
+    git worktree prune 2>/dev/null || true
+
+    git worktree add "$worktree_path" -b "$branch_name" HEAD || {
+        echo -e "${RED}Failed to create execution worktree at ${worktree_path}${NC}" >&2
+        return 1
+    }
+
+    _V2_EXEC_WORKTREE_PATH="$worktree_path"
+    _V2_EXEC_WORKTREE_BRANCH="$branch_name"
+    echo -e "${BLUE}Created execution worktree: ${worktree_path} (branch: ${branch_name})${NC}"
+}
+
+_v2_merge_execution_worktree() {
+    [[ -n "$_V2_EXEC_WORKTREE_PATH" ]] || return 0
+
+    cd "$SCRIPT_DIR"
+
+    # Check if the worktree branch has any commits beyond our starting point
+    local worktree_head=""
+    worktree_head=$(git -C "$_V2_EXEC_WORKTREE_PATH" rev-parse HEAD 2>/dev/null || true)
+    local main_head=""
+    main_head=$(git rev-parse HEAD 2>/dev/null || true)
+
+    if [[ -n "$worktree_head" && "$worktree_head" != "$main_head" ]]; then
+        git merge --no-edit "$_V2_EXEC_WORKTREE_BRANCH" || {
+            echo -e "${RED}Merge conflict from execution worktree branch ${_V2_EXEC_WORKTREE_BRANCH}${NC}" >&2
+            echo -e "${RED}Worktree preserved at ${_V2_EXEC_WORKTREE_PATH} for manual resolution${NC}" >&2
+            return 1
+        }
+    fi
+
+    _v2_cleanup_execution_worktree
+}
+
+_v2_cleanup_execution_worktree() {
+    local wt_path="$_V2_EXEC_WORKTREE_PATH"
+    local wt_branch="$_V2_EXEC_WORKTREE_BRANCH"
+
+    # Clear globals first so re-entry is safe
+    _V2_EXEC_WORKTREE_PATH=""
+    _V2_EXEC_WORKTREE_BRANCH=""
+
+    # Ensure we're not inside the worktree being removed
+    cd "$SCRIPT_DIR" 2>/dev/null || true
+
+    if [[ -n "$wt_path" && -d "$wt_path" ]]; then
+        git worktree remove "$wt_path" --force 2>/dev/null || rm -rf "$wt_path"
+    fi
+    if [[ -n "$wt_branch" ]]; then
+        git branch -D "$wt_branch" 2>/dev/null || true
+    fi
+    git worktree prune 2>/dev/null || true
+}
+
 # Active runtime state
 _interrupt_marker_path() {
     printf '%s/.interrupted\n' "${_CURRENT_TASK_LOG_DIR:-${TASK_LOG_DIR:-/tmp}}"
@@ -881,9 +1036,11 @@ cleanup_v2() {
         if ! _is_terminal_status "$_current_status"; then
             set_task_status "$_CURRENT_TASK_FILE" "blocked" || true
             log_execution "$_CURRENT_TASK_FILE" "cleanup_v2: task was still 'in progress' at exit — set to blocked" || true
+            finalize_v2_task_metadata "$_CURRENT_TASK_FILE" "cleanup-safety-net" "blocked" "0" || true
         fi
     fi
 
+    _v2_cleanup_execution_worktree || true
     _terminate_active_jobs || true
     release_lock || true
     _clear_active_runtime_state || true
@@ -908,10 +1065,12 @@ _interrupted() {
         set_task_status "$_CURRENT_TASK_FILE" "blocked" || true
         log_execution "$_CURRENT_TASK_FILE" "Pipeline interrupted (signal ${signal})" || true
         _set_interrupt_marker || true
+        _v2_cleanup_execution_worktree || true
         _terminate_active_jobs || true
         _append_interrupted_cost_rows "$signal" || true
         _print_cost_summary || true
         _print_phase_timing || true
+        finalize_v2_task_metadata "$_CURRENT_TASK_FILE" "interrupted-${signal}" "interrupted" "0" || true
     fi
 
     notify_terminal_state "interrupted" "Pipeline interrupted (${signal}) — ${SLUG:-unknown}" || true
@@ -1053,7 +1212,7 @@ run_agent() {
         if [[ "$attempt_artifact_state" == "valid" || "$attempt_artifact_state" == "complete_fallback" ]]; then
             fallback_reason=""
         elif fallback_reason=$(_codex_attempt_fallback_reason "$attempt_log" "$exit_code"); then
-            codex_profile="$LAUREN_LOOP_CODEX_PROFILE_MEDIUM"
+            codex_profile="$LAUREN_LOOP_CODEX_PROFILE_HIGH"
 
             for fallback_backoff in 15 30 60; do
                 echo "WARN: Codex ${fallback_reason} failure for $role; retrying with profile ${codex_profile} after ${fallback_backoff}s backoff." >> "$log_file"
@@ -1305,6 +1464,7 @@ _backup_artifacts_on_force() {
     for artifact in \
         "$comp_dir"/*.md \
         "$comp_dir"/*.patch \
+        "$comp_dir"/*.tsv \
         "$comp_dir"/*.json \
         "$comp_dir"/.plan-mapping \
         "$comp_dir"/.review-mapping \
@@ -1327,10 +1487,14 @@ _clear_force_artifacts() {
         "$comp_dir/plan-evaluation.md" \
         "$comp_dir/plan-critique.md" \
         "$comp_dir/execution-diff.patch" \
+        "$comp_dir/execution-diff.numstat.tsv" \
+        "$comp_dir/execution-diff.estimate.numstat.tsv" \
         "$comp_dir/review-synthesis.md" \
         "$comp_dir/fix-plan.md" \
         "$comp_dir/fix-critique.md" \
         "$comp_dir/fix-execution.md" \
+        "$comp_dir/execution-scope-triage.json" \
+        "$comp_dir/execution-scope-triage.raw.json" \
         "$comp_dir/execution-log.md" \
         "$comp_dir/reviewer-a.raw.md" \
         "$comp_dir/reviewer-b.raw.md" \
@@ -1341,6 +1505,7 @@ _clear_force_artifacts() {
         "$comp_dir"/review-a.cycle*.md \
         "$comp_dir"/review-b.cycle*.md \
         "$comp_dir"/plan-b.attempt-*.md \
+        "$comp_dir"/execution-scope-triage.raw.attempt-*.json \
         "$comp_dir"/reviewer-b.raw.attempt-*.md \
         "$comp_dir/plan-1.md" \
         "$comp_dir/plan-2.md" \
@@ -1350,6 +1515,7 @@ _clear_force_artifacts() {
         "$comp_dir/human-review-handoff.md" \
         "$comp_dir/blinding-metadata.log" \
         "$comp_dir/run-manifest.json" \
+        "$comp_dir/traditional-dev-proxy.json" \
         "$comp_dir/.cycle-state.json" \
         "$comp_dir/plan-evaluation.contract.json" \
         "$comp_dir/plan-critique.contract.json" \
@@ -1358,6 +1524,9 @@ _clear_force_artifacts() {
         "$comp_dir/fix-plan.contract.json" \
         "$comp_dir/fix-execution.contract.json"
     rm -f "$comp_dir"/fix-diff-cycle*.patch
+    rm -f "$comp_dir"/fix-diff-cycle*.numstat.tsv
+    rm -f "$comp_dir"/fix-diff-cycle*.estimate.numstat.tsv
+    rm -rf "$comp_dir/scope-triage-quarantine"
     rm -f "$task_log_dir/cost.csv" "$task_log_dir"/.cost-*.csv "$task_log_dir"/*.summary.txt
 }
 
@@ -1380,6 +1549,11 @@ _V2_LAST_CAPTURE_ALL_FILES=""
 _V2_LAST_CAPTURED_FILES=""
 _V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES=""
 _V2_LAST_CAPTURE_UNTRACKED_FILES=""
+_V2_LAST_ESTIMATE_SCOPE_PATHS=""
+_V2_PHASE4_CHECKPOINT_NEEDS_TRIAGE=false
+_V2_PHASE4_CHECKPOINT_BEFORE_SHA=""
+_V2_PHASE4_CHECKPOINT_PREEXISTING_DIRTY=""
+_V2_SCOPE_TRIAGE_MAX_AGENT_CANDIDATES=30
 
 _v2_unique_nonblank_lines() {
     awk 'NF && !seen[$0]++'
@@ -1878,6 +2052,105 @@ _v2_append_untracked_file_diffs() {
     ) || true
 }
 
+_v2_numstat_artifact_path() {
+    local diff_file="$1"
+    if [[ "$diff_file" == *.patch ]]; then
+        printf '%s\n' "${diff_file%.patch}.numstat.tsv"
+    else
+        printf '%s.numstat.tsv\n' "$diff_file"
+    fi
+}
+
+_v2_estimate_numstat_artifact_path() {
+    local diff_file="$1"
+    if [[ "$diff_file" == *.patch ]]; then
+        printf '%s\n' "${diff_file%.patch}.estimate.numstat.tsv"
+    else
+        printf '%s.estimate.numstat.tsv\n' "$diff_file"
+    fi
+}
+
+_v2_append_untracked_numstat_entries() {
+    local numstat_file="$1" untracked_files="$2"
+    local numstat_path="$numstat_file"
+    local repo_root=""
+
+    [[ -n "$untracked_files" ]] || return 0
+    if [[ "$numstat_path" != /* ]]; then
+        numstat_path="$PWD/$numstat_file"
+    fi
+
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    (
+        cd "$repo_root" || exit 0
+        local path="" line_count=0
+        while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            [[ -f "$path" ]] || continue
+            line_count=$(awk 'END { print NR + 0 }' "$path" 2>/dev/null || echo "0")
+            printf '%s\t0\t%s\n' "$line_count" "$path" >> "$numstat_path"
+        done <<< "$untracked_files"
+    ) || true
+}
+
+_v2_write_numstat_snapshot() {
+    local before_sha="$1" numstat_file="$2" tracked_files="$3" untracked_files="$4"
+    local numstat_path="$numstat_file"
+    local repo_root=""
+    local -a scope_args=()
+    local path=""
+
+    if [[ "$numstat_path" != /* ]]; then
+        numstat_path="$PWD/$numstat_file"
+    fi
+    : > "$numstat_path"
+
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        scope_args+=("$path")
+    done <<< "$tracked_files"
+
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || pwd)
+    (
+        cd "$repo_root" || exit 0
+        if [[ ${#scope_args[@]} -gt 0 ]]; then
+            if [[ -n "$before_sha" ]]; then
+                git diff --numstat "$before_sha" -- "${scope_args[@]}" >> "$numstat_path" 2>/dev/null || true
+            else
+                git diff HEAD --numstat -- "${scope_args[@]}" >> "$numstat_path" 2>/dev/null || true
+            fi
+        fi
+    ) || true
+
+    _v2_append_untracked_numstat_entries "$numstat_path" "$untracked_files"
+}
+
+_v2_write_estimate_numstat_snapshot_for_scope() {
+    local before_sha="$1" diff_file="$2" scope_paths="$3" scope_source="$4" preexisting_dirty="${5:-}"
+    local estimate_numstat_file=""
+    local tracked_files=""
+    local untracked_files=""
+
+    estimate_numstat_file=$(_v2_estimate_numstat_artifact_path "$diff_file")
+    tracked_files=$(_v2_collect_changed_files_for_scope "$before_sha" "$scope_paths" "$scope_source" | _v2_unique_nonblank_lines)
+    untracked_files=$(_v2_collect_untracked_files_for_scope "$scope_paths" "$scope_source")
+
+    if [[ -n "$preexisting_dirty" ]]; then
+        tracked_files=$(_v2_subtract_preexisting_files "$tracked_files" "$preexisting_dirty" "$before_sha")
+        untracked_files=$(_v2_subtract_preexisting_files "$untracked_files" "$preexisting_dirty" "$before_sha")
+    fi
+
+    _v2_write_numstat_snapshot "$before_sha" "$estimate_numstat_file" "$tracked_files" "$untracked_files"
+}
+
+_v2_refresh_traditional_dev_proxy_artifacts() {
+    local task_file="$1" before_sha="$2" diff_file="$3" scope_paths="$4" scope_source="$5"
+    local preexisting_dirty="${6:-}" fix_cycles="${7:-0}"
+
+    _v2_write_estimate_numstat_snapshot_for_scope "$before_sha" "$diff_file" "$scope_paths" "$scope_source" "$preexisting_dirty"
+    persist_v2_traditional_dev_proxy_json "$task_file" "$fix_cycles" >/dev/null 2>&1 || true
+}
+
 _collect_blocking_untracked_files() {
     local task_file="$1" plan_file="${2:-}" before_sha="${3:-}"
     _v2_resolve_scope_paths "$task_file" "$plan_file" "$before_sha" || true
@@ -2008,6 +2281,8 @@ mirror_plan_into_task_file() {
 
 capture_diff_artifact() {
     local before_sha="$1" diff_file="$2" task_file="${3:-}" plan_file="${4:-}" pre_exec_dirty="${5:-}"
+    local scope_override_paths="${6:-}" scope_override_source="${7:-}"
+    local numstat_file=""
     local tracked_all_files=""
     local tracked_captured_files=""
 
@@ -2019,6 +2294,10 @@ capture_diff_artifact() {
     _V2_LAST_CAPTURE_UNTRACKED_FILES=""
 
     _v2_resolve_scope_paths "$task_file" "$plan_file" "$before_sha" || true
+    if [[ -n "$scope_override_paths" ]]; then
+        _V2_SCOPE_SOURCE="${scope_override_source:-$_V2_SCOPE_SOURCE}"
+        _V2_SCOPE_PATHS="$scope_override_paths"
+    fi
     _V2_LAST_CAPTURE_SCOPE_SOURCE="$_V2_SCOPE_SOURCE"
     _V2_LAST_CAPTURE_SCOPE_PATHS="$_V2_SCOPE_PATHS"
     _V2_LAST_CAPTURE_UNTRACKED_FILES=$(_v2_collect_untracked_files_for_scope "$_V2_SCOPE_PATHS" "$_V2_SCOPE_SOURCE")
@@ -2040,6 +2319,9 @@ capture_diff_artifact() {
     if _v2_scope_source_is_constrained "$_V2_SCOPE_SOURCE" && [[ -n "$_V2_LAST_CAPTURE_ALL_FILES" ]]; then
         _V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES=$(_v2_collect_out_of_scope_paths "$_V2_LAST_CAPTURE_ALL_FILES" "$_V2_SCOPE_PATHS" | _v2_unique_nonblank_lines)
     fi
+
+    numstat_file=$(_v2_numstat_artifact_path "$diff_file")
+    _v2_write_numstat_snapshot "$before_sha" "$numstat_file" "$tracked_captured_files" "$_V2_LAST_CAPTURE_UNTRACKED_FILES"
 }
 
 _v2_log_capture_scope_details() {
@@ -2066,6 +2348,657 @@ _v2_log_out_of_scope_capture_warning() {
         return 0
     fi
     return 1
+}
+
+_v2_scope_triage_state_path() {
+    local comp_dir="$1"
+    printf '%s\n' "${comp_dir}/execution-scope-triage.json"
+}
+
+_v2_scope_triage_raw_output_path() {
+    local comp_dir="$1"
+    printf '%s\n' "${comp_dir}/execution-scope-triage.raw.json"
+}
+
+_v2_scope_triage_quarantine_dir() {
+    local comp_dir="$1"
+    printf '%s\n' "${comp_dir}/scope-triage-quarantine"
+}
+
+_v2_repo_relative_path() {
+    local path="$1"
+    local repo_root=""
+    repo_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    if [[ -n "$repo_root" && "$path" == "$repo_root/"* ]]; then
+        printf '%s\n' "${path#$repo_root/}"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
+_v2_filter_out_paths_from_list() {
+    local source_paths="$1" paths_to_remove="$2"
+    local path
+    [[ -n "$source_paths" ]] || return 0
+    if [[ -z "$paths_to_remove" ]]; then
+        printf '%s\n' "$source_paths"
+        return 0
+    fi
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if ! printf '%s\n' "$paths_to_remove" | grep -qxF "$path"; then
+            printf '%s\n' "$path"
+        fi
+    done <<< "$source_paths" | _v2_unique_nonblank_lines
+}
+
+_v2_path_changed_in_commit_range() {
+    local before_sha="$1" path="$2"
+    [[ -n "$before_sha" ]] || return 1
+    git diff "$before_sha"..HEAD --name-only -- "$path" 2>/dev/null | grep -qxF "$path"
+}
+
+_v2_is_untracked_path() {
+    local path="$1"
+    git ls-files --others --exclude-standard -- "$path" 2>/dev/null | grep -qxF "$path"
+}
+
+_v2_is_pipeline_owned_phase4_noise() {
+    local path="$1"
+    case "$path" in
+        "docs/tasks/open/${SLUG}/task.md"|\
+        "docs/tasks/open/${SLUG}/competitive/"*|\
+        "docs/tasks/open/${SLUG}/logs/"*)
+            return 0
+            ;;
+    esac
+    return 1
+}
+
+_v2_collect_out_of_scope_untracked_paths_for_triage() {
+    local scope_paths="$1" scope_source="$2" pre_exec_dirty="${3:-}"
+    local current=""
+    _v2_scope_source_is_constrained "$scope_source" || return 0
+    current=$(git ls-files --others --exclude-standard 2>/dev/null | while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if _is_ignored_untracked_path "$path"; then
+            continue
+        fi
+        if _v2_path_in_scope "$path" "$scope_paths"; then
+            continue
+        fi
+        printf '%s\n' "$path"
+    done | _v2_unique_nonblank_lines)
+    _v2_subtract_preexisting_files "$current" "$pre_exec_dirty"
+}
+
+_v2_scope_triage_diff_for_path() {
+    local before_sha="$1" path="$2"
+    local tmp_file=""
+    if _v2_is_untracked_path "$path"; then
+        [[ -e "$path" ]] || return 0
+        diff -u /dev/null "$path" 2>/dev/null || true
+        return 0
+    fi
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/scope-triage-diff.XXXXXX") || return 1
+    if [[ -n "$before_sha" ]]; then
+        git diff "$before_sha"..HEAD -- "$path" > "$tmp_file" 2>/dev/null || true
+    else
+        : > "$tmp_file"
+    fi
+    if [[ ! -s "$tmp_file" ]]; then
+        git diff -- "$path" > "$tmp_file" 2>/dev/null || true
+        git diff --cached -- "$path" >> "$tmp_file" 2>/dev/null || true
+    fi
+    cat "$tmp_file"
+    rm -f "$tmp_file"
+}
+
+_v2_build_scope_triage_instruction() {
+    local task_file="$1" plan_file="$2" output_path="$3" scope_paths="$4" triage_candidates="$5" before_sha="$6"
+    local scope_block="None declared."
+    local triage_block=""
+    local path diff_text
+    if [[ -n "$scope_paths" ]]; then
+        scope_block=""
+        while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            scope_block+="- ${path}"$'\n'
+        done <<< "$scope_paths"
+    fi
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        diff_text=$(_v2_scope_triage_diff_for_path "$before_sha" "$path")
+        [[ -n "$diff_text" ]] || diff_text="(no diff available)"
+        triage_block+="### ${path}"$'\n'
+        triage_block+='```diff'$'\n'
+        triage_block+="${diff_text}"$'\n'
+        triage_block+='```'$'\n'$'\n'
+    done <<< "$triage_candidates"
+    printf '%s\n' "The task file is ${task_file}. Read the approved plan at ${plan_file}."
+    printf '%s\n' "Write the JSON classification array to ${output_path}."
+    printf '\n%s\n' "Declared plan scope from ## Files to Modify:"
+    printf '%s' "$scope_block"
+    printf '\n%s\n' "Out-of-scope files to classify:"
+    printf '%s' "$triage_block"
+}
+
+_v2_scope_triage_entries_as_tsv() {
+    local json_file="$1"
+    [[ -f "$json_file" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$json_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(1)
+if not isinstance(data, list):
+    raise SystemExit(1)
+seen = set()
+for item in data:
+    if not isinstance(item, dict):
+        raise SystemExit(1)
+    file_path = item.get("file")
+    classification = item.get("classification")
+    reasoning = item.get("reasoning")
+    if not all(isinstance(value, str) for value in (file_path, classification, reasoning)):
+        raise SystemExit(1)
+    if classification not in ("PLAN_GAP", "NOISE"):
+        raise SystemExit(1)
+    if file_path in seen:
+        print(f"scope-triage: duplicate entry for file: {file_path}", file=sys.stderr)
+        raise SystemExit(1)
+    seen.add(file_path)
+    reasoning = reasoning.replace("\t", " ").replace("\r", " ").replace("\n", " ").strip()
+    print("\t".join((file_path, classification, reasoning)))
+PY
+}
+
+_v2_scope_triage_records_cover_candidates() {
+    local triage_candidates="$1" triage_records="$2"
+    local path record_count=0
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        record_count=$(printf '%s\n' "$triage_records" | awk -F'\t' -v target="$path" '$1 == target { count++ } END { print count + 0 }')
+        [[ "$record_count" -eq 1 ]] || return 1
+    done <<< "$triage_candidates"
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if ! printf '%s\n' "$triage_candidates" | grep -qxF "${path%%$'\t'*}"; then
+            return 1
+        fi
+    done <<< "$triage_records"
+}
+
+_v2_restore_tracked_noise_path() {
+    local path="$1"
+    git reset -q HEAD -- "$path" >/dev/null 2>&1 || true
+    if git ls-files --error-unmatch "$path" >/dev/null 2>&1; then
+        git checkout -- "$path" >/dev/null 2>&1 || return 1
+    else
+        rm -f -- "$path" >/dev/null 2>&1 || return 1
+    fi
+}
+
+_v2_quarantine_untracked_noise_path() {
+    local comp_dir="$1" path="$2"
+    local quarantine_root=""
+    local destination=""
+    quarantine_root=$(_v2_scope_triage_quarantine_dir "$comp_dir")
+    destination="${quarantine_root}/${path}"
+    mkdir -p "$(dirname "$destination")" || return 1
+    mv -- "$path" "$destination" || return 1
+    printf '%s\n' "$destination"
+}
+
+_v2_ensure_scope_triage_log_section() {
+    local task_file="$1"
+    local count=0 insert_line="" tmp_file=""
+    count=$(grep -n -F -x '## Scope Triage Log' "$task_file" | wc -l | tr -d ' ')
+    if [[ "$count" -gt 1 ]]; then
+        echo "Expected exactly one section: ## Scope Triage Log" >&2
+        return 1
+    fi
+    if [[ "$count" -eq 1 ]]; then
+        return 0
+    fi
+    insert_line=$(grep -n -F -x '## Execution Log' "$task_file" | head -1 | cut -d: -f1)
+    tmp_file=$(same_dir_temp_file "$task_file") || return 1
+    if [[ -n "$insert_line" ]]; then
+        awk -v insert_line="$insert_line" '
+            NR == insert_line {
+                print "## Scope Triage Log"
+                print ""
+            }
+            { print }
+        ' "$task_file" > "$tmp_file" && mv "$tmp_file" "$task_file" || { rm -f "$tmp_file"; return 1; }
+    else
+        {
+            cat "$task_file"
+            printf '\n## Scope Triage Log\n'
+        } > "$tmp_file" && mv "$tmp_file" "$task_file" || { rm -f "$tmp_file"; return 1; }
+    fi
+}
+
+_v2_append_scope_triage_log_entry() {
+    local task_file="$1" phase_label="$2" result="$3" classifications="$4" actions="$5" failure_reason="${6:-}"
+    local section_line="" tmp_file=""
+    _v2_ensure_scope_triage_log_section "$task_file" || return 1
+    section_line=$(grep -n -F -x '## Scope Triage Log' "$task_file" | head -1 | cut -d: -f1)
+    [[ -n "$section_line" ]] || return 1
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/scope-triage-log.XXXXXX") || return 1
+    {
+        printf '### %s Scope Triage - %s\n' "$phase_label" "$(_iso_timestamp)"
+        printf -- '- Result: %s\n' "$result"
+        if [[ -n "$failure_reason" ]]; then
+            printf -- '- Failure: %s\n' "$failure_reason"
+        fi
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            local path="" classification="" reasoning="" action_line=""
+            path=$(printf '%s\n' "$line" | awk -F'\t' '{ print $1 }')
+            classification=$(printf '%s\n' "$line" | awk -F'\t' '{ print $2 }')
+            reasoning=$(printf '%s\n' "$line" | awk -F'\t' '{ print $3 }')
+            action_line=$(printf '%s\n' "$actions" | awk -F'\t' -v target="$path" '$1 == target { print $2 ": " $3; exit }')
+            if [[ -n "$action_line" ]]; then
+                printf -- '- %s: `%s` - %s [%s]\n' "$classification" "$path" "$reasoning" "$action_line"
+            else
+                printf -- '- %s: `%s` - %s\n' "$classification" "$path" "$reasoning"
+            fi
+        done <<< "$classifications"
+        printf '\n'
+    } > "$tmp_file"
+    _sed_i "${section_line}r ${tmp_file}" "$task_file"
+    rm -f "$tmp_file"
+}
+
+_v2_write_scope_triage_state() {
+    local state_file="$1" status="$2" before_sha="$3" plan_file="$4" diff_file="$5" preexisting_dirty="$6"
+    local raw_output_file="${7:-}" failure_reason="${8:-}" classifications="${9:-}" actions="${10:-}"
+    local tmp_file=""
+    command -v python3 >/dev/null 2>&1 || return 1
+    tmp_file=$(same_dir_temp_file "$state_file") || return 1
+    TRIAGE_SCOPE_SOURCE="${_V2_LAST_CAPTURE_SCOPE_SOURCE:-}" \
+    TRIAGE_SCOPE_PATHS="${_V2_LAST_CAPTURE_SCOPE_PATHS:-}" \
+    TRIAGE_ESTIMATE_SCOPE_PATHS="${_V2_LAST_ESTIMATE_SCOPE_PATHS:-}" \
+    TRIAGE_ALL_FILES="${_V2_LAST_CAPTURE_ALL_FILES:-}" \
+    TRIAGE_CAPTURED_FILES="${_V2_LAST_CAPTURED_FILES:-}" \
+    TRIAGE_OUT_OF_SCOPE_FILES="${_V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES:-}" \
+    TRIAGE_UNTRACKED_FILES="${_V2_LAST_CAPTURE_UNTRACKED_FILES:-}" \
+    TRIAGE_PREEXISTING_DIRTY="$preexisting_dirty" \
+    TRIAGE_CLASSIFICATIONS="$classifications" \
+    TRIAGE_ACTIONS="$actions" \
+    python3 - "$tmp_file" "$status" "$before_sha" "$plan_file" "$diff_file" "$raw_output_file" "$failure_reason" "$(_iso_timestamp)" <<'PY'
+import json
+import os
+import sys
+
+tmp_file, status, before_sha, plan_file, diff_file, raw_output_file, failure_reason, timestamp = sys.argv[1:9]
+
+def lines(name):
+    return [line for line in os.environ.get(name, "").splitlines() if line.strip()]
+
+def classification_records():
+    records = []
+    for line in lines("TRIAGE_CLASSIFICATIONS"):
+        file_path, classification, reasoning = (line.split("\t", 2) + ["", "", ""])[:3]
+        if file_path and classification:
+            records.append(
+                {
+                    "file": file_path,
+                    "classification": classification,
+                    "reasoning": reasoning,
+                }
+            )
+    return records
+
+def action_records():
+    records = []
+    for line in lines("TRIAGE_ACTIONS"):
+        file_path, action, details = (line.split("\t", 2) + ["", "", ""])[:3]
+        if file_path and action:
+            records.append(
+                {
+                    "file": file_path,
+                    "action": action,
+                    "details": details,
+                }
+            )
+    return records
+
+data = {
+    "status": status,
+    "timestamp": timestamp,
+    "before_sha": before_sha or None,
+    "plan_file": plan_file or None,
+    "diff_file": diff_file or None,
+    "raw_output_file": raw_output_file or None,
+    "failure_reason": failure_reason or None,
+    "scope_source": os.environ.get("TRIAGE_SCOPE_SOURCE") or None,
+    "scope_paths": lines("TRIAGE_SCOPE_PATHS"),
+    "estimate_scope_paths": lines("TRIAGE_ESTIMATE_SCOPE_PATHS"),
+    "all_files": lines("TRIAGE_ALL_FILES"),
+    "captured_files": lines("TRIAGE_CAPTURED_FILES"),
+    "out_of_scope_files": lines("TRIAGE_OUT_OF_SCOPE_FILES"),
+    "untracked_files": lines("TRIAGE_UNTRACKED_FILES"),
+    "preexisting_dirty": lines("TRIAGE_PREEXISTING_DIRTY"),
+    "classifications": classification_records(),
+    "actions": action_records(),
+}
+
+with open(tmp_file, "w", encoding="utf-8") as fh:
+    json.dump(data, fh, indent=2)
+    fh.write("\n")
+PY
+    mv "$tmp_file" "$state_file" || { rm -f "$tmp_file"; return 1; }
+}
+
+_v2_read_scope_triage_state_field() {
+    local state_file="$1" field="$2"
+    [[ -f "$state_file" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$state_file" "$field" <<'PY'
+import json
+import sys
+
+state_file, field = sys.argv[1:3]
+with open(state_file, encoding="utf-8") as fh:
+    data = json.load(fh)
+value = data.get(field)
+if isinstance(value, str):
+    print(value)
+elif value is None:
+    print("")
+else:
+    raise SystemExit(1)
+PY
+}
+
+_v2_read_scope_triage_state_lines() {
+    local state_file="$1" field="$2"
+    [[ -f "$state_file" ]] || return 1
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - "$state_file" "$field" <<'PY'
+import json
+import sys
+
+state_file, field = sys.argv[1:3]
+with open(state_file, encoding="utf-8") as fh:
+    data = json.load(fh)
+value = data.get(field, [])
+if not isinstance(value, list):
+    raise SystemExit(1)
+for item in value:
+    if isinstance(item, str) and item.strip():
+        print(item)
+PY
+}
+
+_v2_handle_phase4_checkpoint() {
+    local task_file="$1" baseline_diff="$2" scope_triage_state_file="$3" phase4_scope_plan_file="$4"
+    local scope_triage_state=""
+    local checkpoint_before_sha=""
+    local checkpoint_preexisting_dirty=""
+    local checkpoint_scope_source=""
+    local checkpoint_scope_paths=""
+    local checkpoint_estimate_scope_paths=""
+
+    _V2_PHASE4_CHECKPOINT_NEEDS_TRIAGE=false
+    _V2_PHASE4_CHECKPOINT_BEFORE_SHA=""
+    _V2_PHASE4_CHECKPOINT_PREEXISTING_DIRTY=""
+
+    [[ "${FORCE_RERUN:-false}" != "true" ]] || return 1
+    [[ -f "$baseline_diff" ]] || return 1
+
+    scope_triage_state=$(_v2_read_scope_triage_state_field "$scope_triage_state_file" "status" 2>/dev/null || true)
+    if [[ -z "$scope_triage_state" ]]; then
+        echo -e "${YELLOW}WARN: Phase 4 scope triage state missing or unreadable; resuming as pending from checkpoint${NC}"
+        log_execution "$task_file" "Phase 4: WARNING scope triage state missing or unreadable; resuming as pending from checkpoint" || true
+        scope_triage_state="pending"
+    fi
+
+    case "$scope_triage_state" in
+        pending)
+            echo -e "${BLUE}Phase 4: Executor skipped (checkpoint — scope triage pending)${NC}"
+            log_execution "$task_file" "Phase 4: Executor skipped (checkpoint — scope triage pending)"
+            checkpoint_before_sha=$(_v2_read_scope_triage_state_field "$scope_triage_state_file" "before_sha" 2>/dev/null || true)
+            checkpoint_preexisting_dirty=$(_v2_read_scope_triage_state_lines "$scope_triage_state_file" "preexisting_dirty" 2>/dev/null || true)
+            _V2_PHASE4_CHECKPOINT_BEFORE_SHA="$checkpoint_before_sha"
+            _V2_PHASE4_CHECKPOINT_PREEXISTING_DIRTY="$checkpoint_preexisting_dirty"
+            _V2_PHASE4_CHECKPOINT_NEEDS_TRIAGE=true
+            capture_diff_artifact \
+                "$checkpoint_before_sha" \
+                "$baseline_diff" \
+                "$task_file" \
+                "$phase4_scope_plan_file" \
+                "$checkpoint_preexisting_dirty"
+            ;;
+        skipped|completed|failed-open)
+            echo -e "${GREEN}Phase 4: Skipped (checkpoint — execution diff and scope triage exist)${NC}"
+            log_execution "$task_file" "Phase 4: Skipped (checkpoint)"
+            checkpoint_before_sha=$(_v2_read_scope_triage_state_field "$scope_triage_state_file" "before_sha" 2>/dev/null || true)
+            checkpoint_preexisting_dirty=$(_v2_read_scope_triage_state_lines "$scope_triage_state_file" "preexisting_dirty" 2>/dev/null || true)
+            checkpoint_scope_source=$(_v2_read_scope_triage_state_field "$scope_triage_state_file" "scope_source" 2>/dev/null || true)
+            checkpoint_scope_paths=$(_v2_read_scope_triage_state_lines "$scope_triage_state_file" "scope_paths" 2>/dev/null || true)
+            checkpoint_estimate_scope_paths=$(_v2_read_scope_triage_state_lines "$scope_triage_state_file" "estimate_scope_paths" 2>/dev/null || true)
+            if [[ -z "$checkpoint_estimate_scope_paths" ]]; then
+                checkpoint_estimate_scope_paths="$checkpoint_scope_paths"
+            fi
+            if [[ -n "$checkpoint_scope_source" || -n "$checkpoint_estimate_scope_paths" ]]; then
+                _v2_refresh_traditional_dev_proxy_artifacts \
+                    "$task_file" \
+                    "$checkpoint_before_sha" \
+                    "$baseline_diff" \
+                    "$checkpoint_estimate_scope_paths" \
+                    "$checkpoint_scope_source" \
+                    "$checkpoint_preexisting_dirty" \
+                    0
+            else
+                persist_v2_traditional_dev_proxy_json "$task_file" 0 >/dev/null 2>&1 || true
+            fi
+            _append_manifest_phase "phase-4" "execute" "$_phase_start" "$(_iso_timestamp)" "skipped" || true
+            ;;
+        *)
+            echo -e "${GREEN}Phase 4: Skipped (legacy checkpoint — execution-diff.patch exists)${NC}"
+            log_execution "$task_file" "Phase 4: Skipped (legacy checkpoint)"
+            persist_v2_traditional_dev_proxy_json "$task_file" 0 >/dev/null 2>&1 || true
+            _append_manifest_phase "phase-4" "execute" "$_phase_start" "$(_iso_timestamp)" "skipped" || true
+            ;;
+    esac
+
+    return 0
+}
+
+_v2_run_scope_triage() {
+    local task_file="$1" phase_label="$2" comp_dir="$3" before_sha="$4" plan_file="$5" diff_file="$6" preexisting_dirty="${7:-}" fix_cycles="${8:-0}"
+    local state_file="" raw_output_file="" task_file_rel="" scope_source="" scope_paths="" triage_candidates=""
+    local supplemental_untracked="" triage_output_path="" triage_instruction="" triage_records="" failure_reason=""
+    local classifications="" actions="" plan_gap_paths="" estimate_plan_gap_paths="" suppressed_noise_paths="" result="completed"
+    local estimate_scope_paths="" raw_classification=""
+    local triage_count=0 plan_gap_count=0 noise_count=0
+    local record="" path="" classification="" reasoning="" action_detail="" quarantine_path=""
+    local start_ts=""
+
+    state_file=$(_v2_scope_triage_state_path "$comp_dir")
+    raw_output_file=$(_v2_scope_triage_raw_output_path "$comp_dir")
+    task_file_rel=$(_v2_repo_relative_path "$task_file")
+    rm -f "$raw_output_file"
+    scope_source="${_V2_LAST_CAPTURE_SCOPE_SOURCE:-}"
+    scope_paths="${_V2_LAST_CAPTURE_SCOPE_PATHS:-}"
+    _V2_LAST_ESTIMATE_SCOPE_PATHS=""
+    supplemental_untracked=$(_v2_collect_out_of_scope_untracked_paths_for_triage "$scope_paths" "$scope_source" "$preexisting_dirty")
+    triage_candidates=$(printf '%s\n%s\n' "${_V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES:-}" "$supplemental_untracked" | _v2_unique_nonblank_lines)
+    _V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES="$triage_candidates"
+    _v2_write_scope_triage_state "$state_file" "pending" "$before_sha" "$plan_file" "$diff_file" "$preexisting_dirty" "$raw_output_file" || true
+
+    if [[ -z "$triage_candidates" ]]; then
+        _V2_LAST_ESTIMATE_SCOPE_PATHS="$scope_paths"
+        log_execution "$task_file" "${phase_label}: Scope triage skipped (no out-of-scope files)" || true
+        _v2_write_scope_triage_state "$state_file" "skipped" "$before_sha" "$plan_file" "$diff_file" "$preexisting_dirty" "$raw_output_file" || true
+        _v2_refresh_traditional_dev_proxy_artifacts \
+            "$task_file" \
+            "$before_sha" \
+            "$diff_file" \
+            "$scope_paths" \
+            "$scope_source" \
+            "$preexisting_dirty" \
+            "$fix_cycles"
+        return 0
+    fi
+
+    triage_count=$(printf '%s\n' "$triage_candidates" | awk 'NF { count++ } END { print count + 0 }')
+    start_ts=$(_iso_timestamp)
+    log_execution "$task_file" "${phase_label}: Scope triage started (${triage_count} file(s))" || true
+
+    if [[ "$triage_count" -gt "$_V2_SCOPE_TRIAGE_MAX_AGENT_CANDIDATES" ]]; then
+        failure_reason="Scope triage skipped agent call because candidate volume exceeded ${_V2_SCOPE_TRIAGE_MAX_AGENT_CANDIDATES} files"
+        echo -e "${YELLOW}WARN: ${phase_label} scope triage skipped agent call because candidate volume exceeded ${_V2_SCOPE_TRIAGE_MAX_AGENT_CANDIDATES} files${NC}"
+        log_execution "$task_file" "${phase_label}: WARNING scope triage skipped agent call because candidate volume exceeded ${_V2_SCOPE_TRIAGE_MAX_AGENT_CANDIDATES} files" || true
+    else
+        triage_output_path="$raw_output_file"
+        if [[ "$ENGINE_EVALUATOR" == "codex" ]]; then
+            triage_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
+        fi
+        triage_instruction=$(_v2_build_scope_triage_instruction "$task_file" "$plan_file" "$triage_output_path" "$scope_paths" "$triage_candidates" "$before_sha")
+
+        if ! prepare_agent_request "$ENGINE_EVALUATOR" "$scope_triage_prompt" "$triage_instruction"; then
+            failure_reason="Failed to assemble scope triage prompt"
+        else
+            local exit_triage=0
+            touch "${log_dir}/scope-triage.log"
+            run_agent "scope-triage" "$ENGINE_EVALUATOR" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+                "$raw_output_file" "${log_dir}/scope-triage.log" "$EVALUATE_TIMEOUT" "100" "Bash,WebFetch,WebSearch" || exit_triage=$?
+            if [[ "$exit_triage" -ne 0 ]]; then
+                if [[ "$exit_triage" -eq 124 ]]; then
+                    failure_reason="Scope triage timed out (${EVALUATE_TIMEOUT})"
+                else
+                    failure_reason="Scope triage failed (exit ${exit_triage})"
+                fi
+            fi
+        fi
+    fi
+
+    if [[ -z "$failure_reason" ]]; then
+        triage_records=$(_v2_scope_triage_entries_as_tsv "$raw_output_file") || failure_reason="Scope triage returned unparseable JSON"
+    fi
+    if [[ -z "$failure_reason" ]] && ! _v2_scope_triage_records_cover_candidates "$triage_candidates" "$triage_records"; then
+        failure_reason="Scope triage output did not classify the expected file set"
+    fi
+
+    if [[ -n "$failure_reason" ]]; then
+        result="failed-open"
+        while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            if [[ "$path" == "$task_file_rel" ]] || _v2_is_pipeline_owned_phase4_noise "$path"; then
+                classifications+="${path}"$'\t'"NOISE"$'\t'"Pipeline-owned task artifact; excluded from executor scope review."$'\n'
+                actions+="${path}"$'\t'"suppressed"$'\t'"Kept pipeline artifact in place during fail-open"$'\n'
+                suppressed_noise_paths+="${path}"$'\n'
+                noise_count=$((noise_count + 1))
+            else
+                classifications+="${path}"$'\t'"PLAN_GAP"$'\t'"${failure_reason}. Kept by default."$'\n'
+                actions+="${path}"$'\t'"kept"$'\t'"Fail-open default to PLAN_GAP"$'\n'
+                plan_gap_paths+="${path}"$'\n'
+                estimate_plan_gap_paths+="${path}"$'\n'
+                plan_gap_count=$((plan_gap_count + 1))
+            fi
+        done <<< "$triage_candidates"
+        log_execution "$task_file" "${phase_label}: Scope triage failed open (${failure_reason})" || true
+    else
+        while IFS= read -r path; do
+            [[ -n "$path" ]] || continue
+            record=$(printf '%s\n' "$triage_records" | awk -F'\t' -v target="$path" '$1 == target { print; exit }')
+            classification=$(printf '%s\n' "$record" | awk -F'\t' '{ print $2 }')
+            reasoning=$(printf '%s\n' "$record" | awk -F'\t' '{ print $3 }')
+            action_detail=""
+            raw_classification="$classification"
+
+            if [[ "$path" == "$task_file_rel" ]] || _v2_is_pipeline_owned_phase4_noise "$path"; then
+                classification="NOISE"
+                reasoning="Pipeline-owned task artifact; excluded from executor scope review."
+                action_detail="suppressed: kept pipeline artifact in place"
+                suppressed_noise_paths+="${path}"$'\n'
+                noise_count=$((noise_count + 1))
+            elif [[ "$raw_classification" == "NOISE" ]]; then
+                if _v2_is_untracked_path "$path"; then
+                    quarantine_path=$(_v2_quarantine_untracked_noise_path "$comp_dir" "$path") || quarantine_path=""
+                    if [[ -n "$quarantine_path" ]]; then
+                        action_detail="quarantined: ${quarantine_path}"
+                        noise_count=$((noise_count + 1))
+                    else
+                        classification="PLAN_GAP"
+                        reasoning="Failed to quarantine untracked noise safely; kept by default."
+                    fi
+                elif [[ -n "$before_sha" ]] && _v2_path_changed_in_commit_range "$before_sha" "$path"; then
+                    classification="PLAN_GAP"
+                    reasoning="Committed change cannot be auto-reverted safely without rewriting history; kept by default."
+                elif _v2_restore_tracked_noise_path "$path"; then
+                    action_detail="reverted: restored path to HEAD"
+                    noise_count=$((noise_count + 1))
+                else
+                    classification="PLAN_GAP"
+                    reasoning="Failed to revert tracked noise safely; kept by default."
+                fi
+            elif [[ "$raw_classification" == "PLAN_GAP" ]]; then
+                estimate_plan_gap_paths+="${path}"$'\n'
+            fi
+
+            if [[ "$classification" == "PLAN_GAP" ]]; then
+                plan_gap_paths+="${path}"$'\n'
+                plan_gap_count=$((plan_gap_count + 1))
+                [[ -n "$action_detail" ]] || action_detail="kept: added to effective scope"
+            fi
+
+            classifications+="${path}"$'\t'"${classification}"$'\t'"${reasoning}"$'\n'
+            actions+="${path}"$'\t'"${action_detail%%:*}"$'\t'"${action_detail#*: }"$'\n'
+        done <<< "$triage_candidates"
+
+        log_execution "$task_file" "${phase_label}: Scope triage completed (PLAN_GAP=${plan_gap_count}, NOISE=${noise_count})" || true
+    fi
+
+    estimate_scope_paths=$(printf '%s\n%s\n' "$scope_paths" "$estimate_plan_gap_paths" | _v2_unique_nonblank_lines)
+    _V2_LAST_ESTIMATE_SCOPE_PATHS="$estimate_scope_paths"
+
+    capture_diff_artifact \
+        "$before_sha" \
+        "$diff_file" \
+        "$task_file" \
+        "$plan_file" \
+        "$preexisting_dirty" \
+        "$(printf '%s\n%s\n' "$scope_paths" "$plan_gap_paths" | _v2_unique_nonblank_lines)" \
+        "$scope_source"
+
+    if [[ -n "$suppressed_noise_paths" ]]; then
+        _V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES=$(_v2_filter_out_paths_from_list "${_V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES:-}" "$suppressed_noise_paths")
+    fi
+
+    if [[ ! -s "$diff_file" ]]; then
+        echo -e "${YELLOW}WARN: ${phase_label} scope triage left an empty execution diff: ${diff_file}${NC}"
+        log_execution "$task_file" "${phase_label}: Scope triage left the execution diff empty" || true
+    else
+        log_execution "$task_file" "${phase_label}: Scope triage regenerated execution diff at ${diff_file}" || true
+    fi
+
+    _v2_refresh_traditional_dev_proxy_artifacts \
+        "$task_file" \
+        "$before_sha" \
+        "$diff_file" \
+        "$estimate_scope_paths" \
+        "$scope_source" \
+        "$preexisting_dirty" \
+        "$fix_cycles"
+
+    _v2_append_scope_triage_log_entry "$task_file" "$phase_label" "$result" "$classifications" "$actions" "$failure_reason" || true
+    # NOTE: execution-scope-triage.raw.json preserves the agent's unmodified output.
+    # This canonical artifact reflects shell-side overrides (task file forced to NOISE,
+    # pipeline-owned files forced to NOISE). The two files may disagree on
+    # individual classifications; this file is authoritative.
+    _v2_write_scope_triage_state "$state_file" "$result" "$before_sha" "$plan_file" "$diff_file" "$preexisting_dirty" "$raw_output_file" "$failure_reason" "$classifications" "$actions" || true
+    return 0
 }
 
 _v2_select_phase7_scope_plan_file() {
@@ -2146,6 +3079,7 @@ _phase7_resume_gate_reason() {
 lauren_loop_competitive() {
     local slug="$1" goal="$2"
     SLUG="$slug"
+    _PIPELINE_START_TS=$(date +%s)
     _apply_effective_strict_mode "$slug" "$goal"
 
     # Directory setup
@@ -2180,7 +3114,7 @@ lauren_loop_competitive() {
     fi
     _ensure_cost_csv_header "${TASK_LOG_DIR}/cost.csv"
     _merge_cost_csvs || true
-    _init_run_manifest || true
+    [[ ! -f "${comp_dir}/run-manifest.json" ]] && _init_run_manifest || true
     _PIPELINE_PRE_SHA=$(git rev-parse HEAD 2>/dev/null || true)
 
     # Task file creation (if not resuming)
@@ -2219,9 +3153,19 @@ TASKEOF
         echo -e "${YELLOW}Task is already in needs verification: ${task_file}${NC}"
         echo -e "${YELLOW}Skipping competitive execution. Use verify/closeout flow instead of reseeding a new plan.${NC}"
         log_execution "$task_file" "Competitive launch skipped: canonical task already in needs verification; preserve verification state instead of reseeding plan work"
+        _update_run_manifest_state "phase-0" || true
         _append_manifest_phase "phase-0" "preflight" "$(_iso_timestamp)" "$(_iso_timestamp)" "skipped" "needs verification" || true
         _finalize_run_manifest "needs verification" 0 || true
         return 0
+    fi
+
+    if _should_enforce_task_file_content_gate "$DRY_RUN" "false" "${_LAUREN_LOOP_RESUME_HINT:-0}"; then
+        _validate_task_file_content "$task_file" || return 1
+    fi
+
+    if ! _preflight_dependency_check "$task_file" "$FORCE_RERUN"; then
+        log_execution "$task_file" "Preflight: dependency check failed — aborting"
+        return 1
     fi
 
     if [[ "$LAUREN_LOOP_AUTO_STRICT" == "true" ]]; then
@@ -2237,6 +3181,7 @@ TASKEOF
     local critic_prompt="$SCRIPT_DIR/prompts/critic.md"
     local reviser_prompt="$SCRIPT_DIR/prompts/reviser.md"
     local executor_prompt="$SCRIPT_DIR/prompts/executor.md"
+    local scope_triage_prompt="$SCRIPT_DIR/prompts/scope-triage.md"
     # Reviewer A reuses the v1 reviewer prompt (no -a suffix — intentional)
     local reviewer_a_prompt="$SCRIPT_DIR/prompts/reviewer.md"
     # Reviewer B has its own prompt; naming asymmetry with reviewer.md is intentional (v1 reuse)
@@ -2249,7 +3194,7 @@ TASKEOF
     local missing=0
     for pf in "$explore_prompt" "$planner_a_prompt" "$planner_b_prompt" \
               "$evaluator_prompt" "$critic_prompt" "$reviser_prompt" \
-              "$executor_prompt" "$reviewer_a_prompt" "$reviewer_b_prompt" \
+              "$executor_prompt" "$scope_triage_prompt" "$reviewer_a_prompt" "$reviewer_b_prompt" \
               "$review_evaluator_prompt" "$fix_plan_author_prompt" "$fix_executor_prompt"; do
         if [[ ! -f "$pf" ]]; then
             echo -e "${RED}Missing prompt: $pf${NC}" >&2
@@ -2265,6 +3210,7 @@ TASKEOF
         local review_verdict="$1"
         local fix_cycles="$2"
         local handoff_file="${comp_dir}/human-review-handoff.md"
+        local synthesis_file="${comp_dir}/review-synthesis.md"
         local tmp_file
         tmp_file=$(mktemp "${TMPDIR:-/tmp}/human-review-handoff.XXXXXX")
 
@@ -2279,25 +3225,34 @@ TASKEOF
 
             local wrote_findings=false
             local section body
-            for section in "## Critical Findings" "## Major Findings" "## Minor Findings" "## Nit Findings"; do
-                body=$(section_body "${comp_dir}/review-synthesis.md" "$section" 2>/dev/null || true)
-                body=$(printf '%s\n' "$body" | sed '/^[[:space:]]*$/d')
-                if [[ -n "$body" && "$body" != "None." ]]; then
-                    echo
-                    echo "$section"
-                    printf '%s\n' "$body"
-                    wrote_findings=true
-                fi
-            done
+            if [[ -f "$synthesis_file" ]]; then
+                for section in "## Critical Findings" "## Major Findings" "## Minor Findings" "## Nit Findings"; do
+                    body=$(section_body "$synthesis_file" "$section" 2>/dev/null || true)
+                    body=$(printf '%s\n' "$body" | sed '/^[[:space:]]*$/d')
+                    if [[ -n "$body" && "$body" != "None." ]]; then
+                        echo
+                        echo "$section"
+                        printf '%s\n' "$body"
+                        wrote_findings=true
+                    fi
+                done
+            fi
 
-            if [[ "$wrote_findings" == false ]]; then
+            if [[ ! -f "$synthesis_file" ]]; then
+                echo
+                echo "review-synthesis.md is missing, so unresolved findings could not be extracted."
+            elif [[ "$wrote_findings" == false ]]; then
                 echo
                 echo "No unresolved findings were extracted from review-synthesis.md."
             fi
 
             echo
             echo "## Human Reviewer Focus"
-            echo "- Review ${comp_dir}/review-synthesis.md for the final synthesized findings and verdict."
+            if [[ -f "$synthesis_file" ]]; then
+                echo "- Review ${synthesis_file} for the final synthesized findings and verdict."
+            else
+                echo "- review-synthesis.md was not produced for this halt; use the reviewer logs and raw review artifacts instead."
+            fi
             echo "- Review ${comp_dir}/fix-plan.md and ${comp_dir}/fix-execution.md to see what the last automated fix cycle attempted."
             echo "- Review ${latest_fix_diff:-${comp_dir}/execution-diff.patch} for the latest code changes under review."
             echo "- Confirm whether the remaining findings are valid fixes, false positives, or need a narrower follow-up task."
@@ -2356,6 +3311,50 @@ TASKEOF
         fi
     }
 
+    _append_review_blinding_metadata() {
+        local reviewer_a_engine="$1"
+        local reviewer_b_engine="$2"
+
+        blinding_message="Phase 5: Review mapping: $(cat "${comp_dir}/.review-mapping" 2>/dev/null || echo 'missing')"
+        _atomic_append "${comp_dir}/blinding-metadata.log" "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $blinding_message"
+        blinding_message="Review engine mapping: reviewer-a=${reviewer_a_engine}, reviewer-b=${reviewer_b_engine}"
+        _atomic_append "${comp_dir}/blinding-metadata.log" "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $blinding_message"
+    }
+
+    _describe_artifact_state() {
+        local artifact_path="$1"
+
+        if [[ -f "$artifact_path" ]]; then
+            if [[ -s "$artifact_path" ]]; then
+                printf 'exists (%s bytes)\n' "$(wc -c < "$artifact_path" | tr -d ' ')"
+            else
+                printf 'exists (empty)\n'
+            fi
+        else
+            printf 'missing\n'
+        fi
+    }
+
+    _capture_reviewer_a_raw_artifact() {
+        local source_task_file="$1"
+        local output_file="$2"
+
+        rm -f "$output_file"
+        if ! extract_markdown_section_to_file "$source_task_file" "## Review Findings" "$output_file"; then
+            printf "WARN: reviewer-a raw artifact extraction failed: missing or empty '## Review Findings' section in %s\n" "$source_task_file" >&2
+            return 1
+        fi
+
+        clear_markdown_section "$source_task_file" "## Review Findings"
+        _validate_agent_output_for_role "reviewer-a" "$output_file"
+    }
+
+    _review_phase_codex_retry_already_attempted() {
+        local role_log="$1"
+        [[ -f "$role_log" ]] || return 1
+        grep -Eqi 'WARN: Codex (capacity|stream) failure .*retrying' "$role_log"
+    }
+
     _mark_fix_execution_handoff() {
         local handoff_file="${comp_dir}/human-review-handoff.md"
         local fix_execution_file="${comp_dir}/fix-execution.md"
@@ -2405,6 +3404,8 @@ EOF
         if [[ -n "$recovery_hint" ]]; then
             log_execution "$task_file" "  recovery hint: ${recovery_hint}"
         fi
+        _finalize_run_manifest "blocked" "${fix_cycle:-0}" || true
+        finalize_v2_task_metadata "$task_file" "$phase_status" "blocked" "${fix_cycle:-0}" || true
         return 1
     }
 
@@ -2486,6 +3487,7 @@ EOF
     local _phase_start=""
     echo -e "${BLUE}=== Phase 1: Explore ===${NC}"
     _phase_start=$(_iso_timestamp)
+    _update_run_manifest_state "phase-1" || true
     if [[ "$FORCE_RERUN" != "true" ]] && [[ -s "${comp_dir}/exploration-summary.md" ]]; then
         echo -e "${GREEN}Phase 1: Skipped (checkpoint — exploration-summary.md exists)${NC}"
         log_execution "$task_file" "Phase 1: Skipped (checkpoint)"
@@ -2539,6 +3541,7 @@ Read the task file at ${task_file} for context. Explore the codebase to understa
     local plan_b_valid=false
     echo -e "${BLUE}=== Phase 2: Parallel Planning ===${NC}"
     _phase_start=$(_iso_timestamp)
+    _update_run_manifest_state "phase-2" || true
     if [[ "$FORCE_RERUN" != "true" ]] && { [[ -s "${comp_dir}/plan-a.md" ]] || [[ -s "${comp_dir}/plan-b.md" ]]; }; then
         phase2_skipped=true
         echo -e "${GREEN}Phase 2: Skipped (checkpoint — plan artifact(s) exist)${NC}"
@@ -2552,6 +3555,7 @@ Read the task file at ${task_file} for context. Explore the codebase to understa
 
 Read the exploration summary at ${comp_dir}/exploration-summary.md and the task file at ${task_file}.
 Write a detailed implementation plan to ${comp_dir}/plan-a.md."
+        local plan_a_fallback_instruction="$plan_a_instruction"
         prepare_agent_request "$ENGINE_PLANNER_A" "$planner_a_prompt" "$plan_a_instruction" || {
             _fail_phase "planning" "Failed to assemble planner-a prompt" "Check agent log at ${log_dir}/planner-a.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
         }
@@ -2566,6 +3570,10 @@ Write a detailed implementation plan to ${comp_dir}/plan-a.md."
 
 Read the exploration summary at ${comp_dir}/exploration-summary.md and the task file at ${task_file}.
 Write a detailed implementation plan to ${plan_b_output_path}."
+        local plan_b_fallback_instruction="You are Planner B (Claude). Goal: ${goal}
+
+Read the exploration summary at ${comp_dir}/exploration-summary.md and the task file at ${task_file}.
+Write a detailed implementation plan to ${comp_dir}/plan-b.md."
         prepare_agent_request "$ENGINE_PLANNER_B" "$planner_b_prompt" "$plan_b_instruction" || {
             _fail_phase "planning" "Failed to assemble planner-b prompt" "Check agent log at ${log_dir}/planner-b.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
         }
@@ -2701,18 +3709,94 @@ Write a detailed implementation plan to ${plan_b_output_path}."
             return 0
         fi
 
-        echo -e "${YELLOW}Only one plan produced — evaluator skipped, surviving plan seeds revised-plan.md${NC}"
-        if [[ ! -s "${comp_dir}/revised-plan.md" ]] || [[ "$FORCE_RERUN" == "true" ]]; then
-            cp "$surviving_plan" "${comp_dir}/revised-plan.md"
-            log_execution "$task_file" "Phase 2: Single plan ($(basename "$surviving_plan")) seeded ${comp_dir}/revised-plan.md"
+        local fallback_validator_role="" fallback_run_role="" fallback_prompt_file="" fallback_instruction=""
+        local fallback_output="" fallback_log="" fallback_prompt_body="" fallback_sysprompt=""
+        if [[ "$plan_a_valid" != true ]]; then
+            fallback_validator_role="planner-a"
+            fallback_run_role="planner-a-claude-fallback"
+            fallback_prompt_file="$planner_a_prompt"
+            fallback_instruction="$plan_a_fallback_instruction"
+            fallback_output="${comp_dir}/plan-a.md"
+            fallback_log="${log_dir}/planner-a-claude-fallback.log"
         else
-            echo -e "${BLUE}Preserving existing revised-plan.md checkpoint during single-plan resume${NC}"
-            log_execution "$task_file" "Phase 2: Single plan ($(basename "$surviving_plan")) preserved existing ${comp_dir}/revised-plan.md checkpoint"
+            fallback_validator_role="planner-b"
+            fallback_run_role="planner-b-claude-fallback"
+            fallback_prompt_file="$planner_b_prompt"
+            fallback_instruction="$plan_b_fallback_instruction"
+            fallback_output="${comp_dir}/plan-b.md"
+            fallback_log="${log_dir}/planner-b-claude-fallback.log"
         fi
-        skip_evaluator=true
+
+        echo -e "${YELLOW}One planner failed — falling back to Claude for ${fallback_validator_role} (competitive guarantee)${NC}"
+        log_execution "$task_file" "Phase 2: ${fallback_validator_role} failed, launching Claude fallback with original persona"
+
+        local fallback_exit=0
+        local fallback_prepared=false
+        local fallback_start_ts fallback_duration
+        if prepare_agent_request "claude" "$fallback_prompt_file" "$fallback_instruction"; then
+            fallback_prepared=true
+            fallback_prompt_body="$AGENT_PROMPT_BODY"
+            fallback_sysprompt="$AGENT_SYSTEM_PROMPT"
+            fallback_start_ts=$(date +%s)
+            # Fallback gets its own full PLANNER_TIMEOUT — not a remainder from the failed planner.
+            run_agent "$fallback_run_role" "claude" "$fallback_prompt_body" "$fallback_sysprompt" \
+                "$fallback_output" "$fallback_log" "$PLANNER_TIMEOUT" "100"; fallback_exit=$?
+            fallback_duration=$(( $(date +%s) - fallback_start_ts ))
+        else
+            log_execution "$task_file" "Phase 2: Failed to assemble Claude fallback prompt for ${fallback_validator_role}"
+        fi
+        _merge_cost_csvs || true
+
+        local fallback_validation_err=""
+        local _fb_validation_ok=false
+        if [[ "$fallback_prepared" == true ]] && [[ "$fallback_exit" -eq 0 ]]; then
+            if fallback_validation_err=$(_validate_agent_output_for_role "$fallback_validator_role" "$fallback_output" 2>&1 1>/dev/null); then
+                _fb_validation_ok=true
+            fi
+        fi
+        if [[ "$_fb_validation_ok" == true ]]; then
+            echo -e "${GREEN}Claude fallback for ${fallback_validator_role} succeeded — both plans available${NC}"
+            log_execution "$task_file" "Phase 2: Claude fallback for ${fallback_validator_role} succeeded"
+            if [[ "$fallback_validator_role" == "planner-a" ]]; then
+                plan_a_valid=true
+            else
+                plan_b_valid=true
+            fi
+        else
+            echo -e "${YELLOW}Claude fallback for ${fallback_validator_role} also failed — single plan, evaluator skipped${NC}"
+            local _fb_output_state="missing"
+            if [[ -f "$fallback_output" ]]; then
+                if [[ -s "$fallback_output" ]]; then
+                    _fb_output_state="exists ($(wc -c < "$fallback_output") bytes)"
+                else
+                    _fb_output_state="exists (empty)"
+                fi
+            fi
+            log_execution "$task_file" "Phase 2: Claude fallback for ${fallback_validator_role} failed (prepared=${fallback_prepared}, exit=${fallback_exit}, duration=${fallback_duration:-?}s, output=${_fb_output_state})"
+            if [[ -n "${fallback_validation_err:-}" ]]; then
+                log_execution "$task_file" "Phase 2: Fallback validation failure: ${fallback_validation_err}"
+            fi
+            if [[ -f "$fallback_log" ]] && [[ -s "$fallback_log" ]]; then
+                local _fb_log_tail
+                _fb_log_tail=$(tail -20 "$fallback_log" 2>/dev/null || true)
+                if [[ -n "$_fb_log_tail" ]]; then
+                    log_execution "$task_file" "Phase 2: Fallback agent log tail (last 20 lines):"
+                    _log_diagnostic_lines "$task_file" "$_fb_log_tail"
+                fi
+            fi
+            if [[ ! -s "${comp_dir}/revised-plan.md" ]] || [[ "$FORCE_RERUN" == "true" ]]; then
+                cp "$surviving_plan" "${comp_dir}/revised-plan.md"
+                log_execution "$task_file" "Phase 2: Single plan ($(basename "$surviving_plan")) seeded ${comp_dir}/revised-plan.md"
+            else
+                echo -e "${BLUE}Preserving existing revised-plan.md checkpoint during single-plan resume${NC}"
+                log_execution "$task_file" "Phase 2: Single plan ($(basename "$surviving_plan")) preserved existing ${comp_dir}/revised-plan.md checkpoint"
+            fi
+            skip_evaluator=true
+        fi
     fi
 
     _phase_start=$(_iso_timestamp)
+    _update_run_manifest_state "phase-3" || true
     if [[ "$FORCE_RERUN" != "true" ]] && [[ -s "${comp_dir}/revised-plan.md" ]] && \
        [[ -s "${comp_dir}/plan-critique.md" ]] && \
        [[ "$(_parse_contract "${comp_dir}/plan-critique.md" "verdict")" == "EXECUTE" ]]; then
@@ -2843,14 +3927,20 @@ Do NOT modify the task file."
     log_execution "$task_file" "Phase 3: Current Plan mirrored from ${comp_dir}/revised-plan.md for review compatibility"
 
     local baseline_diff="${comp_dir}/execution-diff.patch"
+    local scope_triage_state_file="${comp_dir}/execution-scope-triage.json"
     local latest_fix_diff=""
+    local phase4_before_sha=""
+    local phase4_pre_exec_dirty=""
+    local phase4_scope_plan_file="${comp_dir}/revised-plan.md"
+    local phase4_needs_triage=false
 
     echo -e "${BLUE}=== Phase 4: Execute ===${NC}"
     _phase_start=$(_iso_timestamp)
-    if [[ "$FORCE_RERUN" != "true" ]] && [[ -s "${comp_dir}/execution-diff.patch" ]]; then
-        echo -e "${GREEN}Phase 4: Skipped (checkpoint — execution-diff.patch exists)${NC}"
-        log_execution "$task_file" "Phase 4: Skipped (checkpoint)"
-        _append_manifest_phase "phase-4" "execute" "$_phase_start" "$(_iso_timestamp)" "skipped" || true
+    _update_run_manifest_state "phase-4" || true
+    if _v2_handle_phase4_checkpoint "$task_file" "$baseline_diff" "$scope_triage_state_file" "$phase4_scope_plan_file"; then
+        phase4_before_sha="${_V2_PHASE4_CHECKPOINT_BEFORE_SHA:-}"
+        phase4_pre_exec_dirty="${_V2_PHASE4_CHECKPOINT_PREEXISTING_DIRTY:-}"
+        phase4_needs_triage="${_V2_PHASE4_CHECKPOINT_NEEDS_TRIAGE:-false}"
     else
         set_task_status "$task_file" "in progress"
         log_execution "$task_file" "Phase 4: Execution started"
@@ -2861,20 +3951,64 @@ Do NOT modify the task file."
         pre_exec_untracked=$(_collect_blocking_untracked_files "$task_file" "${comp_dir}/revised-plan.md" "$pre_exec_sha")
         local pre_exec_dirty=""
         pre_exec_dirty=$(_v2_snapshot_dirty_files)
+        if ! _normalize_verify_tags_with_timeout_in_file "${comp_dir}/revised-plan.md" "V2 phase 4 plan"; then
+            _fail_phase "executing" "Failed to wrap repo-standard pytest verification commands in revised-plan.md" "Check ${comp_dir}/revised-plan.md for verify tag formatting drift, then retry"
+            return 1
+        fi
+        if ! _validate_verify_commands_in_file "${comp_dir}/revised-plan.md" "V2 phase 4 plan"; then
+            _fail_phase "executing" "Invalid verify commands found in revised-plan.md" "Check ${comp_dir}/revised-plan.md for bad verify commands, then retry"
+            return 1
+        fi
         local exec_instruction="You are the Executor. Read the approved plan at ${comp_dir}/revised-plan.md and the task file at ${task_file}.
 Implement the plan step by step. Write execution progress to ${comp_dir}/execution-log.md.
-Work in small, verifiable steps and stop with BLOCKED if the plan cannot be completed safely."
+Work in small, verifiable steps and stop with BLOCKED if the plan cannot be completed safely.
+If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_message) - <command>' and stop immediately."
         prepare_agent_request "$ENGINE_EXECUTOR" "$executor_prompt" "$exec_instruction" || {
             _fail_phase "executing" "Failed to assemble executor prompt" "Check agent log at ${log_dir}/executor.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
         }
+        if [[ "$ENGINE_EXECUTOR" == "claude" ]]; then
+            AGENT_SYSTEM_PROMPT=$(printf '%s' "$AGENT_SYSTEM_PROMPT" | _normalize_executor_prompt_timeout_content "V2 phase 4 executor prompt") || {
+                _fail_phase "executing" "Executor prompt timeout normalization drifted" "Check ${executor_prompt} for repo-standard pytest command changes before retrying"
+                return 1
+            }
+        else
+            AGENT_PROMPT_BODY=$(printf '%s' "$AGENT_PROMPT_BODY" | _normalize_executor_prompt_timeout_content "V2 phase 4 executor prompt") || {
+                _fail_phase "executing" "Executor prompt timeout normalization drifted" "Check ${executor_prompt} for repo-standard pytest command changes before retrying"
+                return 1
+            }
+        fi
+
+        # Create isolated worktree for execution
+        _v2_create_execution_worktree || {
+            _fail_phase "executing" "Failed to create execution worktree" "Check disk space and git state"
+            return 1
+        }
+        cd "$_V2_EXEC_WORKTREE_PATH"
 
         local exit_exec=0
+        local pre_exec_timeout_blocks=0
+        local post_exec_timeout_blocks=0
+        local exec_timeout_block_line=""
+        pre_exec_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/execution-log.md")
         touch "${log_dir}/executor.log"
         start_agent_monitor "${log_dir}/executor.log" "$task_file"
         run_agent "executor" "$ENGINE_EXECUTOR" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
             "/dev/null" "${log_dir}/executor.log" \
             "$EXECUTOR_TIMEOUT" "300" "WebFetch,WebSearch" || exit_exec=$?
         stop_agent_monitor
+        post_exec_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/execution-log.md")
+        if [[ "${post_exec_timeout_blocks:-0}" -gt "${pre_exec_timeout_blocks:-0}" ]]; then
+            exec_timeout_block_line=$(_latest_timeout_block_line "${comp_dir}/execution-log.md" || true)
+            echo -e "${YELLOW}$(_verification_timeout_message)${NC}"
+            log_execution "$task_file" "Phase 4: $(_verification_timeout_message)"
+            set_task_status "$task_file" "blocked"
+            if [[ -n "$exec_timeout_block_line" ]]; then
+                echo "  Reason: $exec_timeout_block_line"
+            fi
+            _print_cost_summary
+            _v2_cleanup_execution_worktree || true
+            return 1
+        fi
 
         if [[ "$exit_exec" -ne 0 ]]; then
             if [[ "$exit_exec" -eq 124 ]]; then
@@ -2886,17 +4020,22 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
             fi
             set_task_status "$task_file" "blocked"
             _print_cost_summary
+            _v2_cleanup_execution_worktree || true
             return 1
         fi
         set_task_status "$task_file" "in progress"
         log_execution "$task_file" "Phase 4: Execution completed"
 
+        # Capture diff inside the worktree (isolated from other pipelines)
+        phase4_before_sha="$pre_exec_sha"
+        phase4_pre_exec_dirty="$pre_exec_dirty"
         capture_diff_artifact "$pre_exec_sha" "$baseline_diff" "$task_file" "${comp_dir}/revised-plan.md" "$pre_exec_dirty"
         if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null && [[ -z "${_V2_LAST_CAPTURE_UNTRACKED_FILES:-}" ]]; then
             echo -e "${RED}Executor produced no code changes${NC}"
             set_task_status "$task_file" "blocked"
             log_execution "$task_file" "Phase 4: Executor produced no code changes"
             _print_cost_summary
+            _v2_cleanup_execution_worktree || true
             return 1
         fi
         _v2_log_capture_scope_details "$task_file" "Phase 4"
@@ -2907,27 +4046,48 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
             log_execution "$task_file" "Phase 4: Execution diff captured at ${baseline_diff}"
         fi
 
-        _block_on_untracked_files "$task_file" "Phase 4" "${comp_dir}/revised-plan.md" "$pre_exec_sha" "$pre_exec_untracked" || return 1
+        _block_on_untracked_files "$task_file" "Phase 4" "${comp_dir}/revised-plan.md" "$pre_exec_sha" "$pre_exec_untracked" || {
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+
+        # Merge worktree changes back to the main branch
+        cd "$SCRIPT_DIR"
+        _v2_merge_execution_worktree || {
+            _fail_phase "executing" "Failed to merge execution worktree" "Check for merge conflicts; resolve manually then retry"
+            return 1
+        }
+
+        phase4_needs_triage=true
+    fi
+
+    if [[ "$phase4_needs_triage" == true ]]; then
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "$phase4_before_sha" "$phase4_scope_plan_file" "$baseline_diff" "$phase4_pre_exec_dirty" 0
         _append_manifest_phase "phase-4" "execute" "$_phase_start" "$(_iso_timestamp)" "completed" || true
     fi
 
-    if _v2_log_out_of_scope_capture_warning "$task_file" "Phase 4"; then
-        :
-    elif [[ -n "${_V2_LAST_CAPTURE_SCOPE_SOURCE:-}" ]]; then
-        if [[ "${_V2_LAST_CAPTURE_SCOPE_SOURCE}" == "plan-files-to-modify" ]]; then
-            log_execution "$task_file" "Phase 4: Diff scope check passed"
-        else
-            log_execution "$task_file" "Phase 4: Diff scope check passed with warnings"
+    if [[ "$phase4_needs_triage" == true ]]; then
+        if _v2_log_out_of_scope_capture_warning "$task_file" "Phase 4"; then
+            :
+        elif [[ -n "${_V2_LAST_CAPTURE_SCOPE_SOURCE:-}" ]]; then
+            if [[ "${_V2_LAST_CAPTURE_SCOPE_SOURCE}" == "plan-files-to-modify" ]]; then
+                log_execution "$task_file" "Phase 4: Diff scope check passed"
+            else
+                log_execution "$task_file" "Phase 4: Diff scope check passed with warnings"
+            fi
         fi
     fi
 
     local _diff_risk=""
+    local _effective_reviewer_timeout=""
     _diff_risk=$(_classify_diff_risk)
+    _effective_reviewer_timeout=$(_resolve_reviewer_timeout "$_diff_risk")
     log_execution "$task_file" "Phase 4: Diff risk classification: ${_diff_risk}"
+    log_execution "$task_file" "Phase 4: Reviewer timeout resolved to ${_effective_reviewer_timeout} (source=$(_reviewer_timeout_resolution_source), diff_risk=${_diff_risk})"
+    _update_run_manifest_state "phase-4" "$_diff_risk" "$_effective_reviewer_timeout" || true
 
-    if [[ "${_diff_risk}" != "LOW" && "${SINGLE_REVIEWER_POLICY}" == "synthesis" ]]; then
-        SINGLE_REVIEWER_POLICY="strict"
-        log_execution "$task_file" "Phase 4: Elevated SINGLE_REVIEWER_POLICY to strict (diff_risk=${_diff_risk})"
+    if [[ "${_diff_risk}" != "LOW" ]]; then
+        log_execution "$task_file" "Phase 4: Diff risk advisory only (diff_risk=${_diff_risk}; single-reviewer halt now requires explicit LAUREN_LOOP_STRICT=true)"
     fi
 
     # Cost ceiling check after Phase 4 (most expensive pre-review phase)
@@ -3008,6 +4168,7 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
         _resume_to_subphase=""
         echo -e "${BLUE}=== Phase 5: Parallel Review (cycle $((fix_cycle + 1))) ===${NC}"
         _phase_start=$(_iso_timestamp)
+        _update_run_manifest_state "phase-5" "$_diff_risk" "$_effective_reviewer_timeout" || true
         set_task_status "$task_file" "in progress"
         log_execution "$task_file" "Phase 5: Review started (cycle $((fix_cycle + 1)))"
 
@@ -3058,12 +4219,12 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
 
         reviewer_a_start_ts=$(date +%s)
         run_agent "$reviewer_a_role" "$ENGINE_REVIEWER_A" "$reviewer_a_body" "$reviewer_a_system" \
-            "/dev/null" "$reviewer_a_log" "$REVIEWER_TIMEOUT" "100" &
+            "/dev/null" "$reviewer_a_log" "$_effective_reviewer_timeout" "100" &
         local pid_ra=$!
 
         reviewer_b_start_ts=$(date +%s)
         run_agent "$reviewer_b_role" "$ENGINE_REVIEWER_B" "$reviewer_b_body" "$reviewer_b_system" \
-            "${comp_dir}/reviewer-b.raw.md" "$reviewer_b_log" "$REVIEWER_TIMEOUT" "100" &
+            "${comp_dir}/reviewer-b.raw.md" "$reviewer_b_log" "$_effective_reviewer_timeout" "100" &
         local pid_rb=$!
 
         local exit_ra=0 exit_rb=0
@@ -3071,11 +4232,8 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
         reviewer_a_duration=$(( $(date +%s) - reviewer_a_start_ts ))
         (( reviewer_a_duration < 0 )) && reviewer_a_duration=0
 
-        if extract_markdown_section_to_file "$task_file" "## Review Findings" "${comp_dir}/reviewer-a.raw.md"; then
-            clear_markdown_section "$task_file" "## Review Findings"
-            if _validate_agent_output_for_role "reviewer-a" "${comp_dir}/reviewer-a.raw.md" >/dev/null 2>&1; then
-                reviewer_a_usable=true
-            fi
+        if _capture_reviewer_a_raw_artifact "$task_file" "${comp_dir}/reviewer-a.raw.md"; then
+            reviewer_a_usable=true
         else
             grep -i 'review.findings' "$task_file" | head -5 | while IFS= read -r _line; do
                 log_execution "$task_file" "  diagnostic: found heading: $_line"
@@ -3085,7 +4243,7 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
         if [[ "$ENGINE_REVIEWER_A" == "claude" ]] && [[ "$ENGINE_REVIEWER_B" == "codex" ]] && \
            [[ "$reviewer_a_usable" == true ]] && \
            kill -0 "$pid_rb" 2>/dev/null; then
-            if ! _enforce_codex_phase_backstop "$pid_rb" "$reviewer_b_role" "$reviewer_b_start_ts" "$REVIEWER_TIMEOUT" "$reviewer_a_duration" "$reviewer_b_log" "${comp_dir}/reviewer-b.raw.md"; then
+            if ! _enforce_codex_phase_backstop "$pid_rb" "$reviewer_b_role" "$reviewer_b_start_ts" "$_effective_reviewer_timeout" "$reviewer_a_duration" "$reviewer_b_log" "${comp_dir}/reviewer-b.raw.md"; then
                 reviewer_b_backstopped=true
             fi
         fi
@@ -3095,7 +4253,7 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
         fi
         _merge_cost_csvs || true
         rm -f "$reviewer_a_prompt_runtime"
-        _validate_agent_output "${comp_dir}/reviewer-a.raw.md" || true
+        _validate_agent_output_for_role "$reviewer_a_role" "${comp_dir}/reviewer-a.raw.md" || true
         _validate_agent_output_for_role "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" || true
 
         if [[ "$exit_ra" -ne 0 && "$exit_rb" -ne 0 ]]; then
@@ -3104,37 +4262,206 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
 
         echo -e "${BLUE}Review parallel done: A=$exit_ra, B=$exit_rb${NC}"
         local has_review_a=false has_review_b=false
-        _validate_agent_output "${comp_dir}/reviewer-a.raw.md" >/dev/null 2>&1 && has_review_a=true
+        local effective_reviewer_a_engine="$ENGINE_REVIEWER_A"
+        local effective_reviewer_b_engine="$ENGINE_REVIEWER_B"
+        local reviewer_a_fallback_attempted=false reviewer_b_fallback_attempted=false
+        local reviewer_a_fallback_succeeded=false reviewer_b_fallback_succeeded=false
+        _validate_agent_output_for_role "$reviewer_a_role" "${comp_dir}/reviewer-a.raw.md" >/dev/null 2>&1 && has_review_a=true
         _promote_latest_valid_attempt "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" || true
         _validate_agent_output_for_role "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" >/dev/null 2>&1 && has_review_b=true
-
-        if [[ "$has_review_a" == false ]]; then
-            if [[ "$exit_ra" -ne 0 ]]; then
-                echo -e "${YELLOW}Reviewer A unavailable (exit $exit_ra; no usable review artifact), continuing with B only${NC}"
-            else
-                echo -e "${YELLOW}Reviewer A produced no usable review artifact, continuing with B only${NC}"
-            fi
-        elif [[ "$exit_ra" -ne 0 ]]; then
-            echo -e "${YELLOW}Reviewer A exited $exit_ra but produced a usable review artifact${NC}"
-        fi
-
-        if [[ "$has_review_b" == false ]]; then
-            if [[ "$exit_rb" -ne 0 ]]; then
-                echo -e "${YELLOW}Reviewer B unavailable (exit $exit_rb; no usable review artifact), continuing with A only${NC}"
-            else
-                echo -e "${YELLOW}Reviewer B produced no usable review artifact, continuing with A only${NC}"
-            fi
-        elif [[ "$exit_rb" -ne 0 ]]; then
-            echo -e "${YELLOW}Reviewer B exited $exit_rb but produced a usable review artifact${NC}"
-        fi
 
         if [[ "$has_review_a" == false && "$has_review_b" == false ]]; then
             echo -e "${RED}Parallel review failed to produce any usable raw review artifacts${NC}"
             set_task_status "$task_file" "blocked"
             log_execution "$task_file" "Phase 5: Review artifacts missing (A exit ${exit_ra}, A artifact ${has_review_a}; B exit ${exit_rb}, B artifact ${has_review_b})"
+            _finalize_run_manifest "blocked" "$fix_cycle" || true
             _print_cost_summary
             return 1
         fi
+
+        if [[ "$has_review_a" != "$has_review_b" ]]; then
+            local fallback_missing_label="" fallback_engine="" fallback_run_role="" fallback_log=""
+            local fallback_prompt_file="" fallback_instruction="" fallback_output=""
+            local fallback_prompt_body="" fallback_sysprompt=""
+            local fallback_exit=0 fallback_prepared=false fallback_start_ts=0 fallback_duration=0
+            local skip_engine_fallback=false fallback_review_b_output_path="" fallback_source_engine=""
+            local reviewer_a_fallback_prompt_runtime="" fallback_diag_output="" fallback_output_state="" fallback_validation_err=""
+
+            if [[ "$has_review_a" == false ]]; then
+                fallback_missing_label="reviewer-a"
+                fallback_engine="codex"
+                fallback_source_engine="$ENGINE_REVIEWER_A"
+                if [[ "$ENGINE_REVIEWER_A" == "codex" ]]; then
+                    fallback_engine="claude"
+                fi
+                fallback_run_role="reviewer-a-${fallback_engine}-fallback${role_suffix}"
+                fallback_log="${log_dir}/${fallback_run_role}.log"
+                fallback_output="/dev/null"
+                fallback_diag_output="${comp_dir}/reviewer-a.raw.md"
+                fallback_instruction="$review_a_instruction"
+
+                if [[ ! -f "$reviewer_a_prompt_runtime" ]]; then
+                    reviewer_a_fallback_prompt_runtime=$(mktemp "${TMPDIR:-/tmp}/reviewer-a-fallback.XXXXXX")
+                    sed "s|\$PROJECT_NAME|$PROJECT_NAME|g" "$reviewer_a_prompt" > "$reviewer_a_fallback_prompt_runtime"
+                    fallback_prompt_file="$reviewer_a_fallback_prompt_runtime"
+                else
+                    fallback_prompt_file="$reviewer_a_prompt_runtime"
+                fi
+            else
+                fallback_missing_label="reviewer-b"
+                fallback_engine="claude"
+                fallback_source_engine="$ENGINE_REVIEWER_B"
+                if [[ "$ENGINE_REVIEWER_B" == "claude" ]]; then
+                    fallback_engine="codex"
+                fi
+                fallback_run_role="reviewer-b-${fallback_engine}-fallback${role_suffix}"
+                fallback_log="${log_dir}/${fallback_run_role}.log"
+                fallback_output="${comp_dir}/reviewer-b.raw.md"
+                fallback_diag_output="$fallback_output"
+                fallback_review_b_output_path="$fallback_output"
+                if [[ "$fallback_engine" == "codex" ]]; then
+                    fallback_review_b_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
+                fi
+                fallback_instruction="Read the task file at ${task_file}. ${review_diff_context} Read ${comp_dir}/exploration-summary.md for context. Write your review to ${fallback_review_b_output_path}. This is review cycle $((fix_cycle + 1))."
+                fallback_prompt_file="$reviewer_b_prompt"
+            fi
+
+            if [[ "$fallback_source_engine" == "codex" ]]; then
+                if [[ "$fallback_missing_label" == "reviewer-a" ]] && _review_phase_codex_retry_already_attempted "$reviewer_a_log"; then
+                    skip_engine_fallback=true
+                elif [[ "$fallback_missing_label" == "reviewer-b" ]] && _review_phase_codex_retry_already_attempted "$reviewer_b_log"; then
+                    skip_engine_fallback=true
+                fi
+            fi
+
+            if [[ "$skip_engine_fallback" == true ]]; then
+                [[ -n "$reviewer_a_fallback_prompt_runtime" ]] && rm -f "$reviewer_a_fallback_prompt_runtime"
+                log_execution "$task_file" "Phase 5: ${fallback_missing_label} missing, skipping opposite-engine fallback because Codex already entered capacity/stream retry handling"
+            else
+                if [[ "$fallback_missing_label" == "reviewer-a" ]]; then
+                    reviewer_a_fallback_attempted=true
+                else
+                    reviewer_b_fallback_attempted=true
+                fi
+                echo -e "${YELLOW}Single reviewer available — retrying ${fallback_missing_label} once with ${fallback_engine}${NC}"
+                log_execution "$task_file" "Phase 5: ${fallback_missing_label} missing, launching ${fallback_engine} fallback"
+                if [[ "$fallback_missing_label" == "reviewer-a" ]]; then
+                    _update_run_manifest_state "phase-5" "$_diff_risk" "$_effective_reviewer_timeout" "${fallback_engine} (fallback)" "$ENGINE_REVIEWER_B" || true
+                else
+                    _update_run_manifest_state "phase-5" "$_diff_risk" "$_effective_reviewer_timeout" "$ENGINE_REVIEWER_A" "${fallback_engine} (fallback)" || true
+                fi
+
+                if [[ "$fallback_missing_label" == "reviewer-a" ]]; then
+                    clear_markdown_section "$task_file" "## Review Findings"
+                    rm -f "${comp_dir}/reviewer-a.raw.md"
+                else
+                    rm -f "${comp_dir}/reviewer-b.raw.md"
+                fi
+
+                if prepare_agent_request "$fallback_engine" "$fallback_prompt_file" "$fallback_instruction"; then
+                    fallback_prepared=true
+                    fallback_prompt_body="$AGENT_PROMPT_BODY"
+                    fallback_sysprompt="$AGENT_SYSTEM_PROMPT"
+                    fallback_start_ts=$(date +%s)
+                    run_agent "$fallback_run_role" "$fallback_engine" "$fallback_prompt_body" "$fallback_sysprompt" \
+                        "$fallback_output" "$fallback_log" "$_effective_reviewer_timeout" "100"
+                    fallback_exit=$?
+                    fallback_duration=$(( $(date +%s) - fallback_start_ts ))
+                    (( fallback_duration < 0 )) && fallback_duration=0
+                else
+                    log_execution "$task_file" "Phase 5: Failed to assemble ${fallback_engine} fallback prompt for ${fallback_missing_label}"
+                fi
+
+                _merge_cost_csvs || true
+
+                if [[ "$fallback_missing_label" == "reviewer-a" ]]; then
+                    if fallback_validation_err=$(_capture_reviewer_a_raw_artifact "$task_file" "${comp_dir}/reviewer-a.raw.md" 2>&1 1>/dev/null); then
+                        reviewer_a_fallback_succeeded=true
+                        effective_reviewer_a_engine="${fallback_engine} (fallback)"
+                    else
+                        fallback_output_state=$(_describe_artifact_state "$fallback_diag_output")
+                    fi
+                    [[ -n "$reviewer_a_fallback_prompt_runtime" ]] && rm -f "$reviewer_a_fallback_prompt_runtime"
+                else
+                    if fallback_validation_err=$(_validate_agent_output_for_role "$fallback_run_role" "${comp_dir}/reviewer-b.raw.md" 2>&1 1>/dev/null); then
+                        reviewer_b_fallback_succeeded=true
+                    else
+                        local fallback_retry_validation_err=""
+                        fallback_output_state=$(_describe_artifact_state "$fallback_diag_output")
+                        rm -f "${comp_dir}/reviewer-b.raw.md"
+                        if _promote_latest_valid_attempt "$fallback_run_role" "${comp_dir}/reviewer-b.raw.md" >/dev/null 2>&1; then
+                            if fallback_retry_validation_err=$(_validate_agent_output_for_role "$fallback_run_role" "${comp_dir}/reviewer-b.raw.md" 2>&1 1>/dev/null); then
+                                reviewer_b_fallback_succeeded=true
+                            elif [[ -n "$fallback_retry_validation_err" ]]; then
+                                fallback_validation_err="$fallback_retry_validation_err"
+                            fi
+                        fi
+                        if [[ "$reviewer_b_fallback_succeeded" != true ]] && [[ -z "$fallback_output_state" || "$fallback_output_state" == "missing" ]]; then
+                            fallback_output_state=$(_describe_artifact_state "$fallback_diag_output")
+                        fi
+                    fi
+                    if [[ "$reviewer_b_fallback_succeeded" == true ]]; then
+                        effective_reviewer_b_engine="${fallback_engine} (fallback)"
+                    fi
+                fi
+
+                has_review_a=false
+                has_review_b=false
+                _validate_agent_output_for_role "$reviewer_a_role" "${comp_dir}/reviewer-a.raw.md" >/dev/null 2>&1 && has_review_a=true
+                _promote_latest_valid_attempt "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" || true
+                _validate_agent_output_for_role "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" >/dev/null 2>&1 && has_review_b=true
+
+                if [[ "$has_review_a" == true && "$has_review_b" == true ]]; then
+                    echo -e "${GREEN}Opposite-engine fallback for ${fallback_missing_label} succeeded — both reviews available${NC}"
+                    log_execution "$task_file" "Phase 5: ${fallback_missing_label} fallback succeeded"
+                else
+                    local _fb_output_state=""
+                    local _fb_validation_err=""
+                    echo -e "${YELLOW}Opposite-engine fallback for ${fallback_missing_label} failed — continuing with single reviewer${NC}"
+                    _fb_output_state="${fallback_output_state:-$(_describe_artifact_state "$fallback_diag_output")}"
+                    log_execution "$task_file" "Phase 5: ${fallback_missing_label} fallback failed (prepared=${fallback_prepared}, exit=${fallback_exit}, duration=${fallback_duration}s, output=${_fb_output_state})"
+                    _fb_validation_err="${fallback_validation_err//$'\n'/ | }"
+                    if [[ -n "$_fb_validation_err" ]]; then
+                        log_execution "$task_file" "Phase 5: Fallback validation failure: ${_fb_validation_err}"
+                    fi
+                    if [[ -f "$fallback_log" ]] && [[ -s "$fallback_log" ]]; then
+                        local _fb_log_tail
+                        _fb_log_tail=$(tail -20 "$fallback_log" 2>/dev/null || true)
+                        if [[ -n "$_fb_log_tail" ]]; then
+                            log_execution "$task_file" "Phase 5: Fallback agent log tail (last 20 lines):"
+                            _log_diagnostic_lines "$task_file" "$_fb_log_tail"
+                        fi
+                    fi
+                fi
+            fi
+        fi
+
+        if [[ "$has_review_a" == false ]]; then
+            if [[ "$reviewer_a_fallback_attempted" == true && "$reviewer_a_fallback_succeeded" == false ]]; then
+                echo -e "${YELLOW}Reviewer A remains unavailable after opposite-engine fallback, continuing with B only${NC}"
+            elif [[ "$exit_ra" -ne 0 ]]; then
+                echo -e "${YELLOW}Reviewer A unavailable (exit $exit_ra; no usable review artifact), continuing with B only${NC}"
+            else
+                echo -e "${YELLOW}Reviewer A produced no usable review artifact, continuing with B only${NC}"
+            fi
+        elif [[ "$reviewer_a_fallback_succeeded" != true && "$exit_ra" -ne 0 ]]; then
+            echo -e "${YELLOW}Reviewer A exited $exit_ra but produced a usable review artifact${NC}"
+        fi
+
+        if [[ "$has_review_b" == false ]]; then
+            if [[ "$reviewer_b_fallback_attempted" == true && "$reviewer_b_fallback_succeeded" == false ]]; then
+                echo -e "${YELLOW}Reviewer B remains unavailable after opposite-engine fallback, continuing with A only${NC}"
+            elif [[ "$exit_rb" -ne 0 ]]; then
+                echo -e "${YELLOW}Reviewer B unavailable (exit $exit_rb; no usable review artifact), continuing with A only${NC}"
+            else
+                echo -e "${YELLOW}Reviewer B produced no usable review artifact, continuing with A only${NC}"
+            fi
+        elif [[ "$reviewer_b_fallback_succeeded" != true && "$exit_rb" -ne 0 ]]; then
+            echo -e "${YELLOW}Reviewer B exited $exit_rb but produced a usable review artifact${NC}"
+        fi
+
+        [[ "$has_review_a" == true ]] || rm -f "${comp_dir}/reviewer-a.raw.md"
+        [[ "$has_review_b" == true ]] || rm -f "${comp_dir}/reviewer-b.raw.md"
 
         if [[ "$has_review_a" == true && "$has_review_b" == true ]]; then
             if (( RANDOM % 2 )); then
@@ -3162,16 +4489,17 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
 
         # Single-reviewer policy gate
         if [[ "$has_review_a" != "$has_review_b" ]]; then
-            if _strict_contract_mode || [[ "$SINGLE_REVIEWER_POLICY" == "strict" ]] || [[ "${_diff_risk:-LOW}" == "HIGH" ]]; then
-                echo -e "${YELLOW}Single reviewer available with strict policy, effective strict mode, or HIGH diff risk — halting for human review${NC}"
+            if [[ "$LAUREN_LOOP_STRICT" == "true" ]]; then
+                echo -e "${YELLOW}Single reviewer available with explicit strict mode — halting for human review${NC}"
                 set_task_status "$task_file" "needs verification"
-                log_execution "$task_file" "Phase 5: Single reviewer halt (strict=${LAUREN_LOOP_EFFECTIVE_STRICT}, policy=${SINGLE_REVIEWER_POLICY}, diff_risk=${_diff_risk:-LOW})"
+                log_execution "$task_file" "Phase 5: Single reviewer halt (explicit_strict=${LAUREN_LOOP_STRICT}, diff_risk=${_diff_risk:-LOW})"
                 _write_human_review_handoff "SINGLE_REVIEWER" "$fix_cycle" || true
                 pipeline_finished=true
                 pipeline_human_review_halt=true
                 break
             else
-                log_execution "$task_file" "Phase 5: Single reviewer — continuing to synthesis (policy=${SINGLE_REVIEWER_POLICY}, diff_risk=${_diff_risk:-LOW})"
+                echo -e "${YELLOW}WARN: Single reviewer available; explicit strict mode not set — continuing to synthesis${NC}"
+                log_execution "$task_file" "Phase 5: WARN — single reviewer continuing to synthesis (explicit_strict=${LAUREN_LOOP_STRICT}, diff_risk=${_diff_risk:-LOW})"
             fi
         fi
 
@@ -3189,10 +4517,7 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
                 if [[ "${_crit_a:-0}" -eq 0 && "${_crit_b:-0}" -eq 0 ]]; then
                     echo -e "${GREEN}Both reviewers signaled PASS — skipping synthesis${NC}"
                     set_task_status "$task_file" "needs verification"
-                    blinding_message="Phase 5: Review mapping: $(cat "${comp_dir}/.review-mapping" 2>/dev/null || echo 'missing')"
-                    _atomic_append "${comp_dir}/blinding-metadata.log" "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $blinding_message"
-                    blinding_message="Review engine mapping: reviewer-a=${ENGINE_REVIEWER_A}, reviewer-b=${ENGINE_REVIEWER_B}"
-                    _atomic_append "${comp_dir}/blinding-metadata.log" "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $blinding_message"
+                    _append_review_blinding_metadata "$effective_reviewer_a_engine" "$effective_reviewer_b_engine"
                     log_execution "$task_file" "Phase 5: Review randomization completed"
                     log_execution "$task_file" "Phase 5/6: Both reviewers PASS — early consensus"
                     _append_manifest_phase "phase-5" "review-cycle-$((fix_cycle+1))" "$_phase_start" "$(_iso_timestamp)" "completed" "PASS" || true
@@ -3219,6 +4544,7 @@ Work in small, verifiable steps and stop with BLOCKED if the plan cannot be comp
         echo -e "${BLUE}=== Phase 6: Review Evaluation (cycle $((fix_cycle + 1))) ===${NC}"
         local _phase6_start=""
         _phase6_start=$(_iso_timestamp)
+        _update_run_manifest_state "phase-6a" "$_diff_risk" "$_effective_reviewer_timeout" || true
         set_task_status "$task_file" "in progress"
         log_execution "$task_file" "Phase 6: Review evaluation started (cycle $((fix_cycle + 1)))"
 
@@ -3255,10 +4581,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             "evaluating-reviews" \
             "Phase 6 review evaluation produced an invalid synthesis artifact" \
             "Check ${comp_dir}/review-a.md and ${comp_dir}/review-b.md, then inspect agent log ${log_dir}/${review_evaluator_role}.log" || return 1
-        blinding_message="Phase 5: Review mapping: $(cat "${comp_dir}/.review-mapping" 2>/dev/null || echo 'missing')"
-        _atomic_append "${comp_dir}/blinding-metadata.log" "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $blinding_message"
-        blinding_message="Review engine mapping: reviewer-a=${ENGINE_REVIEWER_A}, reviewer-b=${ENGINE_REVIEWER_B}"
-        _atomic_append "${comp_dir}/blinding-metadata.log" "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $blinding_message"
+        _append_review_blinding_metadata "$effective_reviewer_a_engine" "$effective_reviewer_b_engine"
         log_execution "$task_file" "Phase 5: Review randomization completed"
 
         local review_verdict=""
@@ -3314,6 +4637,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local _phase6b_start=""
         _phase6b_start=$(_iso_timestamp)
         echo -e "${BLUE}=== Phase 6: Author Fix Plan (cycle $((fix_cycle + 1))) ===${NC}"
+        _update_run_manifest_state "phase-6b" "$_diff_risk" "$_effective_reviewer_timeout" || true
         cost_gate_result=0
         _check_cost_ceiling "$task_file" "$comp_dir" "$fix_cycle" || cost_gate_result=$?
         case "$cost_gate_result" in
@@ -3398,6 +4722,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local fix_critic_prefix="fix-critic${role_suffix}"
         local fix_critic_result=0
         echo -e "${BLUE}=== Phase 6: Critique Fix Plan (cycle $((fix_cycle + 1))) ===${NC}"
+        _update_run_manifest_state "phase-6c" "$_diff_risk" "$_effective_reviewer_timeout" || true
         run_critic_loop "$task_file" "$comp_dir" "$critic_prompt" "$reviser_prompt" "${comp_dir}/fix-plan.md" "${comp_dir}/fix-critique.md" 3 "$fix_critic_prefix" "needs verification" "$ENGINE_CRITIC" || fix_critic_result=$?
         case "$fix_critic_result" in
             0)
@@ -3429,6 +4754,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         echo -e "${BLUE}=== Phase 7: Execute Review Fixes (cycle $((fix_cycle + 1))) ===${NC}"
         local _phase7_start=""
         _phase7_start=$(_iso_timestamp)
+        _update_run_manifest_state "phase-7" "$_diff_risk" "$_effective_reviewer_timeout" || true
         cost_gate_result=0
         _check_cost_ceiling "$task_file" "$comp_dir" "$fix_cycle" || cost_gate_result=$?
         case "$cost_gate_result" in
@@ -3456,23 +4782,53 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local pre_fix_dirty=""
         pre_fix_dirty=$(_v2_snapshot_dirty_files)
         local fix_executor_role="fix-executor${role_suffix}"
-        local fix_exec_instruction="The task file is ${task_file}. Read ${comp_dir}/review-synthesis.md and ${comp_dir}/fix-plan.md. Execute the planned fixes and write execution progress to ${comp_dir}/fix-execution.md."
+        if ! _normalize_verify_tags_with_timeout_in_file "${comp_dir}/fix-plan.md" "V2 phase 7 fix plan"; then
+            _fail_phase "executing-fixes" "Failed to wrap repo-standard pytest verification commands in fix-plan.md" "Check ${comp_dir}/fix-plan.md for verify tag formatting drift, then retry"
+            return 1
+        fi
+        if ! _validate_verify_commands_in_file "${comp_dir}/fix-plan.md" "V2 phase 7 fix plan"; then
+            _fail_phase "executing-fixes" "Invalid verify commands found in fix-plan.md" "Check ${comp_dir}/fix-plan.md for bad verify commands, then retry"
+            return 1
+        fi
+        local fix_exec_instruction="The task file is ${task_file}. Read ${comp_dir}/review-synthesis.md and ${comp_dir}/fix-plan.md. Execute the planned fixes and write execution progress to ${comp_dir}/fix-execution.md. If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_message) - <command>' and stop immediately."
         prepare_agent_request "$ENGINE_FIX" "$fix_executor_prompt" "$fix_exec_instruction" || {
             _fail_phase "executing-fixes" "Failed to assemble fix-executor prompt" "See ${comp_dir}/fix-execution.md for blocking issues. Address manually, then retry"
         }
 
+        # Create isolated worktree for fix execution
+        _v2_create_execution_worktree || {
+            _fail_phase "executing-fixes" "Failed to create fix execution worktree" "Check disk space and git state"
+            return 1
+        }
+        cd "$_V2_EXEC_WORKTREE_PATH"
+
         local exit_fix_exec=0
+        local pre_fix_timeout_blocks=0
+        local post_fix_timeout_blocks=0
+        local fix_timeout_block_detected=false
         rm -f "${comp_dir}/fix-execution.contract.json"
+        pre_fix_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/fix-execution.md")
         touch "${log_dir}/${fix_executor_role}.log"
         start_agent_monitor "${log_dir}/${fix_executor_role}.log" "$task_file"
         run_agent "$fix_executor_role" "$ENGINE_FIX" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
             "/dev/null" "${log_dir}/${fix_executor_role}.log" \
             "$EXECUTOR_TIMEOUT" "300" "WebFetch,WebSearch" || exit_fix_exec=$?
         stop_agent_monitor
+        post_fix_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/fix-execution.md")
+        if [[ "${post_fix_timeout_blocks:-0}" -gt "${pre_fix_timeout_blocks:-0}" ]]; then
+            fix_timeout_block_detected=true
+            printf '{"status":"BLOCKED"}\n' > "${comp_dir}/fix-execution.contract.json"
+            echo -e "${YELLOW}$(_verification_timeout_message)${NC}"
+            log_execution "$task_file" "Phase 7: $(_verification_timeout_message)"
+        fi
 
         # Signal: fix executor STATUS: BLOCKED
         local fix_exec_status=""
-        fix_exec_status=$(_parse_contract "${comp_dir}/fix-execution.md" "status")
+        if [[ "$fix_timeout_block_detected" == true ]]; then
+            fix_exec_status="BLOCKED"
+        else
+            fix_exec_status=$(_parse_contract "${comp_dir}/fix-execution.md" "status")
+        fi
         local fix_exec_status_upper=""
         fix_exec_status_upper=$(echo "$fix_exec_status" | tr '[:lower:]' '[:upper:]')
         if _strict_contract_mode && [[ "$fix_exec_status_upper" != "COMPLETE" && "$fix_exec_status_upper" != "BLOCKED" ]]; then
@@ -3480,6 +4836,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             set_task_status "$task_file" "blocked"
             log_execution "$task_file" "Phase 7: Strict contract failure for fix-execution status signal"
             _print_cost_summary
+            _v2_cleanup_execution_worktree || true
             return 1
         fi
         if [[ "$fix_exec_status_upper" == "BLOCKED" ]]; then
@@ -3488,6 +4845,9 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             log_execution "$task_file" "Phase 7: Fix executor STATUS: BLOCKED — human review required"
             _write_human_review_handoff "BLOCKED" "$((fix_cycle + 1))" || true
             _mark_fix_execution_handoff || true
+            # Merge partial work back for human review
+            cd "$SCRIPT_DIR"
+            _v2_merge_execution_worktree || _v2_cleanup_execution_worktree || true
             pipeline_finished=true
             pipeline_human_review_halt=true
             break
@@ -3503,12 +4863,14 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             fi
             set_task_status "$task_file" "blocked"
             _print_cost_summary
+            _v2_cleanup_execution_worktree || true
             return 1
         fi
 
         set_task_status "$task_file" "in progress"
         log_execution "$task_file" "Phase 7: Fix execution completed"
 
+        # Capture diff inside the worktree (isolated from other pipelines)
         latest_fix_diff="${comp_dir}/fix-diff-cycle$((fix_cycle + 1)).patch"
         local phase7_scope_plan_file=""
         phase7_scope_plan_file=$(_v2_select_phase7_scope_plan_file "$comp_dir")
@@ -3518,6 +4880,14 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             log_execution "$task_file" "Phase 7: Scope plan file: fallback only" || true
         fi
         capture_diff_artifact "$pre_fix_sha" "$latest_fix_diff" "$task_file" "$phase7_scope_plan_file" "$pre_fix_dirty"
+        _v2_refresh_traditional_dev_proxy_artifacts \
+            "$task_file" \
+            "$pre_fix_sha" \
+            "$latest_fix_diff" \
+            "${_V2_LAST_CAPTURE_SCOPE_PATHS:-}" \
+            "${_V2_LAST_CAPTURE_SCOPE_SOURCE:-}" \
+            "$pre_fix_dirty" \
+            "$((fix_cycle + 1))"
         _v2_log_capture_scope_details "$task_file" "Phase 7"
         if [[ ! -s "$latest_fix_diff" ]]; then
             if _strict_contract_mode; then
@@ -3525,6 +4895,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
                 set_task_status "$task_file" "blocked"
                 log_execution "$task_file" "Phase 7: Strict mode blocked empty fix execution diff"
                 _print_cost_summary
+                _v2_cleanup_execution_worktree || true
                 return 1
             fi
             echo -e "${YELLOW}WARN: Fix execution diff is empty after cycle $((fix_cycle + 1))${NC}"
@@ -3534,7 +4905,18 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         fi
 
         _v2_log_out_of_scope_capture_warning "$task_file" "Phase 7" || true
-        _block_on_untracked_files "$task_file" "Phase 7" "$phase7_scope_plan_file" "$pre_fix_sha" "$pre_fix_untracked" || return 1
+        _block_on_untracked_files "$task_file" "Phase 7" "$phase7_scope_plan_file" "$pre_fix_sha" "$pre_fix_untracked" || {
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+
+        # Merge worktree changes back to the main branch
+        cd "$SCRIPT_DIR"
+        _v2_merge_execution_worktree || {
+            _fail_phase "executing-fixes" "Failed to merge fix execution worktree" "Check for merge conflicts; resolve manually then retry"
+            return 1
+        }
+
         _append_manifest_phase "phase-7" "fix-exec-cycle-$((fix_cycle+1))" "${_phase7_start:-$(_iso_timestamp)}" "$(_iso_timestamp)" "completed" || true
         _write_cycle_state "$comp_dir" "$fix_cycle" "phase-7" || true
         fi  # end Phase 7 skip guard
@@ -3553,6 +4935,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
     _print_cost_summary
     _print_phase_timing || true
     if [[ "$pipeline_success" == true ]]; then
+        finalize_v2_task_metadata "$task_file" "pipeline-complete" "success" "$fix_cycle" || true
         notify_terminal_state "pass" "Pipeline complete — ${slug}" || true
         echo -e "${GREEN}=== Competitive pipeline complete ===${NC}"
     elif [[ "$pipeline_human_review_halt" == true ]]; then
@@ -3563,10 +4946,12 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         if [[ -n "$_halt_status" ]] && ! _is_terminal_status "$_halt_status"; then
             set_task_status "$task_file" "needs verification" || true
         fi
+        finalize_v2_task_metadata "$task_file" "human-review-halt" "human_review" "$fix_cycle" || true
         notify_terminal_state "human-review" "Human review needed — ${slug}" || true
         echo -e "${YELLOW}=== Competitive pipeline halted for human review ===${NC}"
     else
         set_task_status "$task_file" "blocked" || true
+        finalize_v2_task_metadata "$task_file" "pipeline-blocked" "blocked" "$fix_cycle" || true
         notify_terminal_state "blocked" "Pipeline finished without success — ${slug}" || true
         echo -e "${BLUE}=== Competitive pipeline finished ===${NC}"
     fi
@@ -4162,6 +5547,7 @@ if [[ "$DRY_RUN" = true ]]; then
         "critic:$SCRIPT_DIR/prompts/critic.md" \
         "reviser:$SCRIPT_DIR/prompts/reviser.md" \
         "executor:$SCRIPT_DIR/prompts/executor.md" \
+        "scope-triage:$SCRIPT_DIR/prompts/scope-triage.md" \
         "reviewer-a:$SCRIPT_DIR/prompts/reviewer.md" \
         "reviewer-b:$SCRIPT_DIR/prompts/reviewer-b.md" \
         "review-evaluator:$SCRIPT_DIR/prompts/review-evaluator.md" \
@@ -4191,10 +5577,42 @@ trap '_interrupted INT' INT
 trap '_interrupted TERM' TERM
 trap '_interrupted HUP' HUP
 
+_v2_direct_summary() {
+    local slug="$1"
+    local task_file="" cost="" trad_proxy="" duration="" display_duration=""
+
+    task_file=$(_require_v2_task_file "$slug" 2>/dev/null) || task_file=""
+    cost=$(read_v2_total_cost "$slug")
+
+    if [[ -n "$task_file" ]]; then
+        trad_proxy=$(read_persisted_v2_traditional_dev_proxy_summary "$task_file" 2>/dev/null) || trad_proxy=""
+    fi
+    [[ -z "$trad_proxy" ]] && trad_proxy="N/A"
+
+    duration=$(( $(date +%s) - ${_PIPELINE_START_TS:-$(date +%s)} ))
+    [[ "$duration" -lt 0 ]] && duration=0
+    display_duration=$(format_auto_duration "$duration")
+
+    echo ""
+    echo -e "${BLUE}=============================================="
+    echo "     Auto Route Summary"
+    echo -e "==============================================${NC}"
+    echo ""
+    echo "  Pipeline: V2 (direct)"
+    echo "  Duration: ${display_duration}"
+    echo "  Cost:     ${cost}"
+    echo "  Traditional Dev Proxy: ${trad_proxy}"
+}
+
 acquire_lock
 _oc_rc=0
 lauren_loop_competitive "$SLUG" "$GOAL" || _oc_rc=$?
 if [[ "$_oc_rc" -ne 0 ]]; then
     notify_terminal_state "blocked" "Pipeline blocked — ${SLUG}" || true
     exit "$_oc_rc"
+fi
+
+# Print summary when launched directly (v1 wrapper prints its own summary)
+if [[ "${_LAUREN_LOOP_AUTO_WRAPPER:-}" != "1" ]]; then
+    _v2_direct_summary "$SLUG"
 fi

@@ -70,7 +70,7 @@ No fixes required.
       Include the finding being addressed and the public interface under test
       when the work is testable.
     </action>
-    <verify>Exact verification command sequence</verify>
+    <verify>.venv/bin/python -m pytest tests/foo.py -xvs && .venv/bin/python -m pytest tests/bar.py -xvs</verify>
     <done>
       What is true when this finding is resolved. Write the observable end
       state, not the implementation instruction.
@@ -118,6 +118,8 @@ Set `ready` to `true` when the markdown artifact says `READY: yes`, and `false` 
 - If the synthesis verdict is `PASS` and there are no actionable findings, emit an explicit no-op plan instead of inventing work.
 - If a finding appears unsupported or contradictory, mark it `DISPUTED` with evidence in `## Dispute Candidates` instead of planning an invalid fix.
 - Reference `competitive/fix-execution.md` as the execution log target for every planned item.
+- CRITICAL: `<verify>` tags must be single-line. Both `<verify>` and `</verify>` must appear on the same line. If multiple verification commands are needed, join them with `&&`.
+- Example: `<verify>.venv/bin/python -m pytest tests/foo.py -xvs && .venv/bin/python -m pytest tests/bar.py -xvs</verify>`
 
 ## Session Summary
 

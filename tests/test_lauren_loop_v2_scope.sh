@@ -15,6 +15,7 @@ TEST_LOG_FILE=""
 RED='\033[0;31m'
 YELLOW='\033[1;33m'
 GREEN='\033[0;32m'
+BLUE='\033[0;34m'
 NC='\033[0m'
 
 pass() {
@@ -122,6 +123,39 @@ log_execution() {
     fi
 }
 _print_cost_summary() { :; }
+
+prime_scope_triage_env() {
+    local repo_root="$1"
+    local task_dir="$2"
+    scope_triage_prompt="$REPO_ROOT/prompts/scope-triage.md"
+    ENGINE_EVALUATOR="claude"
+    EVALUATE_TIMEOUT="1m"
+    log_dir="$task_dir/logs"
+    mkdir -p "$log_dir"
+}
+
+scope_triage_state_record_field() {
+    local state_file="$1"
+    local section="$2"
+    local file_path="$3"
+    local field="$4"
+    python3 - "$state_file" "$section" "$file_path" "$field" <<'PY'
+import json
+import sys
+
+state_file, section, file_path, field = sys.argv[1:5]
+with open(state_file, encoding="utf-8") as fh:
+    data = json.load(fh)
+
+for item in data.get(section, []):
+    if isinstance(item, dict) and item.get("file") == file_path:
+        value = item.get(field)
+        if isinstance(value, str):
+            print(value)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
 
 (
     repo_root="$(setup_scope_repo diff-scoped)"
@@ -825,10 +859,12 @@ EOF
     task_dir="$repo_root/docs/tasks/open/$slug"
     flat_file="$repo_root/docs/tasks/open/${slug}.md"
 
+    # Create flat file and track it in git
     mkdir -p "$repo_root/docs/tasks/open"
     printf '## Task: %s\n## Status: in progress\n' "$slug" > "$flat_file"
     git_commit_all "$repo_root" "add flat task file"
 
+    # Create artifact directory (as Lauren Loop would)
     mkdir -p "${task_dir}/competitive" "${task_dir}/logs"
 
     (
@@ -836,6 +872,7 @@ EOF
         SCRIPT_DIR="$repo_root"
         _consolidate_task_to_dir "$flat_file" "$task_dir"
 
+        # Flat file should be gone, task.md should exist in dir
         [[ ! -f "$flat_file" ]]
         [[ -f "${task_dir}/task.md" ]]
         grep -q "## Task: $slug" "${task_dir}/task.md"
@@ -850,10 +887,12 @@ EOF
     task_dir="$repo_root/docs/tasks/open/$slug"
     pilot_file="$repo_root/docs/tasks/open/pilot-${slug}.md"
 
+    # Create pilot file and track it in git
     mkdir -p "$repo_root/docs/tasks/open"
     printf '## Task: %s\n## Status: in progress\n' "$slug" > "$pilot_file"
     git_commit_all "$repo_root" "add pilot task file"
 
+    # Create artifact directory
     mkdir -p "${task_dir}/competitive" "${task_dir}/logs"
 
     (
@@ -861,6 +900,7 @@ EOF
         SCRIPT_DIR="$repo_root"
         _consolidate_task_to_dir "$pilot_file" "$task_dir"
 
+        # Pilot file should be gone, task.md should exist in dir
         [[ ! -f "$pilot_file" ]]
         [[ -f "${task_dir}/task.md" ]]
         grep -q "## Task: $slug" "${task_dir}/task.md"
@@ -875,6 +915,7 @@ EOF
     task_dir="$repo_root/docs/tasks/open/$slug"
     flat_file="$repo_root/docs/tasks/open/${slug}.md"
 
+    # Create both flat file and dir task.md
     mkdir -p "$repo_root/docs/tasks/open" "${task_dir}/competitive"
     printf '## Task: %s (flat)\n' "$slug" > "$flat_file"
     printf '## Task: %s (dir)\n' "$slug" > "${task_dir}/task.md"
@@ -885,12 +926,567 @@ EOF
         SCRIPT_DIR="$repo_root"
         _consolidate_task_to_dir "$flat_file" "$task_dir"
 
+        # Both files should still exist — dir task.md untouched
         [[ -f "$flat_file" ]]
         [[ -f "${task_dir}/task.md" ]]
         grep -q "(dir)" "${task_dir}/task.md"
     )
 ) && pass "27. consolidation no-op when task.md already in directory" \
   || fail "27. consolidation no-op when task.md already in directory"
+
+# ---------- Test 28: PLAN_GAP files are added to effective scope and kept in diff ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-plan-gap)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+
+    printf 'executor out-of-scope tracked change\n' > "$repo_root/docs/out_of_scope.md"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' '[{"file":"docs/out_of_scope.md","classification":"PLAN_GAP","reasoning":"Required transitive dependency"}]' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        grep -q 'docs/out_of_scope.md' "$diff_file"
+        grep -q 'PLAN_GAP: `docs/out_of_scope.md` - Required transitive dependency' "$task_file"
+        [[ "$(_v2_read_scope_triage_state_field "$comp_dir/execution-scope-triage.json" "status")" == "completed" ]]
+    )
+) && pass "28. scope triage keeps PLAN_GAP files in the regenerated diff" \
+  || fail "28. scope triage keeps PLAN_GAP files in the regenerated diff"
+
+# ---------- Test 29: NOISE tracked files are reverted ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-noise-tracked)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+
+    printf 'executor out-of-scope tracked change\n' > "$repo_root/docs/out_of_scope.md"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' '[{"file":"docs/out_of_scope.md","classification":"NOISE","reasoning":"Unrelated documentation edit"}]' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        grep -q '^baseline$' "$repo_root/docs/out_of_scope.md"
+        [[ ! -s "$diff_file" ]]
+        grep -q 'NOISE: `docs/out_of_scope.md` - Unrelated documentation edit \[reverted: restored path to HEAD\]' "$task_file"
+    )
+) && pass "29. scope triage reverts tracked NOISE files" \
+  || fail "29. scope triage reverts tracked NOISE files"
+
+# ---------- Test 30: triage failure fails open to PLAN_GAP ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-fail-open)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+
+    printf 'executor out-of-scope tracked change\n' > "$repo_root/docs/out_of_scope.md"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            return 124
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        grep -q 'docs/out_of_scope.md' "$diff_file"
+        grep -q 'Failure: Scope triage timed out (1m)' "$task_file"
+        grep -q 'PLAN_GAP: `docs/out_of_scope.md` - Scope triage timed out (1m). Kept by default.' "$task_file"
+        [[ "$(_v2_read_scope_triage_state_field "$comp_dir/execution-scope-triage.json" "status")" == "failed-open" ]]
+    )
+) && pass "30. scope triage failures keep files as PLAN_GAP" \
+  || fail "30. scope triage failures keep files as PLAN_GAP"
+
+# ---------- Test 31: zero out-of-scope files skip triage agent ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-skip)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    marker_file="$repo_root/triage-agent-called.txt"
+
+    printf 'changed in scope only\n' > "$repo_root/src/in_scope.py"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf 'called\n' > "$marker_file"
+            return 1
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        [[ ! -f "$marker_file" ]]
+        [[ "$(_v2_read_scope_triage_state_field "$comp_dir/execution-scope-triage.json" "status")" == "skipped" ]]
+    )
+) && pass "31. scope triage skips the agent when there are no violations" \
+  || fail "31. scope triage skips the agent when there are no violations"
+
+# ---------- Test 32: task file is always forced to NOISE ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-task-file)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    task_file_rel="docs/tasks/open/$slug/task.md"
+
+    printf '\nexecutor touched task file\n' >> "$task_file"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' "[{\"file\":\"${task_file_rel}\",\"classification\":\"PLAN_GAP\",\"reasoning\":\"Model guessed wrong\"}]" > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        grep -q "NOISE: \`${task_file_rel}\` - Pipeline-owned task artifact; excluded from executor scope review." "$task_file"
+        [[ -z "${_V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES:-}" ]]
+    )
+) && pass "32. task file violations are forced to NOISE" \
+  || fail "32. task file violations are forced to NOISE"
+
+# ---------- Test 33: untracked NOISE files are quarantined ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-untracked-noise)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    new_file="$repo_root/docs/new-outside-scope.md"
+    quarantined_file="$comp_dir/scope-triage-quarantine/docs/new-outside-scope.md"
+
+    printf 'untracked noise\n' > "$new_file"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' '[{"file":"docs/new-outside-scope.md","classification":"NOISE","reasoning":"Debug artifact"}]' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        [[ ! -e "$new_file" ]]
+        [[ -f "$quarantined_file" ]]
+        [[ ! -s "$diff_file" ]]
+        grep -q 'NOISE: `docs/new-outside-scope.md` - Debug artifact \[quarantined: '"$quarantined_file"'\]' "$task_file"
+    )
+) && pass "33. scope triage quarantines untracked NOISE files" \
+  || fail "33. scope triage quarantines untracked NOISE files"
+
+# ---------- Test 34: scope triage log section is appended ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-log-section)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+
+    printf 'executor out-of-scope tracked change\n' > "$repo_root/docs/out_of_scope.md"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' '[{"file":"docs/out_of_scope.md","classification":"PLAN_GAP","reasoning":"Needed dependency"}]' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        grep -q '^## Scope Triage Log$' "$task_file"
+        grep -q '^### Phase 4 Scope Triage - ' "$task_file"
+    )
+) && pass "34. scope triage log section is created and populated" \
+  || fail "34. scope triage log section is created and populated"
+
+# ---------- Test 35: pending checkpoint reruns scope triage on resume ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-resume-pending)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    state_file="$comp_dir/execution-scope-triage.json"
+    marker_file="$repo_root/triage-agent-called.txt"
+
+    printf 'changed in scope\n' > "$repo_root/src/in_scope.py"
+    printf 'changed out of scope\n' > "$repo_root/docs/out_of_scope.md"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        before_sha=$(git rev-parse HEAD)
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf 'called\n' > "$marker_file"
+            printf '%s\n' '[{"file":"docs/out_of_scope.md","classification":"NOISE","reasoning":"Resume rerun reverted unrelated docs change"}]' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "$before_sha" "$diff_file" "$task_file" "$plan_file"
+        _phase_start=$(_iso_timestamp)
+        _v2_handle_phase4_checkpoint "$task_file" "$diff_file" "$state_file" "$plan_file"
+        [[ "$_V2_PHASE4_CHECKPOINT_NEEDS_TRIAGE" == "true" ]]
+        grep -q 'Phase 4: WARNING scope triage state missing or unreadable; resuming as pending from checkpoint' "$TEST_LOG_FILE"
+
+        _v2_write_scope_triage_state "$state_file" "pending" "$before_sha" "$plan_file" "$diff_file" "" ""
+        _v2_handle_phase4_checkpoint "$task_file" "$diff_file" "$state_file" "$plan_file"
+        [[ "$_V2_PHASE4_CHECKPOINT_NEEDS_TRIAGE" == "true" ]]
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "$_V2_PHASE4_CHECKPOINT_BEFORE_SHA" "$plan_file" "$diff_file" "$_V2_PHASE4_CHECKPOINT_PREEXISTING_DIRTY"
+
+        [[ -f "$marker_file" ]]
+        grep -q '^changed in scope$' "$repo_root/src/in_scope.py"
+        grep -q '^baseline$' "$repo_root/docs/out_of_scope.md"
+        grep -q 'src/in_scope.py' "$diff_file"
+        ! grep -q 'docs/out_of_scope.md' "$diff_file"
+        grep -q 'Phase 4: Executor skipped (checkpoint — scope triage pending)' "$TEST_LOG_FILE"
+        [[ "$(_v2_read_scope_triage_state_field "$state_file" "status")" == "completed" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "classifications" "docs/out_of_scope.md" "classification")" == "NOISE" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "actions" "docs/out_of_scope.md" "action")" == "reverted" ]]
+    )
+) && pass "35. pending checkpoint reruns scope triage on resume" \
+  || fail "35. pending checkpoint reruns scope triage on resume"
+
+# ---------- Test 36: completed checkpoint skips scope triage on resume ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-resume-completed)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    state_file="$comp_dir/execution-scope-triage.json"
+    marker_file="$repo_root/triage-agent-called.txt"
+
+    printf 'changed in scope\n' > "$repo_root/src/in_scope.py"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        before_sha=$(git rev-parse HEAD)
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf 'called\n' > "$marker_file"
+            return 0
+        }
+
+        capture_diff_artifact "$before_sha" "$diff_file" "$task_file" "$plan_file"
+        _v2_write_scope_triage_state "$state_file" "completed" "$before_sha" "$plan_file" "$diff_file" "" ""
+        _phase_start=$(_iso_timestamp)
+        _v2_handle_phase4_checkpoint "$task_file" "$diff_file" "$state_file" "$plan_file"
+
+        [[ "$_V2_PHASE4_CHECKPOINT_NEEDS_TRIAGE" == "false" ]]
+        [[ ! -f "$marker_file" ]]
+        grep -q '^changed in scope$' "$repo_root/src/in_scope.py"
+        grep -q '^baseline$' "$repo_root/docs/out_of_scope.md"
+        grep -q 'src/in_scope.py' "$diff_file"
+        ! grep -q 'docs/out_of_scope.md' "$diff_file"
+        grep -q 'Phase 4: Skipped (checkpoint)' "$TEST_LOG_FILE"
+        [[ "$(_v2_read_scope_triage_state_field "$state_file" "status")" == "completed" ]]
+    )
+) && pass "36. completed checkpoint skips scope triage on resume" \
+  || fail "36. completed checkpoint skips scope triage on resume"
+
+# ---------- Test 37: invalid JSON fails open ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-invalid-json)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    state_file="$comp_dir/execution-scope-triage.json"
+
+    printf 'executor out-of-scope tracked change\n' > "$repo_root/docs/out_of_scope.md"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' 'not json' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        grep -q '^executor out-of-scope tracked change$' "$repo_root/docs/out_of_scope.md"
+        grep -q 'docs/out_of_scope.md' "$diff_file"
+        [[ "$(_v2_read_scope_triage_state_field "$state_file" "status")" == "failed-open" ]]
+        [[ "$(_v2_read_scope_triage_state_field "$state_file" "failure_reason")" == "Scope triage returned unparseable JSON" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "classifications" "docs/out_of_scope.md" "classification")" == "PLAN_GAP" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "actions" "docs/out_of_scope.md" "action")" == "kept" ]]
+    )
+) && pass "37. scope triage invalid JSON fails open" \
+  || fail "37. scope triage invalid JSON fails open"
+
+# ---------- Test 38: incomplete coverage fails open ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-incomplete-coverage)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    state_file="$comp_dir/execution-scope-triage.json"
+    second_file="$repo_root/docs/second_out_of_scope.md"
+
+    printf 'baseline\n' > "$second_file"
+    git_commit_all "$repo_root" "add second out of scope file"
+    printf 'changed first out of scope\n' > "$repo_root/docs/out_of_scope.md"
+    printf 'changed second out of scope\n' > "$second_file"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' '[{"file":"docs/out_of_scope.md","classification":"PLAN_GAP","reasoning":"Only one file was classified"}]' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        grep -q '^changed first out of scope$' "$repo_root/docs/out_of_scope.md"
+        grep -q '^changed second out of scope$' "$second_file"
+        grep -q 'docs/out_of_scope.md' "$diff_file"
+        grep -q 'docs/second_out_of_scope.md' "$diff_file"
+        [[ "$(_v2_read_scope_triage_state_field "$state_file" "status")" == "failed-open" ]]
+        [[ "$(_v2_read_scope_triage_state_field "$state_file" "failure_reason")" == "Scope triage output did not classify the expected file set" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "classifications" "docs/out_of_scope.md" "classification")" == "PLAN_GAP" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "actions" "docs/out_of_scope.md" "action")" == "kept" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "classifications" "docs/second_out_of_scope.md" "classification")" == "PLAN_GAP" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "actions" "docs/second_out_of_scope.md" "action")" == "kept" ]]
+    )
+) && pass "38. scope triage incomplete coverage fails open" \
+  || fail "38. scope triage incomplete coverage fails open"
+
+# ---------- Test 39: multi-file mixed classification ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-mixed-classification)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    state_file="$comp_dir/execution-scope-triage.json"
+    tracked_plan_gap="$repo_root/docs/plan_gap.md"
+    tracked_noise="$repo_root/docs/out_of_scope.md"
+    untracked_noise="$repo_root/docs/new-outside-scope.md"
+    quarantined_file="$comp_dir/scope-triage-quarantine/docs/new-outside-scope.md"
+
+    printf 'baseline\n' > "$tracked_plan_gap"
+    git_commit_all "$repo_root" "add plan gap file"
+    printf 'tracked plan gap\n' > "$tracked_plan_gap"
+    printf 'tracked noise\n' > "$tracked_noise"
+    printf 'untracked noise\n' > "$untracked_noise"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' '[
+{"file":"docs/plan_gap.md","classification":"PLAN_GAP","reasoning":"Needed transitive dependency"},
+{"file":"docs/out_of_scope.md","classification":"NOISE","reasoning":"Unrelated docs churn"},
+{"file":"docs/new-outside-scope.md","classification":"NOISE","reasoning":"Generated noise"}
+]' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "HEAD" "$plan_file" "$diff_file" ""
+
+        grep -q '^tracked plan gap$' "$tracked_plan_gap"
+        grep -q '^baseline$' "$tracked_noise"
+        [[ ! -e "$untracked_noise" ]]
+        [[ -f "$quarantined_file" ]]
+        grep -q 'docs/plan_gap.md' "$diff_file"
+        ! grep -q 'docs/out_of_scope.md' "$diff_file"
+        ! grep -q 'docs/new-outside-scope.md' "$diff_file"
+        [[ "$(_v2_read_scope_triage_state_field "$state_file" "status")" == "completed" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "classifications" "docs/plan_gap.md" "classification")" == "PLAN_GAP" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "actions" "docs/plan_gap.md" "action")" == "kept" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "classifications" "docs/out_of_scope.md" "classification")" == "NOISE" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "actions" "docs/out_of_scope.md" "action")" == "reverted" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "classifications" "docs/new-outside-scope.md" "classification")" == "NOISE" ]]
+        [[ "$(scope_triage_state_record_field "$state_file" "actions" "docs/new-outside-scope.md" "action")" == "quarantined" ]]
+    )
+) && pass "39. scope triage handles mixed PLAN_GAP, tracked NOISE, and untracked NOISE" \
+  || fail "39. scope triage handles mixed PLAN_GAP, tracked NOISE, and untracked NOISE"
+
+# ---------- Test 40: raw NOISE stays out of estimate scope even when review keeps the file ----------
+(
+    repo_root="$(setup_scope_repo scope-triage-estimate-noise)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_dir="$repo_root/docs/tasks/open/$slug"
+    task_file="$task_dir/task.md"
+    plan_file="$task_dir/competitive/revised-plan.md"
+    comp_dir="$task_dir/competitive"
+    diff_file="$comp_dir/execution-diff.patch"
+    state_file="$comp_dir/execution-scope-triage.json"
+    tracked_noise="$repo_root/src/out_of_scope.py"
+    standard_numstat="$comp_dir/execution-diff.numstat.tsv"
+    estimate_numstat="$comp_dir/execution-diff.estimate.numstat.tsv"
+
+    printf 'baseline\n' > "$tracked_noise"
+    git_commit_all "$repo_root" "add tracked out-of-scope source"
+    before_sha="$(git -C "$repo_root" rev-parse HEAD)"
+    printf 'baseline\nin scope change\n' > "$repo_root/src/in_scope.py"
+    printf 'baseline\ntracked raw noise\ntracked raw noise 2\n' > "$tracked_noise"
+    git_commit_all "$repo_root" "executor changes"
+    reset_test_log
+
+    (
+        cd "$repo_root"
+        prime_scope_triage_env "$repo_root" "$task_dir"
+        prepare_agent_request() {
+            AGENT_PROMPT_BODY="scope-triage"
+            AGENT_SYSTEM_PROMPT=""
+        }
+        run_agent() {
+            printf '%s\n' '[{"file":"src/out_of_scope.py","classification":"NOISE","reasoning":"Unrelated helper churn"}]' > "$5"
+            return 0
+        }
+
+        capture_diff_artifact "$before_sha" "$diff_file" "$task_file" "$plan_file"
+        _v2_run_scope_triage "$task_file" "Phase 4" "$comp_dir" "$before_sha" "$plan_file" "$diff_file" ""
+
+        grep -q 'src/out_of_scope.py' "$diff_file"
+        grep -q 'src/out_of_scope.py' "$standard_numstat"
+        [[ "$(scope_triage_state_record_field "$state_file" "classifications" "src/out_of_scope.py" "classification")" == "PLAN_GAP" ]]
+        ! grep -q 'src/out_of_scope.py' "$estimate_numstat"
+        printf '%s\n' "$(_v2_read_scope_triage_state_lines "$state_file" "estimate_scope_paths")" | grep -qx 'src/in_scope.py'
+        ! printf '%s\n' "$(_v2_read_scope_triage_state_lines "$state_file" "estimate_scope_paths")" | grep -qx 'src/out_of_scope.py'
+        result=$(build_v2_traditional_dev_proxy_json "$task_file" 0)
+        echo "$result" | jq -e '.scope_source == "frozen-v2-estimate-numstat"' >/dev/null
+        echo "$result" | jq -e '.insertions == 1 and .deletions == 0 and .net_lines == 1' >/dev/null
+    )
+) && pass "40. scope triage keeps raw NOISE out of estimate scope even when review keeps the file" \
+  || fail "40. scope triage keeps raw NOISE out of estimate scope even when review keeps the file"
 
 echo ""
 echo "Passed: $PASSED/$TOTAL"
