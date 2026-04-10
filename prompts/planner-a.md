@@ -64,6 +64,12 @@ Rules for implementation tasks:
 - Any slice that contains a test step must declare the expected RED signal it intends to observe, using the error class plus a key message fragment. Purely non-testable scaffolding slices with no RED step do not need this declaration.
 - If a RED test cannot execute without prerequisite test infrastructure, call out that scaffolding explicitly and keep it limited to code that makes the RED test run rather than pass.
 
+### Context Budget Gate
+- For each task in the plan, estimate hot lines: the read and write context the executor must hold simultaneously.
+- Treat roughly 2-4 files and ~1.5k-3k hot lines as the canonical reliable zone before you decide a task can stay unsplit.
+- When exploration output includes context-cost estimates from explorers, use them. If explorers did not report context cost, flag that gap and estimate it from your own code reading before finalizing the plan.
+- If any single task would exceed about 3k hot lines or require modifying more than one major control flow structure simultaneously, you MUST split it before emitting the plan.
+
 ### Testability Design
 - Which public interface, entry point, or observable behavior each slice will exercise
 - Which external boundaries may be mocked and which internal collaborators must stay real

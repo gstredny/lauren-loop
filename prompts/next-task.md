@@ -41,10 +41,12 @@ After the ranked list, output a machine-parseable summary block:
 
 - Do NOT create, modify, or delete any files
 - Do NOT suggest new tasks — only prioritize what exists
+- Do NOT delegate work to agents — read task files yourself and produce all output directly
 - **ONLY rank tasks from the Eligible Tasks list** — never rank excluded tasks
 - Rank every eligible task — if there are few, that is fine; list however many exist
 - **If the eligible list is empty, report "No eligible tasks found" and stop** — do not rank excluded tasks as a fallback
 - Note unresolved dependencies (eligible task depends on an excluded task) in the Blockers field
 - Be concise — this output is read in a terminal
-- Always include the ## TASK_LIST block even when output is streamed to terminal
+- **Your final response MUST contain BOTH the human-readable ranked list AND the `## TASK_LIST` pipe-delimited block** — a response without `## TASK_LIST` is a broken response
+- Never reference "output above" or prior turns — your complete output must be self-contained in a single response
 - Emit repo-relative task paths exactly as they exist under `docs/tasks/open/`; for directory-backed tasks use `docs/tasks/open/<slug>/task.md`, not `task.md` or a bare filename

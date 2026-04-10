@@ -5,7 +5,17 @@
 ## Created: {{TIMESTAMP}}
 
 ## Constraints
-<!-- LAUREN_LOOP:INJECT_RULES -->
+- No mock data — Azure/model fails → return error message
+- .env is read-only
+- No new endpoints — modify existing, maintain backward compatibility
+- Product data integrity — never modify product_data.json structure
+- Managed identity — never toggle
+- SAS URLs never sent to LLM
+- Packaging — protected code, read docs before modifying
+- ARR affinity required
+- Never recreate singletons (PyTorch model, ProductLookupService)
+- Preserve LRU cache decorators
+- UI changes require explicit user approval
 
 ## Current Plan
 (Planner writes here)

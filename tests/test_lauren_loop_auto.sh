@@ -149,15 +149,80 @@ ${plan_body}
 ## Plan History
 (Archived plan+critique rounds)
 
-## Left Off At:
+## Left Off At
 Not started.
 
-## Attempts:
+## Attempts
 (none yet)
 
 ## Execution Log
 (Timestamped round results)
 EOF
+}
+
+write_template_backed_v1_task() {
+    local path="$1" title="$2" status="$3" goal="$4"
+    mkdir -p "$(dirname "$path")"
+    cp "$REPO_ROOT/docs/tasks/TEMPLATE.md" "$path"
+    TASK_TITLE="$title" TASK_STATUS="$status" TASK_GOAL="$goal" perl -0pi -e '
+        s/^## Task: \[name\]$/## Task: $ENV{TASK_TITLE}/m;
+        s/^## Status: .*$/## Status: $ENV{TASK_STATUS}/m;
+        s/^## Goal\n.*?(?=^## Scope)/## Goal\n$ENV{TASK_GOAL}\n\n/sm;
+    ' "$path"
+    cat >> "$path" <<'EOF'
+
+## Current Plan
+Confirm canonical workflow section behavior.
+
+## Critique
+(Critic writes here)
+
+## Plan History
+(Archived plan+critique rounds)
+
+## Execution Log
+- [2026-03-12 12:00:00] VERIFY: template-backed workflow fixture prepared
+EOF
+}
+
+run_lib_helper() {
+    local fixture="$1"
+    shift
+    (
+        set -euo pipefail
+        SCRIPT_DIR="$fixture"
+        RED=""
+        GREEN=""
+        YELLOW=""
+        BLUE=""
+        NC=""
+        source "$fixture/lib/lauren-loop-utils.sh"
+        "$@"
+    )
+}
+
+section_body_for_test() {
+    local task_file="$1" header_pattern="$2"
+    awk -v header_pattern="$header_pattern" '
+        $0 ~ header_pattern { capture = 1; next }
+        /^## / && capture { exit }
+        capture { print }
+    ' "$task_file"
+}
+
+assert_canonical_workflow_headers() {
+    local task_file="$1"
+    local left_off_count="" attempts_count="" legacy_left_off_count="" legacy_attempts_count=""
+
+    left_off_count=$(grep -Ec '^## Left Off At[[:space:]]*$' "$task_file" || true)
+    attempts_count=$(grep -Ec '^## Attempts[[:space:]]*$' "$task_file" || true)
+    legacy_left_off_count=$(grep -Ec '^## Left Off At:[[:space:]]*$' "$task_file" || true)
+    legacy_attempts_count=$(grep -Ec '^## Attempts:[[:space:]]*$' "$task_file" || true)
+
+    [ "$left_off_count" -eq 1 ] || return 1
+    [ "$attempts_count" -eq 1 ] || return 1
+    [ "$legacy_left_off_count" -eq 0 ] || return 1
+    [ "$legacy_attempts_count" -eq 0 ] || return 1
 }
 
 init_fixture_git() {
@@ -210,6 +275,181 @@ EOF
 run_v1_auto_success_case() {
     local fixture="$1" slug="$2" goal="$3"
     install_v1_auto_success_claude "$fixture"
+    init_fixture_git "$fixture"
+    CLAUDE_LOG="$fixture/claude.log" run_auto "$fixture" auto "$slug" "$goal" --simple --model sonnet > "$fixture/output.txt" 2>&1
+}
+
+install_v1_auto_corruption_claude() {
+    local fixture="$1"
+    cat > "$fixture/bin/claude" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ -n "${CLAUDE_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$CLAUDE_LOG"
+fi
+if [ -n "${FAKE_CLASSIFY_OUTPUT:-}" ]; then
+    printf '%s\n' "$FAKE_CLASSIFY_OUTPUT"
+    exit "${FAKE_CLASSIFY_EXIT:-0}"
+fi
+
+task_instruction=""
+previous=""
+for arg in "$@"; do
+    if [ "$previous" = "-p" ]; then
+        task_instruction="$arg"
+        break
+    fi
+    previous="$arg"
+done
+
+task_file=$(printf '%s\n' "$task_instruction" | sed -n 's/.*Read the task file at \([^[:space:]]*\.md\)\..*/\1/p')
+[ -n "$task_file" ] || task_file=$(printf '%s\n' "$task_instruction" | sed -n 's/.*Read the task file at \([^[:space:]]*\.md\).*/\1/p')
+[ -n "$task_file" ] || { echo "missing task file path in lead stub" >&2; exit 98; }
+
+mkdir -p src
+printf 'print("fixture execution change")\n' > src/example.py
+git add src/example.py
+git commit -q -m "fixture execution change"
+
+perl -0pi -e 's/^## Status: .*/## Status: executed/m' "$task_file"
+perl -0pi -e 's/^## Critique\n//m' "$task_file"
+exit 0
+EOF
+    chmod +x "$fixture/bin/claude"
+}
+
+run_v1_auto_corruption_case() {
+    local fixture="$1" slug="$2" goal="$3"
+    install_v1_auto_corruption_claude "$fixture"
+    init_fixture_git "$fixture"
+    CLAUDE_LOG="$fixture/claude.log" run_auto "$fixture" auto "$slug" "$goal" --simple --model sonnet > "$fixture/output.txt" 2>&1
+}
+
+install_v1_auto_sibling_creation_claude() {
+    local fixture="$1"
+    cat > "$fixture/bin/claude" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ -n "${CLAUDE_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$CLAUDE_LOG"
+fi
+if [ -n "${FAKE_CLASSIFY_OUTPUT:-}" ]; then
+    printf '%s\n' "$FAKE_CLASSIFY_OUTPUT"
+    exit "${FAKE_CLASSIFY_EXIT:-0}"
+fi
+
+task_instruction=""
+previous=""
+for arg in "$@"; do
+    if [ "$previous" = "-p" ]; then
+        task_instruction="$arg"
+        break
+    fi
+    previous="$arg"
+done
+
+task_file=$(printf '%s\n' "$task_instruction" | sed -n 's/.*Read the task file at \([^[:space:]]*\.md\)\..*/\1/p')
+[ -n "$task_file" ] || task_file=$(printf '%s\n' "$task_instruction" | sed -n 's/.*Read the task file at \([^[:space:]]*\.md\).*/\1/p')
+[ -n "$task_file" ] || { echo "missing task file path in lead stub" >&2; exit 98; }
+
+fixture_root="$(cd "$(dirname "$0")/.." && pwd)"
+created_task="$fixture_root/docs/tasks/open/lauren-loop/unexpected-created.md"
+mkdir -p "$(dirname "$created_task")"
+cat > "$created_task" <<'TASK'
+## Task: Unexpected Created
+## Status: in progress
+## Goal: This sibling task should be quarantined.
+TASK
+git add "$created_task"
+
+perl -0pi -e 's/^## Status: .*/## Status: executed/m' "$task_file"
+exit 0
+EOF
+    chmod +x "$fixture/bin/claude"
+}
+
+run_v1_auto_sibling_creation_case() {
+    local fixture="$1" slug="$2" goal="$3"
+    install_v1_auto_sibling_creation_claude "$fixture"
+    init_fixture_git "$fixture"
+    CLAUDE_LOG="$fixture/claude.log" run_auto "$fixture" auto "$slug" "$goal" --simple --model sonnet > "$fixture/output.txt" 2>&1
+}
+
+install_v1_auto_corruption_and_sibling_delete_claude() {
+    local fixture="$1"
+    cat > "$fixture/bin/claude" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ -n "${CLAUDE_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$CLAUDE_LOG"
+fi
+if [ -n "${FAKE_CLASSIFY_OUTPUT:-}" ]; then
+    printf '%s\n' "$FAKE_CLASSIFY_OUTPUT"
+    exit "${FAKE_CLASSIFY_EXIT:-0}"
+fi
+
+task_instruction=""
+previous=""
+for arg in "$@"; do
+    if [ "$previous" = "-p" ]; then
+        task_instruction="$arg"
+        break
+    fi
+    previous="$arg"
+done
+
+task_file=$(printf '%s\n' "$task_instruction" | sed -n 's/.*Read the task file at \([^[:space:]]*\.md\)\..*/\1/p')
+[ -n "$task_file" ] || task_file=$(printf '%s\n' "$task_instruction" | sed -n 's/.*Read the task file at \([^[:space:]]*\.md\).*/\1/p')
+[ -n "$task_file" ] || { echo "missing task file path in lead stub" >&2; exit 98; }
+
+fixture_root="$(cd "$(dirname "$0")/.." && pwd)"
+rm -f "$fixture_root/docs/tasks/open/sibling-delete/task.md"
+
+perl -0pi -e 's/^## Status: .*/## Status: executed/m' "$task_file"
+perl -0pi -e 's/^## Critique\n//m' "$task_file"
+exit 0
+EOF
+    chmod +x "$fixture/bin/claude"
+}
+
+run_v1_auto_corruption_and_sibling_delete_case() {
+    local fixture="$1" slug="$2" goal="$3"
+    install_v1_auto_corruption_and_sibling_delete_claude "$fixture"
+    init_fixture_git "$fixture"
+    CLAUDE_LOG="$fixture/claude.log" run_auto "$fixture" auto "$slug" "$goal" --simple --model sonnet > "$fixture/output.txt" 2>&1
+}
+
+install_v1_auto_timeout_and_sibling_creation_claude() {
+    local fixture="$1"
+    cat > "$fixture/bin/claude" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ -n "${CLAUDE_LOG:-}" ]; then
+    printf '%s\n' "$*" >> "$CLAUDE_LOG"
+fi
+if [ -n "${FAKE_CLASSIFY_OUTPUT:-}" ]; then
+    printf '%s\n' "$FAKE_CLASSIFY_OUTPUT"
+    exit "${FAKE_CLASSIFY_EXIT:-0}"
+fi
+
+fixture_root="$(cd "$(dirname "$0")/.." && pwd)"
+created_task="$fixture_root/docs/tasks/open/lauren-loop/unexpected-timeout-created.md"
+mkdir -p "$(dirname "$created_task")"
+cat > "$created_task" <<'TASK'
+## Task: Unexpected Timeout Created
+## Status: in progress
+## Goal: This sibling task should be quarantined after a timeout.
+TASK
+git add "$created_task"
+
+exit 124
+EOF
+    chmod +x "$fixture/bin/claude"
+}
+
+run_v1_auto_timeout_and_sibling_creation_case() {
+    local fixture="$1" slug="$2" goal="$3"
+    install_v1_auto_timeout_and_sibling_creation_claude "$fixture"
     init_fixture_git "$fixture"
     CLAUDE_LOG="$fixture/claude.log" run_auto "$fixture" auto "$slug" "$goal" --simple --model sonnet > "$fixture/output.txt" 2>&1
 }
@@ -500,7 +740,7 @@ EOF
 
     run_v1_auto_success_case "$fixture" "v1-auto-attempts" "V1 auto attempts"
 
-    grep -q '^## Attempts:$' "$task_file"
+    grep -q '^## Attempts$' "$task_file"
     grep -q 'Routed V1 auto execution completed via lead pipeline' "$task_file"
     grep -q 'Latest execution evidence: GREEN: v1_auto_success_path - PASS (3 total)' "$task_file"
 ) && pass "16b. routed V1 auto success appends an Attempts entry" \
@@ -512,14 +752,410 @@ EOF
 
     run_v1_auto_success_case "$fixture" "v1-auto-left-off" "V1 auto left off"
 
-    grep -q '^## Left Off At:$' "$task_file"
+    grep -q '^## Left Off At$' "$task_file"
     grep -q 'Automated V1 lead execution completed\.' "$task_file"
     grep -q 'Task is ready for human verification\.' "$task_file"
     ! awk '
-        /^## Left Off At:$/ { getline; print; exit }
+        /^## Left Off At$/ { getline; print; exit }
     ' "$task_file" | grep -qx 'Not started\.'
 ) && pass "16c. routed V1 auto success updates Left Off At" \
   || fail "16c. routed V1 auto success updates Left Off At"
+
+(
+    fixture=$(setup_fixture "v1-auto-corruption-recovery")
+    slug="v1-auto-corruption-recovery"
+    task_file="$fixture/docs/tasks/open/pilot-${slug}.md"
+    diff_file="$fixture/logs/pilot/pilot-${slug}-diff.patch"
+    quarantine_dir="$fixture/logs/pilot/quarantine"
+
+    run_v1_auto_corruption_case "$fixture" "$slug" "V1 auto corruption recovery"
+
+    [ -d "$quarantine_dir" ]
+    quarantine_file=$(find "$quarantine_dir" -maxdepth 1 -type f -name "${slug}-*.md" | head -n 1)
+
+    [ -f "$diff_file" ] && \
+    [ -s "$diff_file" ] && \
+    grep -q 'diff --git' "$diff_file" && \
+    grep -q 'src/example.py' "$diff_file" && \
+    [ -n "$quarantine_file" ] && \
+    [ -f "$quarantine_file" ] && \
+    ! grep -q '^## Critique$' "$quarantine_file" && \
+    grep -q '^## Status: needs-human-review$' "$task_file" && \
+    grep -q '^## Critique$' "$task_file"
+) && pass "16c1. routed V1 auto corruption preserves diff and quarantines corrupted task file" \
+  || fail "16c1. routed V1 auto corruption preserves diff and quarantines corrupted task file"
+
+(
+    fixture=$(setup_fixture "v1-sibling-task-drift-helpers")
+    active_task="$fixture/docs/tasks/open/pilot-active.md"
+    modified_task="$fixture/docs/tasks/open/sibling-mod.md"
+    deleted_task="$fixture/docs/tasks/open/sibling-delete/task.md"
+    created_task="$fixture/docs/tasks/open/lauren-loop/helper-created.md"
+    ignored_task="$fixture/docs/tasks/open/sibling-delete/competitive/ignored.md"
+    snapshot_dir="$fixture/task-snapshot"
+    drift_file="$fixture/task-drift.tsv"
+    quarantine_root="$fixture/logs/pilot/quarantine/helper-created"
+
+    write_task_file "$active_task" "Active Task" "in progress" "Protect active task"
+    write_task_file "$modified_task" "Sibling Modified" "in progress" "Protect sibling task"
+    write_task_file "$deleted_task" "Sibling Deleted" "in progress" "Restore deleted task"
+    mkdir -p "$(dirname "$ignored_task")"
+    printf '# Ignored competitive artifact\n' > "$ignored_task"
+    init_fixture_git "$fixture"
+
+    run_lib_helper "$fixture" _v1_snapshot_canonical_open_task_files "$snapshot_dir" "$active_task"
+
+    printf '## changed sibling\n' >> "$modified_task"
+    rm -f "$deleted_task"
+    mkdir -p "$(dirname "$created_task")"
+    cat > "$created_task" <<'EOF'
+## Task: Helper Created
+## Status: in progress
+## Goal: Created sibling task for drift helper coverage
+EOF
+    printf '# still ignored\n' > "$ignored_task"
+
+    run_lib_helper "$fixture" _v1_detect_canonical_open_task_file_drift "$snapshot_dir" "$active_task" "$drift_file"
+
+    grep -q $'^modified\tdocs/tasks/open/sibling-mod.md$' "$drift_file"
+    grep -q $'^deleted\tdocs/tasks/open/sibling-delete/task.md$' "$drift_file"
+    grep -q $'^created\tdocs/tasks/open/lauren-loop/helper-created.md$' "$drift_file"
+    ! grep -q 'ignored.md' "$drift_file"
+
+    run_lib_helper "$fixture" _v1_restore_canonical_open_task_file_drift "$snapshot_dir" "$drift_file" "$quarantine_root"
+
+    grep -q 'Sibling Modified' "$modified_task"
+    [ -f "$deleted_task" ]
+    [ ! -e "$created_task" ]
+    [ -f "$quarantine_root/docs/tasks/open/lauren-loop/helper-created.md" ]
+    [ -f "$ignored_task" ]
+) && pass "16c2. V1 sibling-task helpers detect create-modify-delete drift and restore canonical task files" \
+  || fail "16c2. V1 sibling-task helpers detect create-modify-delete drift and restore canonical task files"
+
+(
+    fixture=$(setup_fixture "v1-auto-sibling-created")
+    slug="v1-auto-sibling-created"
+    task_file="$fixture/docs/tasks/open/pilot-${slug}.md"
+    created_task="$fixture/docs/tasks/open/lauren-loop/unexpected-created.md"
+    drift_file="$fixture/logs/pilot/pilot-${slug}-sibling-task-drift.tsv"
+    diff_file="$fixture/logs/pilot/pilot-${slug}-diff.patch"
+    quarantine_root="$fixture/logs/pilot/quarantine/sibling-task-files-${slug}-$(date +%Y%m%d-%H%M%S)"
+
+    run_v1_auto_sibling_creation_case "$fixture" "$slug" "V1 auto sibling created"
+
+    quarantined_dir=$(find "$fixture/logs/pilot/quarantine" -maxdepth 1 -type d -name "sibling-task-files-${slug}-*" | head -n 1)
+
+    [ -f "$drift_file" ] && \
+    grep -q $'^created\tdocs/tasks/open/lauren-loop/unexpected-created.md$' "$drift_file" && \
+    [ -f "$diff_file" ] && \
+    [ -s "$diff_file" ] && \
+    grep -q 'unexpected-created.md' "$diff_file" && \
+    [ ! -e "$created_task" ] && \
+    [ -n "$quarantined_dir" ] && \
+    [ -f "$quarantined_dir/docs/tasks/open/lauren-loop/unexpected-created.md" ] && \
+    grep -q '^## Status: needs-human-review$' "$task_file" && \
+    grep -q 'Sibling canonical task files mutated after Lead run' "$task_file"
+) && pass "16c3. routed V1 auto quarantines created sibling canonical task files and blocks the active task" \
+  || fail "16c3. routed V1 auto quarantines created sibling canonical task files and blocks the active task"
+
+(
+    fixture=$(setup_fixture "v1-auto-corruption-and-sibling-delete")
+    slug="v1-auto-corruption-and-sibling-delete"
+    task_file="$fixture/docs/tasks/open/pilot-${slug}.md"
+    sibling_task="$fixture/docs/tasks/open/sibling-delete/task.md"
+    drift_file="$fixture/logs/pilot/pilot-${slug}-sibling-task-drift.tsv"
+    diff_file="$fixture/logs/pilot/pilot-${slug}-diff.patch"
+    quarantine_dir="$fixture/logs/pilot/quarantine"
+
+    write_task_file "$sibling_task" "Sibling Delete" "in progress" "Restore deleted sibling task"
+    run_v1_auto_corruption_and_sibling_delete_case "$fixture" "$slug" "V1 auto corruption plus sibling delete"
+
+    quarantine_file=$(find "$quarantine_dir" -maxdepth 1 -type f -name "${slug}-*.md" | head -n 1)
+
+    [ -f "$drift_file" ] && \
+    grep -q $'^deleted\tdocs/tasks/open/sibling-delete/task.md$' "$drift_file" && \
+    [ -f "$diff_file" ] && \
+    [ -s "$diff_file" ] && \
+    grep -q 'sibling-delete/task.md' "$diff_file" && \
+    [ -f "$sibling_task" ] && \
+    grep -q 'Sibling Delete' "$sibling_task" && \
+    [ -n "$quarantine_file" ] && \
+    [ -f "$quarantine_file" ] && \
+    ! grep -q '^## Critique$' "$quarantine_file" && \
+    grep -q '^## Status: needs-human-review$' "$task_file" && \
+    grep -q '^## Critique$' "$task_file" && \
+    grep -q 'sibling canonical task files mutated' "$task_file"
+) && pass "16c4. routed V1 auto restores deleted sibling task files even when the active task is corrupted" \
+  || fail "16c4. routed V1 auto restores deleted sibling task files even when the active task is corrupted"
+
+(
+    fixture=$(setup_fixture "v1-auto-timeout-and-sibling-created")
+    slug="v1-auto-timeout-and-sibling-created"
+    task_file="$fixture/docs/tasks/open/pilot-${slug}.md"
+    created_task="$fixture/docs/tasks/open/lauren-loop/unexpected-timeout-created.md"
+    drift_file="$fixture/logs/pilot/pilot-${slug}-sibling-task-drift.tsv"
+    diff_file="$fixture/logs/pilot/pilot-${slug}-diff.patch"
+
+    run_v1_auto_timeout_and_sibling_creation_case "$fixture" "$slug" "V1 auto timeout plus sibling create"
+
+    quarantined_dir=$(find "$fixture/logs/pilot/quarantine" -maxdepth 1 -type d -name "sibling-task-files-${slug}-*" | head -n 1)
+
+    [ -f "$drift_file" ] && \
+    grep -q $'^created\tdocs/tasks/open/lauren-loop/unexpected-timeout-created.md$' "$drift_file" && \
+    [ -f "$diff_file" ] && \
+    [ -s "$diff_file" ] && \
+    grep -q 'unexpected-timeout-created.md' "$diff_file" && \
+    [ ! -e "$created_task" ] && \
+    [ -n "$quarantined_dir" ] && \
+    [ -f "$quarantined_dir/docs/tasks/open/lauren-loop/unexpected-timeout-created.md" ] && \
+    grep -q '^## Status: needs-human-review$' "$task_file" && \
+    grep -q 'Lead timed out after' "$task_file" && \
+    grep -q 'Sibling canonical task files mutated after Lead run' "$task_file"
+) && pass "16c5. routed V1 auto restores sibling task drift even when the lead times out" \
+  || fail "16c5. routed V1 auto restores sibling task drift even when the lead times out"
+
+(
+    fixture=$(setup_fixture "template-backed-success-handoff")
+    task_file="$fixture/docs/tasks/open/pilot-template-backed-success.md"
+    write_template_backed_v1_task "$task_file" "Template Backed Success" "in progress" "Template-backed success handoff"
+
+    run_lib_helper "$fixture" finalize_v1_verification_handoff "$task_file" \
+        "Template-backed handoff completed. Latest execution evidence: GREEN: template_helper_success - PASS. Task is ready for human verification." \
+        "- 2026-04-07: Template-backed success handoff executed. Latest execution evidence: GREEN: template_helper_success - PASS. -> Result: worked"
+
+    assert_canonical_workflow_headers "$task_file"
+    grep -q '^## Status: needs verification$' "$task_file"
+    printf '%s\n' "$(section_body_for_test "$task_file" '^## Left Off At[[:space:]]*$')" | grep -q 'Latest execution evidence: GREEN: template_helper_success - PASS'
+    printf '%s\n' "$(section_body_for_test "$task_file" '^## Left Off At[[:space:]]*$')" | grep -q 'Task is ready for human verification\.'
+    printf '%s\n' "$(section_body_for_test "$task_file" '^## Attempts[[:space:]]*$')" | grep -q 'Template-backed success handoff executed'
+    ! printf '%s\n' "$(section_body_for_test "$task_file" '^## Attempts[[:space:]]*$')" | grep -Fq 'what was tried'
+    ! printf '%s\n' "$(section_body_for_test "$task_file" '^## Left Off At[[:space:]]*$')" | grep -Fq '[exactly where work stopped'
+) && pass "16d. template-backed success handoff canonicalizes workflow headers" \
+  || fail "16d. template-backed success handoff canonicalizes workflow headers"
+
+(
+    fixture=$(setup_fixture "template-backed-needs-human-review")
+    task_file="$fixture/docs/tasks/open/pilot-template-backed-needs-human-review.md"
+    write_template_backed_v1_task "$task_file" "Template Backed Human Review" "in progress" "Template-backed human review handoff"
+
+    run_lib_helper "$fixture" ensure_task_workflow_sections "$task_file"
+    run_lib_helper "$fixture" set_task_status "$task_file" "needs-human-review"
+    run_lib_helper "$fixture" set_task_left_off_at "$task_file" \
+        "Human review required after template-backed handoff. Latest execution evidence: BLOCKED: manual review required."
+    run_lib_helper "$fixture" append_task_attempt "$task_file" \
+        "- 2026-04-07: Template-backed needs-human-review handoff recorded. Latest execution evidence: BLOCKED: manual review required. -> Result: blocked"
+
+    assert_canonical_workflow_headers "$task_file"
+    grep -q '^## Status: needs-human-review$' "$task_file"
+    printf '%s\n' "$(section_body_for_test "$task_file" '^## Left Off At[[:space:]]*$')" | grep -q 'Human review required after template-backed handoff'
+    printf '%s\n' "$(section_body_for_test "$task_file" '^## Attempts[[:space:]]*$')" | grep -q 'Template-backed needs-human-review handoff recorded'
+    ! printf '%s\n' "$(section_body_for_test "$task_file" '^## Attempts[[:space:]]*$')" | grep -Fq 'what was tried'
+) && pass "16e. template-backed needs-human-review handoff canonicalizes workflow headers" \
+  || fail "16e. template-backed needs-human-review handoff canonicalizes workflow headers"
+
+(
+    fixture=$(setup_fixture "duplicate-attempts-normalization")
+    task_file="$fixture/docs/tasks/open/pilot-duplicate-attempts.md"
+    cat > "$task_file" <<'EOF'
+## Task: duplicate-attempts
+## Status: in progress
+## Goal: Normalize duplicate Attempts sections
+
+## Current Plan
+Plan body
+
+## Critique
+Critique body
+
+## Plan History
+Plan history body
+
+## Left Off At
+Meaningful left off body.
+
+## Attempts:
+(none yet)
+- 2026-04-01: First attempt -> Result: worked
+- 2026-04-02: Duplicate attempt -> Result: partial
+
+## Attempts
+- 2026-04-02: Duplicate attempt -> Result: partial
+- [date]: what was tried -> what happened -> result (worked/failed/partial)
+- 2026-04-03: Second attempt -> Result: worked
+
+## Execution Log
+EOF
+
+    run_lib_helper "$fixture" ensure_task_workflow_sections "$task_file"
+
+    assert_canonical_workflow_headers "$task_file"
+    expected_attempts="$(cat <<'EOF'
+- 2026-04-01: First attempt -> Result: worked
+- 2026-04-02: Duplicate attempt -> Result: partial
+- 2026-04-03: Second attempt -> Result: worked
+EOF
+)"
+    [ "$(section_body_for_test "$task_file" '^## Attempts[[:space:]]*$')" = "$expected_attempts" ]
+) && pass "16f. duplicate Attempts sections merge in order and drop placeholders" \
+  || fail "16f. duplicate Attempts sections merge in order and drop placeholders"
+
+(
+    fixture=$(setup_fixture "duplicate-left-off-normalization")
+    task_file="$fixture/docs/tasks/open/pilot-duplicate-left-off.md"
+    cat > "$task_file" <<'EOF'
+## Task: duplicate-left-off
+## Status: in progress
+## Goal: Normalize duplicate Left Off At sections
+
+## Current Plan
+Plan body
+
+## Critique
+Critique body
+
+## Plan History
+Plan history body
+
+## Left Off At:
+Not started.
+
+## Left Off At
+Meaningful body B.
+
+## Attempts
+(none yet)
+
+## Execution Log
+EOF
+
+    run_lib_helper "$fixture" ensure_task_workflow_sections "$task_file"
+
+    assert_canonical_workflow_headers "$task_file"
+    [ "$(section_body_for_test "$task_file" '^## Left Off At[[:space:]]*$')" = "Meaningful body B." ]
+) && pass "16g. duplicate Left Off At sections keep the meaningful body" \
+  || fail "16g. duplicate Left Off At sections keep the meaningful body"
+
+(
+    fixture=$(setup_fixture "duplicate-left-off-conflict")
+    task_file="$fixture/docs/tasks/open/pilot-duplicate-left-off-conflict.md"
+    warning_file="$fixture/left-off-warning.txt"
+    cat > "$task_file" <<'EOF'
+## Task: duplicate-left-off-conflict
+## Status: in progress
+## Goal: Fail closed on conflicting Left Off At sections
+
+## Current Plan
+Plan body
+
+## Critique
+Critique body
+
+## Plan History
+Plan history body
+
+## Left Off At:
+Meaningful content A.
+
+## Left Off At
+Meaningful content B.
+
+## Attempts
+(none yet)
+
+## Execution Log
+EOF
+
+    set +e
+    run_lib_helper "$fixture" ensure_task_workflow_sections "$task_file" 2> "$warning_file"
+    rc=$?
+    set -e
+
+    [ "$rc" -ne 0 ]
+    grep -q 'Conflicting logical Left Off At sections found' "$warning_file"
+    [ "$(grep -Ec '^## Left Off At:?[[:space:]]*$' "$task_file" || true)" -eq 2 ]
+) && pass "16h. conflicting Left Off At duplicates fail closed with a warning" \
+  || fail "16h. conflicting Left Off At duplicates fail closed with a warning"
+
+(
+    fixture=$(setup_fixture "colonized-only-backward-compat")
+    task_file="$fixture/docs/tasks/open/pilot-colonized-only.md"
+    cat > "$task_file" <<'EOF'
+## Task: colonized-only
+## Status: in progress
+## Goal: Canonicalize colonized workflow headers on touch
+
+## Current Plan
+Plan body
+
+## Critique
+Critique body
+
+## Plan History
+Plan history body
+
+## Left Off At:
+Waiting on implementation.
+
+## Attempts:
+- 2026-04-01: Existing attempt -> Result: partial
+
+## Execution Log
+EOF
+
+    run_lib_helper "$fixture" validate_task_file "$task_file"
+    run_lib_helper "$fixture" set_task_left_off_at "$task_file" "Updated left off content."
+    run_lib_helper "$fixture" append_task_attempt "$task_file" "- 2026-04-07: Added canonical attempt -> Result: worked"
+
+    assert_canonical_workflow_headers "$task_file"
+    printf '%s\n' "$(section_body_for_test "$task_file" '^## Left Off At[[:space:]]*$')" | grep -qx 'Updated left off content\.'
+    printf '%s\n' "$(section_body_for_test "$task_file" '^## Attempts[[:space:]]*$')" | grep -q 'Existing attempt'
+    printf '%s\n' "$(section_body_for_test "$task_file" '^## Attempts[[:space:]]*$')" | grep -q 'Added canonical attempt'
+) && pass "16i. colonized-only workflow headers validate and canonicalize on touch" \
+  || fail "16i. colonized-only workflow headers validate and canonicalize on touch"
+
+(
+    fixture=$(setup_fixture "duplicate-workflow-validation")
+    task_file="$fixture/docs/tasks/open/pilot-duplicate-workflow-validation.md"
+    output="$fixture/validate.out"
+    cat > "$task_file" <<'EOF'
+## Task: duplicate-workflow-validation
+## Status: in progress
+## Goal: Reject duplicate logical workflow sections
+
+## Current Plan
+Plan body
+
+## Critique
+Critique body
+
+## Plan History
+Plan history body
+
+## Left Off At:
+Meaningful content A.
+
+## Left Off At
+Meaningful content B.
+
+## Attempts:
+- 2026-04-01: Attempt A -> Result: partial
+
+## Attempts
+- 2026-04-02: Attempt B -> Result: worked
+
+## Execution Log
+EOF
+
+    set +e
+    run_lib_helper "$fixture" validate_task_file "$task_file" > "$output" 2>&1
+    rc=$?
+    set -e
+
+    [ "$rc" -ne 0 ]
+    grep -q 'Duplicate logical section: ## Left Off At' "$output"
+    grep -q 'Duplicate logical section: ## Attempts' "$output"
+) && pass "16j. validate_task_file rejects duplicate logical workflow sections" \
+  || fail "16j. validate_task_file rejects duplicate logical workflow sections"
 
 (
     fixture=$(setup_fixture "override-complexity-writeback")
@@ -844,6 +1480,82 @@ EOF
     grep -q "Duration: <1m" "$output"
 ) && pass "31. auto summary renders sub-minute durations as less than one minute" \
   || fail "31. auto summary renders sub-minute durations as less than one minute"
+
+(
+    root="$TMP_ROOT/v2-progress-multiline"
+    output="$root/output.txt"
+    mkdir -p "$root/lib" "$root/docs/tasks/open/multi-goal" "$root/home/.claude/scripts"
+    cp "$REPO_ROOT/lauren-loop-v2.sh" "$root/lauren-loop-v2.sh"
+    cp "$REPO_ROOT/lib/lauren-loop-utils.sh" "$root/lib/lauren-loop-utils.sh"
+    cat > "$root/home/.claude/scripts/context-guard.sh" <<'EOF'
+#!/bin/bash
+setup_azure_context() { :; }
+EOF
+    cat > "$root/docs/tasks/open/multi-goal/task.md" <<'EOF'
+## Task: Multi Goal
+## Status: in progress
+## Goal
+First goal line.
+Second goal line.
+EOF
+
+    HOME="$root/home" PATH="$PATH" bash "$root/lauren-loop-v2.sh" progress multi-goal > "$output" 2>&1
+
+    grep -q 'Task: multi-goal' "$output"
+    grep -q 'Goal:   First goal line. Second goal line.' "$output"
+) && pass "32. v2 progress compacts multiline goals for display" \
+  || fail "32. v2 progress compacts multiline goals for display"
+
+(
+    root="$TMP_ROOT/v2-auth-routing"
+    mkdir -p "$root/lib" "$root/home/.claude/scripts"
+    cp "$REPO_ROOT/lauren-loop-v2.sh" "$root/lauren-loop-v2.sh"
+    cp "$REPO_ROOT/lib/lauren-loop-utils.sh" "$root/lib/lauren-loop-utils.sh"
+
+    call_log="$root/auth.log"
+    : > "$call_log"
+    cat > "$root/home/.claude/scripts/context-guard.sh" <<EOF
+#!/bin/bash
+setup_azure_context() { printf 'called\n' >> "$call_log"; export CLAUDE_CODE_USE_FOUNDRY=1; }
+EOF
+
+    set +e
+    HOME="$root/home" ANTHROPIC_BASE_URL="https://example.services.ai.azure.com/anthropic" ANTHROPIC_API_KEY="test-key" CLAUDE_CODE_USE_FOUNDRY="" PATH="$PATH" \
+        bash "$root/lauren-loop-v2.sh" auth-skip "Skip auth rewrite" > /dev/null 2>&1
+    skip_rc=$?
+    HOME="$root/home" CLAUDE_CODE_USE_FOUNDRY="" PATH="$PATH" bash "$root/lauren-loop-v2.sh" auth-call "Allow auth setup" > /dev/null 2>&1
+    call_rc=$?
+    set -e
+
+    [[ "$skip_rc" -ne 0 ]]
+    [[ "$call_rc" -ne 0 ]]
+    [[ "$(wc -l < "$call_log" | tr -d '[:space:]')" -eq 1 ]]
+) && pass "33. v2 live runs preserve explicit Claude API-key routing and only call setup_azure_context when needed" \
+  || fail "33. v2 live runs preserve explicit Claude API-key routing and only call setup_azure_context when needed"
+
+(
+    root="$TMP_ROOT/v2-auth-routing-foundry"
+    mkdir -p "$root/lib" "$root/home/.claude/scripts"
+    cp "$REPO_ROOT/lauren-loop-v2.sh" "$root/lauren-loop-v2.sh"
+    cp "$REPO_ROOT/lib/lauren-loop-utils.sh" "$root/lib/lauren-loop-utils.sh"
+
+    call_log="$root/auth.log"
+    : > "$call_log"
+    cat > "$root/home/.claude/scripts/context-guard.sh" <<EOF
+#!/bin/bash
+setup_azure_context() { printf 'called\n' >> "$call_log"; export CLAUDE_CODE_USE_FOUNDRY=1; }
+EOF
+
+    set +e
+    HOME="$root/home" ANTHROPIC_BASE_URL="https://example.services.ai.azure.com/anthropic" ANTHROPIC_API_KEY="test-key" CLAUDE_CODE_USE_FOUNDRY=1 PATH="$PATH" \
+        bash "$root/lauren-loop-v2.sh" auth-foundry "Allow explicit Foundry setup" > /dev/null 2>&1
+    foundry_rc=$?
+    set -e
+
+    [[ "$foundry_rc" -ne 0 ]]
+    [[ "$(wc -l < "$call_log" | tr -d '[:space:]')" -eq 1 ]]
+) && pass "34. v2 live runs still call setup_azure_context when Foundry mode is explicitly requested" \
+  || fail "34. v2 live runs still call setup_azure_context when Foundry mode is explicitly requested"
 
 echo ""
 echo "============================="

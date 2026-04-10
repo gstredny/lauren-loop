@@ -261,6 +261,32 @@ EOF
     printf '%s\n' "$root"
 }
 
+write_xml_files_fixture() {
+    local path="$1"
+    local files_body="$2"
+    printf '# XML parser fixture\n\n```xml\n<wave number="1">\n  <task type="auto">\n    <name>Parser test</name>\n    <files>%s</files>\n    <action>noop</action>\n    <verify>bash test_lauren_loop_utils.sh</verify>\n    <done>done</done>\n  </task>\n</wave>\n```\n' "$files_body" > "$path"
+}
+
+assert_lines_match() {
+    local output="$1"
+    shift || true
+    local -a expected=("$@")
+    local -a actual=()
+    local line=""
+    local i=0
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        actual+=("$line")
+    done <<< "$output"
+
+    [[ ${#actual[@]} -eq ${#expected[@]} ]] || return 1
+
+    for ((i=0; i<${#expected[@]}; i++)); do
+        [[ "${actual[$i]}" == "${expected[$i]}" ]] || return 1
+    done
+}
+
 # ============================================================
 # Test 1: Sourcing works — all 29 functions defined
 # ============================================================
@@ -1086,7 +1112,7 @@ EOF
     mkdir -p "$temp_root/prompts"
     awk '
         /^## Verdict$/ && !inserted {
-            print "**9. Rollout Safety:** <checked result>"
+            print "**10. Rollout Safety:** <checked result>"
             print ""
             inserted=1
         }
@@ -1094,14 +1120,14 @@ EOF
     ' "$REPO_ROOT/prompts/reviewer-b.md" > "$temp_root/prompts/reviewer-b.md"
     SCRIPT_DIR="$temp_root"
 
-    artifact="$TMP_ROOT/reviewer-missing-9th-dimension.md"
+    artifact="$TMP_ROOT/reviewer-missing-10th-dimension.md"
     write_valid_reviewer_b_artifact "$artifact" "PASS" "No findings."
     ! _validate_agent_output_for_role "reviewer-b" "$artifact" >/dev/null 2>&1
 
-    fixed_artifact="$TMP_ROOT/reviewer-with-9th-dimension.md"
+    fixed_artifact="$TMP_ROOT/reviewer-with-10th-dimension.md"
     awk '
         /^## Verdict$/ && !inserted {
-            print "**9. Rollout Safety:** checked"
+            print "**10. Rollout Safety:** checked"
             print ""
             inserted=1
         }
@@ -1304,8 +1330,8 @@ EOF
     (
         cd "$repo_root"
         result=$(compute_cocomo_estimate "HEAD" "$task_file" "V1")
-        echo "$result" | grep -q '~\$2.75'
-        echo "$result" | grep -q 'scoped net 1 lines (+1/-0)'
+        echo "$result" | grep -q '~\$3'
+        echo "$result" | grep -q '1 net lines at 20 SLOC/hr'
     )
 ) && pass "50. traditional dev proxy — V1 falls back to Relevant Files" \
   || fail "50. traditional dev proxy — V1 falls back to Relevant Files"
@@ -1343,8 +1369,8 @@ EOF
     (
         cd "$repo_root"
         result=$(compute_cocomo_estimate "HEAD" "$task_file" "V1")
-        echo "$result" | grep -q '~\$2.75'
-        echo "$result" | grep -q 'scoped net 1 lines (+1/-0)'
+        echo "$result" | grep -q '~\$3'
+        echo "$result" | grep -q '1 net lines at 20 SLOC/hr'
     )
 ) && pass "52. traditional dev proxy — scoped code change ignores task and plan churn" \
   || fail "52. traditional dev proxy — scoped code change ignores task and plan churn"
@@ -1361,8 +1387,8 @@ EOF
     (
         cd "$repo_root"
         result=$(compute_cocomo_estimate "HEAD" "$task_file" "V2")
-        echo "$result" | grep -q '~\$2.75'
-        echo "$result" | grep -q 'scoped net 1 lines (+1/-0)'
+        echo "$result" | grep -q '~\$3'
+        echo "$result" | grep -q '1 net lines at 20 SLOC/hr'
     )
 ) && pass "53. traditional dev proxy — V2 includes fix-plan XML scope" \
   || fail "53. traditional dev proxy — V2 includes fix-plan XML scope"
@@ -1379,11 +1405,121 @@ EOF
     (
         cd "$repo_root"
         COCOMO_SLOC_PER_HOUR=10 COCOMO_OFFSHORE_RATE=100 result=$(compute_cocomo_estimate "HEAD" "$task_file" "V1")
-        echo "$result" | grep -q '~\$10.00'
+        echo "$result" | grep -q '~\$10'
         echo "$result" | grep -q '10 SLOC/hr × \$100/hr'
     )
 ) && pass "54. traditional dev proxy — env vars tune heuristic cost" \
   || fail "54. traditional dev proxy — env vars tune heuristic cost"
+
+# ============================================================
+# Test 54a: traditional dev proxy — V2 frozen snapshot prefers estimate numstats
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-v2-frozen-rollup)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+    comp_dir="$repo_root/docs/tasks/open/proxy-scope/competitive"
+
+    printf '200\t0\tsrc/in_scope.py\n' > "$comp_dir/execution-diff.numstat.tsv"
+    printf '20\t0\tsrc/in_scope.py\n5\t0\ttests/test_in_scope.py\n7\t0\tdocs/reference.md\n' > "$comp_dir/execution-diff.estimate.numstat.tsv"
+    printf '5\t0\tconfig/settings.json\n' > "$comp_dir/fix-diff-cycle1.estimate.numstat.tsv"
+
+    (
+        cd "$repo_root"
+        result=$(build_v2_traditional_dev_proxy_json "$task_file" 1)
+        echo "$result" | jq -e '.version == "v2-cocomo-frozen-snapshot-1"' >/dev/null
+        echo "$result" | jq -e '.scope_source == "frozen-v2-estimate-numstat"' >/dev/null
+        echo "$result" | jq -e '.files_count == 3 and .insertions == 30 and .deletions == 0 and .net_lines == 30' >/dev/null
+        echo "$result" | jq -e '.sloc_per_hour == 20 and .hourly_rate_usd == 55 and .loaded_multiplier == 1' >/dev/null
+        echo "$result" | jq -e '.estimated_hours_base == 1.5 and .estimated_cost_usd_base == 82.5' >/dev/null
+        echo "$result" | jq -e '.estimated_hours_loaded == 1.5 and .estimated_cost_usd_loaded == 82.5' >/dev/null
+        echo "$result" | jq -e '.fix_cycles == 1' >/dev/null
+        echo "$result" | jq -r '.summary_text' | grep -q '~1.5h / ~\$82 (COCOMO-inspired heuristic; 30 net lines at 20 SLOC/hr'
+    )
+) && pass "54a. traditional dev proxy — V2 frozen snapshot prefers estimate numstats" \
+  || fail "54a. traditional dev proxy — V2 frozen snapshot prefers estimate numstats"
+
+# ============================================================
+# Test 54b: traditional dev proxy — frozen snapshot honors env overrides on net deletion
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-v2-frozen-env)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+    comp_dir="$repo_root/docs/tasks/open/proxy-scope/competitive"
+
+    printf '0\t4\tsrc/in_scope.py\n' > "$comp_dir/execution-diff.estimate.numstat.tsv"
+
+    (
+        cd "$repo_root"
+        result=$(
+            TRADITIONAL_DEV_PROXY_POINTS_PER_HOUR=10 \
+            TRADITIONAL_DEV_PROXY_HOURLY_RATE_USD=100 \
+            TRADITIONAL_DEV_PROXY_MULTIPLIER=2 \
+            COCOMO_SLOC_PER_HOUR=999 \
+            COCOMO_OFFSHORE_RATE=999 \
+            COCOMO_SDLC_MULTIPLIER=999 \
+            build_v2_traditional_dev_proxy_json "$task_file" 0
+        )
+        echo "$result" | jq -e '.scope_source == "frozen-v2-estimate-numstat"' >/dev/null
+        echo "$result" | jq -e '.sloc_per_hour == 10 and .hourly_rate_usd == 100 and .loaded_multiplier == 2' >/dev/null
+        echo "$result" | jq -e '.estimated_hours_base == 0 and .estimated_cost_usd_base == 0' >/dev/null
+        echo "$result" | jq -e '.estimated_hours_loaded == 0 and .estimated_cost_usd_loaded == 0' >/dev/null
+        echo "$result" | jq -r '.summary_text' | grep -q '^N/A  (frozen scoped net deletion: +0/-4)$'
+    )
+) && pass "54b. traditional dev proxy — frozen snapshot honors env overrides on net deletion" \
+  || fail "54b. traditional dev proxy — frozen snapshot honors env overrides on net deletion"
+
+# ============================================================
+# Test 54c: traditional dev proxy — docs-only frozen snapshots persist stable N/A summary
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-v2-docs-only)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+    comp_dir="$repo_root/docs/tasks/open/proxy-scope/competitive"
+
+    printf '12\t0\tdocs/reference.md\n' > "$comp_dir/execution-diff.numstat.tsv"
+
+    (
+        cd "$repo_root"
+        result=$(build_v2_traditional_dev_proxy_json "$task_file" 0)
+        echo "$result" | jq -e '.files_count == 0 and .net_lines == 0 and .estimated_cost_usd_loaded == 0' >/dev/null
+        echo "$result" | jq -e '.summary_text == "N/A  (no scoped engineering changes)"' >/dev/null
+    )
+) && pass "54c. traditional dev proxy — docs-only frozen snapshots persist stable N/A summary" \
+  || fail "54c. traditional dev proxy — docs-only frozen snapshots persist stable N/A summary"
+
+# ============================================================
+# Test 54d: traditional dev proxy — resolver canonicalizes manifest fallback and never uses live V2 math
+# ============================================================
+(
+    repo_root="$(setup_traditional_dev_proxy_repo proxy-v2-summary-resolver)"
+    task_file="$repo_root/docs/tasks/open/proxy-scope.md"
+    comp_dir="$repo_root/docs/tasks/open/proxy-scope/competitive"
+    summary='Base ~1.2h / ~$63.25; Loaded ~12h / ~$632.5 (persisted snapshot)'
+    artifact="$comp_dir/traditional-dev-proxy.json"
+
+    cat > "$comp_dir/run-manifest.json" <<EOF
+{
+  "traditional_dev_proxy": {
+    "summary_text": "${summary}"
+  }
+}
+EOF
+    printf 'changed\n' >> "$repo_root/src/in_scope.py"
+
+    (
+        cd "$repo_root"
+        resolved=$(resolve_traditional_dev_proxy_summary "HEAD" "$task_file" "V2")
+        [[ "$resolved" == "$summary" ]]
+        [[ -f "$artifact" ]]
+        rm -f "$comp_dir/run-manifest.json"
+        resolved_from_artifact=$(resolve_traditional_dev_proxy_summary "HEAD" "$task_file" "V2")
+        [[ "$resolved_from_artifact" == "$summary" ]]
+        rm -f "$artifact"
+        fallback=$(resolve_traditional_dev_proxy_summary "HEAD" "$task_file" "V2")
+        [[ "$fallback" == "N/A  (traditional dev proxy unavailable before V2 diff capture)" ]]
+    )
+) && pass "54d. traditional dev proxy — resolver canonicalizes manifest fallback and never uses live V2 math" \
+  || fail "54d. traditional dev proxy — resolver canonicalizes manifest fallback and never uses live V2 math"
 
 # ============================================================
 # Fixture helper: valid reviewer-b artifact
@@ -1433,6 +1569,7 @@ FIXTURE
     _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md"
     rc=$?
     [[ "$rc" -eq 0 ]]
+    # Canonical should be unchanged (still the fixture, not "attempt content")
     grep -q '# Review B' "$dir/reviewer-b.raw.md"
 ) && pass "55. _promote_latest_valid_attempt — canonical exists, no promotion needed" \
   || fail "55. _promote_latest_valid_attempt — canonical exists, no promotion needed"
@@ -1444,6 +1581,7 @@ FIXTURE
     dir="$TMP_ROOT/promote-single-attempt"
     mkdir -p "$dir"
     write_valid_reviewer_b_fixture "$dir/reviewer-b.raw.attempt-1.md"
+    # No canonical file exists
 
     _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md"
     rc=$?
@@ -1525,6 +1663,7 @@ FIXTURE
 (
     dir="$TMP_ROOT/promote-no-attempts"
     mkdir -p "$dir"
+    # No attempt files, no canonical
 
     set +e
     _promote_latest_valid_attempt "reviewer-b" "$dir/reviewer-b.raw.md" 2>/dev/null
@@ -1534,6 +1673,231 @@ FIXTURE
     [[ ! -f "$dir/reviewer-b.raw.md" ]]
 ) && pass "61. _promote_latest_valid_attempt — no attempt files at all" \
   || fail "61. _promote_latest_valid_attempt — no attempt files at all"
+
+# ============================================================
+# Test 62: _extract_xml_task_paths — comma-separated paths
+# ============================================================
+(
+    f="$TMP_ROOT/xml-comma.md"
+    write_xml_files_fixture "$f" "src/a.py, src/b.py, src/c.py"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output" "src/a.py" "src/b.py" "src/c.py"
+) && pass "62. _extract_xml_task_paths — comma-separated paths" \
+  || fail "62. _extract_xml_task_paths — comma-separated paths"
+
+# ============================================================
+# Test 63: _extract_xml_task_paths — whitespace-separated paths
+# ============================================================
+(
+    f="$TMP_ROOT/xml-whitespace.md"
+    write_xml_files_fixture "$f" "src/a.py src/b.py"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output" "src/a.py" "src/b.py"
+) && pass "63. _extract_xml_task_paths — whitespace-separated paths" \
+  || fail "63. _extract_xml_task_paths — whitespace-separated paths"
+
+# ============================================================
+# Test 64: _extract_xml_task_paths — single path
+# ============================================================
+(
+    f="$TMP_ROOT/xml-single.md"
+    write_xml_files_fixture "$f" "src/a.py"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output" "src/a.py"
+) && pass "64. _extract_xml_task_paths — single path" \
+  || fail "64. _extract_xml_task_paths — single path"
+
+# ============================================================
+# Test 65: _extract_xml_task_paths — backtick-wrapped paths
+# ============================================================
+(
+    f="$TMP_ROOT/xml-backticks.md"
+    write_xml_files_fixture "$f" '`src/a.py`, `src/b.py`'
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output" "src/a.py" "src/b.py"
+) && pass "65. _extract_xml_task_paths — backtick-wrapped paths" \
+  || fail "65. _extract_xml_task_paths — backtick-wrapped paths"
+
+# ============================================================
+# Test 66: _extract_xml_task_paths — strips leading ./
+# ============================================================
+(
+    f="$TMP_ROOT/xml-dot-slash.md"
+    write_xml_files_fixture "$f" "./src/a.py, ./src/b.py"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output" "src/a.py" "src/b.py"
+) && pass "66. _extract_xml_task_paths — strips leading ./" \
+  || fail "66. _extract_xml_task_paths — strips leading ./"
+
+# ============================================================
+# Test 67: _extract_xml_task_paths — empty tag returns no paths
+# ============================================================
+(
+    f="$TMP_ROOT/xml-empty.md"
+    write_xml_files_fixture "$f" ""
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output"
+) && pass "67. _extract_xml_task_paths — empty tag returns no paths" \
+  || fail "67. _extract_xml_task_paths — empty tag returns no paths"
+
+# ============================================================
+# Test 68a: _extract_xml_task_paths — N/A rejected
+# ============================================================
+(
+    f="$TMP_ROOT/xml-na-uppercase.md"
+    write_xml_files_fixture "$f" "N/A"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output"
+) && pass "68a. _extract_xml_task_paths — N/A rejected" \
+  || fail "68a. _extract_xml_task_paths — N/A rejected"
+
+# ============================================================
+# Test 68b: _extract_xml_task_paths — n/a rejected
+# ============================================================
+(
+    f="$TMP_ROOT/xml-na-lowercase.md"
+    write_xml_files_fixture "$f" "n/a"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output"
+) && pass "68b. _extract_xml_task_paths — n/a rejected" \
+  || fail "68b. _extract_xml_task_paths — n/a rejected"
+
+# ============================================================
+# Test 68c: _extract_xml_task_paths — None rejected
+# ============================================================
+(
+    f="$TMP_ROOT/xml-none-title.md"
+    write_xml_files_fixture "$f" "None"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output"
+) && pass "68c. _extract_xml_task_paths — None rejected" \
+  || fail "68c. _extract_xml_task_paths — None rejected"
+
+# ============================================================
+# Test 68d: _extract_xml_task_paths — none rejected
+# ============================================================
+(
+    f="$TMP_ROOT/xml-none-lowercase.md"
+    write_xml_files_fixture "$f" "none"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output"
+) && pass "68d. _extract_xml_task_paths — none rejected" \
+  || fail "68d. _extract_xml_task_paths — none rejected"
+
+# ============================================================
+# Test 69: _extract_xml_task_paths — garbage-only separators rejected
+# ============================================================
+(
+    f="$TMP_ROOT/xml-garbage-only.md"
+    write_xml_files_fixture "$f" " , , "
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output"
+) && pass "69. _extract_xml_task_paths — garbage-only separators rejected" \
+  || fail "69. _extract_xml_task_paths — garbage-only separators rejected"
+
+# ============================================================
+# Test 70: _extract_xml_task_paths — mixed valid and invalid tokens
+# ============================================================
+(
+    f="$TMP_ROOT/xml-mixed.md"
+    write_xml_files_fixture "$f" "src/a.py, N/A, , src/b.py"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output" "src/a.py" "src/b.py"
+) && pass "70. _extract_xml_task_paths — mixed valid and invalid tokens" \
+  || fail "70. _extract_xml_task_paths — mixed valid and invalid tokens"
+
+# ============================================================
+# Test 71: _extract_xml_task_paths — bare words rejected
+# ============================================================
+(
+    f="$TMP_ROOT/xml-bare-word.md"
+    write_xml_files_fixture "$f" "README"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output"
+) && pass "71. _extract_xml_task_paths — bare words rejected" \
+  || fail "71. _extract_xml_task_paths — bare words rejected"
+
+# ============================================================
+# Test 71a: _extract_xml_task_paths — delimiter detection is per block
+# ============================================================
+(
+    f="$TMP_ROOT/xml-per-block-delimiters.md"
+    printf '# XML parser fixture\n<files>src/a.py, src/b.py</files>\nSome text between blocks.\n<files>src/c.py src/d.py</files>\n' > "$f"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output" "src/a.py" "src/b.py" "src/c.py" "src/d.py"
+) && pass "71a. _extract_xml_task_paths — delimiter detection is per block" \
+  || fail "71a. _extract_xml_task_paths — delimiter detection is per block"
+
+# ============================================================
+# Test 71b: _extract_xml_task_paths — duplicate paths are deduplicated
+# ============================================================
+(
+    f="$TMP_ROOT/xml-dedup.md"
+    write_xml_files_fixture "$f" "src/a.py, src/b.py, src/a.py"
+
+    output=$(_extract_xml_task_paths "$f")
+    assert_lines_match "$output" "src/a.py" "src/b.py"
+) && pass "71b. _extract_xml_task_paths — duplicate paths are deduplicated" \
+  || fail "71b. _extract_xml_task_paths — duplicate paths are deduplicated"
+
+# ============================================================
+# Test 72: _reject_slug_internal_paths — rejects task.md
+# ============================================================
+(
+    output=$(printf '%s\n' "docs/tasks/open/my-slug/task.md" | _reject_slug_internal_paths "my-slug")
+    assert_lines_match "$output"
+) && pass "72. _reject_slug_internal_paths — rejects task.md" \
+  || fail "72. _reject_slug_internal_paths — rejects task.md"
+
+# ============================================================
+# Test 73: _reject_slug_internal_paths — rejects competitive file
+# ============================================================
+(
+    output=$(printf '%s\n' "docs/tasks/open/my-slug/competitive/plan.md" | _reject_slug_internal_paths "my-slug")
+    assert_lines_match "$output"
+) && pass "73. _reject_slug_internal_paths — rejects competitive file" \
+  || fail "73. _reject_slug_internal_paths — rejects competitive file"
+
+# ============================================================
+# Test 74: _reject_slug_internal_paths — rejects top-level competitive path
+# ============================================================
+(
+    output=$(printf '%s\n' "competitive/anything" | _reject_slug_internal_paths "my-slug")
+    assert_lines_match "$output"
+) && pass "74. _reject_slug_internal_paths — rejects top-level competitive path" \
+  || fail "74. _reject_slug_internal_paths — rejects top-level competitive path"
+
+# ============================================================
+# Test 75: _reject_slug_internal_paths — keeps real source file
+# ============================================================
+(
+    output=$(printf '%s\n' "src/services/real-file.py" | _reject_slug_internal_paths "my-slug")
+    assert_lines_match "$output" "src/services/real-file.py"
+) && pass "75. _reject_slug_internal_paths — keeps real source file" \
+  || fail "75. _reject_slug_internal_paths — keeps real source file"
+
+# ============================================================
+# Test 76: _reject_slug_internal_paths — keeps unrelated docs path
+# ============================================================
+(
+    output=$(printf '%s\n' "docs/other-dir/file.md" | _reject_slug_internal_paths "my-slug")
+    assert_lines_match "$output" "docs/other-dir/file.md"
+) && pass "76. _reject_slug_internal_paths — keeps unrelated docs path" \
+  || fail "76. _reject_slug_internal_paths — keeps unrelated docs path"
 
 # ============================================================
 # Summary

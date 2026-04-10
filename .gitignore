@@ -2,3 +2,6 @@ logs/
 *.tmp
 .lauren-loop.conf
 .planning/
+scripts/nightshift/logs/
+scripts/nightshift/python/nightshift/__pycache__/
+scripts/nightshift/python/tests/__pycache__/

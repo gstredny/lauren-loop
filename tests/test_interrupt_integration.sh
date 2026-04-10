@@ -51,29 +51,57 @@ assert_runtime_cleanup() {
     }
 }
 
-assert_all_shards_have_one_complete_row() {
+assert_no_cost_shards() {
     local case_dir="$1"
-    local shard_count
-    shard_count=$(find "$case_dir" -maxdepth 1 -name '.cost-*.csv' ! -name 'cost.csv' | wc -l | tr -d ' ')
-    [[ "$shard_count" -gt 0 ]] || {
-        echo "expected at least one cost shard" >&2
+    ! find "$case_dir" -maxdepth 1 -name '.cost-*.csv' | grep -q . || {
+        echo "expected cost shards to be merged away in $case_dir" >&2
+        return 1
+    }
+}
+
+assert_cost_csv_status_counts() {
+    local csv="$1" expected_completed="$2" expected_interrupted="$3"
+    [[ -f "$csv" ]] || {
+        echo "expected merged cost.csv at $csv" >&2
         return 1
     }
 
-    local shard
-    for shard in "$case_dir"/.cost-*.csv; do
-        [[ -f "$shard" ]] || continue
-        local row_count
-        row_count=$(tail -n +2 "$shard" | awk 'NF { count++ } END { print count+0 }')
-        [[ "$row_count" -eq 1 ]] || {
-            echo "expected exactly one data row in $shard, got $row_count" >&2
-            return 1
+    awk -F',' -v completed="$expected_completed" -v interrupted="$expected_interrupted" '
+        NR == 1 { next }
+        NF != 14 { exit 1 }
+        { status[$14]++ }
+        END {
+            ok = 1
+            if ((status["completed"] + 0) != completed) {
+                ok = 0
+            }
+            if ((status["interrupted"] + 0) != interrupted) {
+                ok = 0
+            }
+            exit(ok ? 0 : 1)
         }
-        awk -F',' 'NR == 1 { next } NF != 13 { exit 1 }' "$shard" || {
-            echo "expected only 13-column data rows in $shard" >&2
-            return 1
-        }
-    done
+    ' "$csv" || {
+        echo "unexpected status counts in $csv" >&2
+        return 1
+    }
+}
+
+assert_manifest_state() {
+    local manifest="$1" expected_status="$2" expected_total_cost="$3"
+    [[ -f "$manifest" ]] || {
+        echo "expected manifest at $manifest" >&2
+        return 1
+    }
+
+    jq -e --arg final_status "$expected_status" --arg total_cost "$expected_total_cost" '
+        .final_status == $final_status and
+        .total_cost_usd == $total_cost and
+        (.started_at | type == "string" and length > 0) and
+        (.completed_at | type == "string" and length > 0)
+    ' "$manifest" >/dev/null || {
+        echo "manifest state mismatch in $manifest" >&2
+        return 1
+    }
 }
 
 # ============================================================
@@ -92,6 +120,7 @@ source "$REPO_ROOT/lib/lauren-loop-utils.sh" 2>/dev/null || true
 SCRIPT_DIR="$REPO_ROOT"
 MODEL="opus"
 SLUG="test-slug"
+slug="$SLUG"
 RED=""
 GREEN=""
 YELLOW=""
@@ -106,9 +135,8 @@ notify_terminal_state() {
 }
 
 eval "$(
-    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^usage()/{ /^usage()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
-        | sed '/^setup_azure_context 2>\/dev\/null || true$/d' \
         | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
 )"
 
@@ -119,20 +147,33 @@ _print_cost_summary() { :; }
 TASK_LOG_DIR="$CASE_DIR"
 _CURRENT_TASK_LOG_DIR="$CASE_DIR"
 _CURRENT_TASK_FILE="$CASE_DIR/task.md"
+comp_dir="$CASE_DIR/competitive"
+mkdir -p "$comp_dir"
+goal="direct interrupt test"
+FORCE_RERUN=false
+ENGINE_EXPLORE="claude"
+ENGINE_PLANNER_A="claude"
+ENGINE_PLANNER_B="claude"
+ENGINE_EVALUATOR="claude"
+ENGINE_EXECUTOR="claude"
+ENGINE_REVIEWER_A="claude"
+ENGINE_REVIEWER_B="claude"
+ENGINE_FIX="claude"
 
 printf '## Status: in progress\n\n## Execution Log\n\n' > "$_CURRENT_TASK_FILE"
+_init_run_manifest
 
 seed_agent_instance() {
     local role="$1" state="$2" status="${3:-}"
     local meta_path instance_id cost_csv
     meta_path=$(_agent_meta_path "$role")
-    _write_active_agent_meta "$role" "claude" "opus" "$(date +%s)" "5s" "$state" "$meta_path"
+    _write_active_agent_meta "$role" "claude" "opus" "medium" "$(date +%s)" "5s" "$state" "$meta_path"
     instance_id=$(_agent_instance_id_from_meta_path "$meta_path")
     cost_csv=$(_cost_csv_path_for_instance "$instance_id")
     if [[ -n "$status" ]]; then
         _append_cost_csv_raw_row \
             "$cost_csv" "$(_iso_timestamp)" "$SLUG" "$role" "claude" "opus" \
-            "1" "0" "0" "1" "0.0001" "1" "0" "$status"
+            "medium" "1" "0" "0" "1" "0.0001" "1" "0" "$status"
     fi
 }
 
@@ -177,16 +218,16 @@ EOF
     [[ "$rc" -eq 143 ]] || { echo "expected child exit 143, got $rc" >&2; exit 1; }
     wait_for_file "$case_dir/marker.seen" || { echo "interrupt marker was never observed" >&2; exit 1; }
     [[ "$(cat "$case_dir/cleanup.count")" == "1" ]] || { echo "cleanup should run its side effects once" >&2; exit 1; }
-    assert_all_shards_have_one_complete_row "$case_dir"
     assert_runtime_cleanup "$case_dir"
-    awk -F',' 'NR > 1 { status[$13]++ } END { exit !(status["completed"] == 1 && status["interrupted"] == 1) }' "$case_dir"/.cost-*.csv \
-        || { echo "expected one completed row and one interrupted row" >&2; exit 1; }
+    assert_no_cost_shards "$case_dir"
+    assert_cost_csv_status_counts "$case_dir/cost.csv" 1 1
+    assert_manifest_state "$case_dir/competitive/run-manifest.json" "interrupted" "0.0001"
     grep -q '^## Status: blocked$' "$case_dir/task.md" || { echo "task file was not marked blocked" >&2; exit 1; }
     [ "$(wc -l < "$case_dir/notify.log" | tr -d ' ')" = "1" ] || { echo "expected exactly one notification" >&2; exit 1; }
     grep -q '^interrupted|Pipeline interrupted (TERM) — test-slug$' "$case_dir/notify.log" \
         || { echo "interrupt notification payload mismatch" >&2; exit 1; }
-) && pass "1. _interrupted direct call — rows finish and cleanup stays idempotent" \
-  || fail "1. _interrupted direct call — rows finish and cleanup stays idempotent"
+) && pass "1. _interrupted direct call — manifest finalizes, rows merge, cleanup stays idempotent" \
+  || fail "1. _interrupted direct call — manifest finalizes, rows merge, cleanup stays idempotent"
 
 # ============================================================
 # Test 2: repeated TERM during interrupted-row write leaves a complete row and cleaned runtime state
@@ -204,6 +245,7 @@ source "$REPO_ROOT/lib/lauren-loop-utils.sh" 2>/dev/null || true
 SCRIPT_DIR="$REPO_ROOT"
 MODEL="opus"
 SLUG="test-slug"
+slug="$SLUG"
 RED=""
 GREEN=""
 YELLOW=""
@@ -218,9 +260,8 @@ notify_terminal_state() {
 }
 
 eval "$(
-    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^usage()/{ /^usage()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
-        | sed '/^setup_azure_context 2>\/dev\/null || true$/d' \
         | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
 )"
 
@@ -232,8 +273,21 @@ _print_cost_summary() { :; }
 TASK_LOG_DIR="$CASE_DIR"
 _CURRENT_TASK_LOG_DIR="$CASE_DIR"
 _CURRENT_TASK_FILE="$CASE_DIR/task.md"
+comp_dir="$CASE_DIR/competitive"
+mkdir -p "$comp_dir"
+goal="repeated interrupt test"
+FORCE_RERUN=false
+ENGINE_EXPLORE="claude"
+ENGINE_PLANNER_A="claude"
+ENGINE_PLANNER_B="claude"
+ENGINE_EVALUATOR="claude"
+ENGINE_EXECUTOR="claude"
+ENGINE_REVIEWER_A="claude"
+ENGINE_REVIEWER_B="claude"
+ENGINE_FIX="claude"
 
 printf '## Status: in progress\n\n## Execution Log\n\n' > "$_CURRENT_TASK_FILE"
+_init_run_manifest
 
 orig_clear_runtime=$(declare -f _clear_active_runtime_state)
 orig_clear_runtime=${orig_clear_runtime/_clear_active_runtime_state/__orig_clear_active_runtime_state}
@@ -247,13 +301,13 @@ _clear_active_runtime_state() {
 
 _append_cost_csv_raw_row() {
     local cost_csv="$1" timestamp="$2" task="$3" role="$4" engine="$5" model_name="$6"
-    local input_tok="$7" cache_write_tok="$8" cache_read_tok="$9" output_tok="${10}"
-    local cost="${11}" duration="${12}" exit_code="${13}" status="${14}"
+    local reasoning_effort="$7" input_tok="$8" cache_write_tok="$9" cache_read_tok="${10}" output_tok="${11}"
+    local cost="${12}" duration="${13}" exit_code="${14}" status="${15}"
 
     _ensure_cost_csv_header "$cost_csv"
-    printf '%s,%s,%s,%s,%s,%s,%s,%s,' \
+    printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,' \
         "$timestamp" "$task" "$role" "$engine" "$model_name" \
-        "$input_tok" "$cache_write_tok" "$cache_read_tok" >> "$cost_csv"
+        "$reasoning_effort" "$input_tok" "$cache_write_tok" "$cache_read_tok" >> "$cost_csv"
     : > "$CASE_DIR/partial-write.started"
     sleep 1
     printf '%s,%s,%s,%s,%s\n' \
@@ -261,7 +315,7 @@ _append_cost_csv_raw_row() {
 }
 
 meta_path=$(_agent_meta_path "explorer")
-_write_active_agent_meta "explorer" "claude" "opus" "$(date +%s)" "5s" "running" "$meta_path"
+_write_active_agent_meta "explorer" "claude" "opus" "medium" "$(date +%s)" "5s" "running" "$meta_path"
 
 trap '_interrupted TERM' TERM
 : > "$CASE_DIR/ready"
@@ -290,15 +344,15 @@ EOF
 
     [[ "$rc" -eq 143 ]] || { echo "expected child exit 143, got $rc" >&2; exit 1; }
     [[ "$(cat "$case_dir/cleanup.count")" == "1" ]] || { echo "cleanup should run its side effects once" >&2; exit 1; }
-    assert_all_shards_have_one_complete_row "$case_dir"
     assert_runtime_cleanup "$case_dir"
-    awk -F',' 'NR > 1 && $13 != "interrupted" { exit 1 }' "$case_dir"/.cost-*.csv \
-        || { echo "expected interrupted status row after repeated TERM" >&2; exit 1; }
+    assert_no_cost_shards "$case_dir"
+    assert_cost_csv_status_counts "$case_dir/cost.csv" 0 1
+    assert_manifest_state "$case_dir/competitive/run-manifest.json" "interrupted" "0.0000"
     [ "$(wc -l < "$case_dir/notify.log" | tr -d ' ')" = "1" ] || { echo "expected exactly one notification" >&2; exit 1; }
     grep -q '^interrupted|Pipeline interrupted (TERM) — test-slug$' "$case_dir/notify.log" \
         || { echo "interrupt notification payload mismatch" >&2; exit 1; }
-) && pass "2. repeated TERM during interrupted write — no partial shard rows" \
-  || fail "2. repeated TERM during interrupted write — no partial shard rows"
+) && pass "2. repeated TERM during interrupted write — manifest persists and no partial rows survive" \
+  || fail "2. repeated TERM during interrupted write — manifest persists and no partial rows survive"
 
 # ============================================================
 # Test 3: cleanup_v2 safety net — sets "blocked" when task is still "in progress"
@@ -316,6 +370,7 @@ source "$REPO_ROOT/lib/lauren-loop-utils.sh" 2>/dev/null || true
 SCRIPT_DIR="$REPO_ROOT"
 MODEL="opus"
 SLUG="test-slug"
+slug="$SLUG"
 RED=""
 GREEN=""
 YELLOW=""
@@ -328,9 +383,8 @@ stop_agent_monitor() { :; }
 notify_terminal_state() { :; }
 
 eval "$(
-    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^usage()/{ /^usage()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
-        | sed '/^setup_azure_context 2>\/dev\/null || true$/d' \
         | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
 )"
 
@@ -342,8 +396,25 @@ _print_cost_summary() { :; }
 TASK_LOG_DIR="$CASE_DIR"
 _CURRENT_TASK_LOG_DIR="$CASE_DIR"
 _CURRENT_TASK_FILE="$CASE_DIR/task.md"
+comp_dir="$CASE_DIR/competitive"
+mkdir -p "$comp_dir"
+goal="cleanup safety-net test"
+FORCE_RERUN=false
+ENGINE_EXPLORE="claude"
+ENGINE_PLANNER_A="claude"
+ENGINE_PLANNER_B="claude"
+ENGINE_EVALUATOR="claude"
+ENGINE_EXECUTOR="claude"
+ENGINE_REVIEWER_A="claude"
+ENGINE_REVIEWER_B="claude"
+ENGINE_FIX="claude"
 
 printf '## Status: in progress\n\n## Execution Log\n\n' > "$_CURRENT_TASK_FILE"
+_init_run_manifest
+_append_manifest_phase "phase-4" "executing" "2026-03-20T00:00:00Z" "2026-03-20T00:00:30Z" "failed"
+_append_cost_csv_raw_row \
+    "$TASK_LOG_DIR/.cost-cleanup.csv" "$(_iso_timestamp)" "$SLUG" "executor" "claude" "opus" \
+    "medium" "1" "0" "0" "1" "0.0002" "30" "1" "completed"
 
 # Simulate an unguarded command failure under set -e.
 # The EXIT trap (cleanup_v2) should detect "in progress" and set "blocked".
@@ -361,8 +432,17 @@ CHILD_EOF
         || { echo "cleanup_v2 safety net did not set status to blocked; got: $(grep '^## Status:' "$case_dir/task.md")" >&2; exit 1; }
     grep -q 'cleanup_v2: task was still .in progress. at exit' "$case_dir/task.md" \
         || { echo "cleanup_v2 safety net did not log the status change" >&2; exit 1; }
-) && pass "3. cleanup_v2 safety net — 'in progress' → 'blocked' on unhandled set -e exit" \
-  || fail "3. cleanup_v2 safety net — 'in progress' → 'blocked' on unhandled set -e exit"
+    assert_no_cost_shards "$case_dir"
+    assert_cost_csv_status_counts "$case_dir/cost.csv" 1 0
+    jq -e '
+        .final_status == "cleanup" and
+        .total_cost_usd == "0.0002" and
+        (.phases | length) == 1 and
+        .phases[0].phase == "phase-4"
+    ' "$case_dir/competitive/run-manifest.json" >/dev/null \
+        || { echo "cleanup_v2 did not finalize the manifest with partial run data" >&2; exit 1; }
+) && pass "3. cleanup_v2 safety net — finalizes manifest and blocks the task on unhandled exit" \
+  || fail "3. cleanup_v2 safety net — finalizes manifest and blocks the task on unhandled exit"
 
 # ============================================================
 # Test 4: cleanup_v2 safety net skips when status is already terminal
@@ -380,6 +460,7 @@ source "$REPO_ROOT/lib/lauren-loop-utils.sh" 2>/dev/null || true
 SCRIPT_DIR="$REPO_ROOT"
 MODEL="opus"
 SLUG="test-slug"
+slug="$SLUG"
 RED=""
 GREEN=""
 YELLOW=""
@@ -392,9 +473,8 @@ stop_agent_monitor() { :; }
 notify_terminal_state() { :; }
 
 eval "$(
-    sed -n '/^## Pricing constants/,/^lauren_loop_competitive()/{ /^lauren_loop_competitive()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
+    sed -n '/^## Pricing constants/,/^usage()/{ /^usage()/d; p; }' "$REPO_ROOT/lauren-loop-v2.sh" \
         | sed '/^source "\$HOME\/\.claude\/scripts\/context-guard\.sh"$/d' \
-        | sed '/^setup_azure_context 2>\/dev\/null || true$/d' \
         | sed '/^source "\$SCRIPT_DIR\/lib\/lauren-loop-utils\.sh"$/d'
 )"
 
@@ -406,9 +486,24 @@ _print_cost_summary() { :; }
 TASK_LOG_DIR="$CASE_DIR"
 _CURRENT_TASK_LOG_DIR="$CASE_DIR"
 _CURRENT_TASK_FILE="$CASE_DIR/task.md"
+comp_dir="$CASE_DIR/competitive"
+mkdir -p "$comp_dir"
+goal="cleanup terminal manifest test"
+FORCE_RERUN=false
+ENGINE_EXPLORE="claude"
+ENGINE_PLANNER_A="claude"
+ENGINE_PLANNER_B="claude"
+ENGINE_EVALUATOR="claude"
+ENGINE_EXECUTOR="claude"
+ENGINE_REVIEWER_A="claude"
+ENGINE_REVIEWER_B="claude"
+ENGINE_FIX="claude"
 
 # Task already has terminal status — safety net should NOT overwrite it
 printf '## Status: needs verification\n\n## Execution Log\n\n' > "$_CURRENT_TASK_FILE"
+_init_run_manifest
+_finalize_run_manifest "success" 2
+jq -r '.completed_at' "$comp_dir/run-manifest.json" > "$CASE_DIR/pre.completed_at"
 
 false
 CHILD_EOF
@@ -422,8 +517,12 @@ CHILD_EOF
     [[ "$rc" -ne 0 ]] || { echo "expected non-zero exit" >&2; exit 1; }
     grep -q '^## Status: needs verification$' "$case_dir/task.md" \
         || { echo "safety net incorrectly overwrote terminal status; got: $(grep '^## Status:' "$case_dir/task.md")" >&2; exit 1; }
-) && pass "4. cleanup_v2 safety net — skips when status is already 'needs verification'" \
-  || fail "4. cleanup_v2 safety net — skips when status is already 'needs verification'"
+    [[ "$(cat "$case_dir/pre.completed_at")" == "$(jq -r '.completed_at' "$case_dir/competitive/run-manifest.json")" ]] \
+        || { echo "cleanup_v2 overwrote an already finalized manifest" >&2; exit 1; }
+    jq -e '.final_status == "success" and .fix_cycles == 2' "$case_dir/competitive/run-manifest.json" >/dev/null \
+        || { echo "cleanup_v2 changed the finalized manifest state" >&2; exit 1; }
+) && pass "4. cleanup_v2 safety net — skips terminal task status and leaves finalized manifest intact" \
+  || fail "4. cleanup_v2 safety net — skips terminal task status and leaves finalized manifest intact"
 
 echo ""
 echo "============================="

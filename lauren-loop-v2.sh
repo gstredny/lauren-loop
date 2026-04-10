@@ -20,17 +20,19 @@ RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; NC
 # Defaults
 DRY_RUN=false
 INTERNAL=false
-FORCE_RERUN=false
+FORCE_RERUN="${FORCE_RERUN:-false}"
 AGENT_SETTINGS='{"disableAllHooks":true}'
 ## Pricing constants + CSV headers — now in lib/lauren-loop-utils.sh
-source "$HOME/.claude/scripts/context-guard.sh"
+[[ -f "$HOME/.claude/scripts/context-guard.sh" ]] && source "$HOME/.claude/scripts/context-guard.sh"
+# Ensure function exists even if context-guard.sh is absent
+type setup_azure_context &>/dev/null || setup_azure_context() { :; }
 source "$SCRIPT_DIR/lib/lauren-loop-utils.sh"
 
 # Source project config (optional overrides)
 [[ -f "$SCRIPT_DIR/.lauren-loop.conf" ]] && source "$SCRIPT_DIR/.lauren-loop.conf"
 
 # Config-driven project values (fallback defaults if conf doesn't set them)
-PROJECT_NAME="${PROJECT_NAME:-AskGeorge}"
+PROJECT_NAME="${PROJECT_NAME:-MyProject}"
 TEST_CMD="${TEST_CMD:-.venv/bin/python -m pytest tests/ -x -q}"
 LINT_CMD="${LINT_CMD:-.venv/bin/python -m flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
 
@@ -61,20 +63,32 @@ ENGINE_PLANNER_A="${ENGINE_PLANNER_A:-claude}"    # Phase 2a
 ENGINE_PLANNER_B="${ENGINE_PLANNER_B:-codex}"     # Phase 2b
 ENGINE_EVALUATOR="${ENGINE_EVALUATOR:-claude}"    # Phase 3
 ENGINE_CRITIC="${ENGINE_CRITIC:-claude}"          # Phase 4
-ENGINE_EXECUTOR="${ENGINE_EXECUTOR:-claude}"      # TODO: switch to codex when stream disconnection fix is merged
+ENGINE_EXECUTOR="${ENGINE_EXECUTOR:-claude}"      # Stream fix shipped (2026-03-07). Codex eligible but kept on claude for executor stability.
 ENGINE_REVIEWER_A="${ENGINE_REVIEWER_A:-claude}"  # Phase 6a
 ENGINE_REVIEWER_B="${ENGINE_REVIEWER_B:-codex}"   # Phase 6b
-ENGINE_FIX="${ENGINE_FIX:-claude}"                # TODO: switch to codex when stream disconnection fix is merged
+ENGINE_FIX="${ENGINE_FIX:-claude}"                # Stream fix shipped (2026-03-07). Codex eligible but kept on claude for fix stability.
+ENGINE_FINAL_VERIFY="${ENGINE_FINAL_VERIFY:-codex}"
+ENGINE_FINAL_FALSIFY="${ENGINE_FINAL_FALSIFY:-codex}"
+ENGINE_FINAL_FIX="${ENGINE_FINAL_FIX:-codex}"
+_V2_CODEX_RUN_FAILURES=0                          # Tracks Codex failures (after internal retries) within a single run
+_V2_CODEX_AUTH_PREFLIGHT_RAN=false
+_V2_CODEX_AUTH_CIRCUIT_OPEN=false
+_V2_CODEX_AUTH_CIRCUIT_MESSAGE=""
+_V2_EFFECTIVE_ENGINE=""
+_V2_LAST_ENGINE_RESOLUTION_REASON="none"
+_V2_LAST_ENGINE_RESOLUTION_REQUESTED=""
+_V2_LAST_ENGINE_RESOLUTION_RESULT=""
 # Timeouts (env-overridable)
-EXPLORE_TIMEOUT="${EXPLORE_TIMEOUT:-15m}"
-PLANNER_TIMEOUT="${PLANNER_TIMEOUT:-10m}"
-EVALUATE_TIMEOUT="${EVALUATE_TIMEOUT:-10m}"
-CRITIC_TIMEOUT="${CRITIC_TIMEOUT:-15m}"
+EXPLORE_TIMEOUT="${EXPLORE_TIMEOUT:-30m}"
+PLANNER_TIMEOUT="${PLANNER_TIMEOUT:-30m}"
+EVALUATE_TIMEOUT="${EVALUATE_TIMEOUT:-30m}"
+CRITIC_TIMEOUT="${CRITIC_TIMEOUT:-30m}"
 EXECUTOR_TIMEOUT="${EXECUTOR_TIMEOUT:-120m}"
 REVIEWER_TIMEOUT_EXPLICIT="false"
 [[ -n "${REVIEWER_TIMEOUT:-}" ]] && REVIEWER_TIMEOUT_EXPLICIT="true"
-REVIEWER_TIMEOUT="${REVIEWER_TIMEOUT:-15m}"
-SYNTHESIZE_TIMEOUT="${SYNTHESIZE_TIMEOUT:-10m}"
+REVIEWER_TIMEOUT="${REVIEWER_TIMEOUT:-30m}"
+SYNTHESIZE_TIMEOUT="${SYNTHESIZE_TIMEOUT:-30m}"
+PHASE8C_TIMEOUT="${PHASE8C_TIMEOUT:-60m}"
 
 # Lock
 LOCK_DIR="/tmp/lauren-loop-v2.lock.d"
@@ -89,9 +103,100 @@ _PIPELINE_PRE_SHA=""
 _PIPELINE_START_TS=""
 _V2_EXEC_WORKTREE_PATH=""
 _V2_EXEC_WORKTREE_BRANCH=""
+_V2_EXEC_TARGET_REF=""
+_V2_EXEC_TARGET_HEAD_SHA=""
+_V2_LAST_MERGE_RECOVERABLE=false
+_V2_PRESERVED_EXEC_WORKTREE_PATH=""
+_V2_PRESERVED_EXEC_WORKTREE_BRANCH=""
+_V2_PRESERVED_EXEC_TARGET_REF=""
+_V2_PRESERVED_EXEC_TARGET_HEAD_SHA=""
+_V2_PRESERVED_EXEC_COMMIT_SHA=""
+_V2_PRESERVED_RECOVERY_DIR=""
+_V2_PRESERVED_COMBINED_PATCH=""
+_V2_PRESERVED_COMMIT_LOG=""
+_V2_PRESERVED_FORMAT_PATCH_DIR=""
+_V2_PRESERVED_WORKTREE_PATCH=""
 
 _v2_task_artifact_dir() {
     printf '%s/docs/tasks/open/%s\n' "$SCRIPT_DIR" "$1"
+}
+
+_v2_task_dir_for_task_file() {
+    local task_file="$1"
+    case "$task_file" in
+        */task.md)
+            dirname "$task_file"
+            ;;
+        *.md)
+            printf '%s/%s\n' "$(dirname "$task_file")" "$(basename "$task_file" .md)"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+_v2_collect_nested_exact_task_matches() {
+    local open_root="$1"
+    local slug="$2"
+    local dir_task="$3"
+    local flat_task="$4"
+
+    find "$open_root" -type f \
+        \( -name "${slug}.md" -o -path "*/${slug}/task.md" \) \
+        ! -path "$flat_task" \
+        ! -path "$dir_task" \
+        ! -path '*/competitive/*' \
+        ! -path '*/logs/*' | sort
+}
+
+_v2_collect_nightshift_manager_matches() {
+    local open_root="$1"
+    local slug="$2"
+
+    find "${open_root}/nightshift" -maxdepth 1 -type f \
+        -name "????-??-??-${slug}.md" \
+        ! -path '*/competitive/*' \
+        ! -path '*/logs/*' | sort 2>/dev/null || true
+}
+
+_v2_task_file_hint_matches_slug() {
+    local task_file="$1"
+    local slug="$2"
+    local base_name=""
+
+    [[ -n "$task_file" && -f "$task_file" ]] || return 1
+
+    case "$task_file" in
+        */task.md)
+            base_name="$(basename "$(dirname "$task_file")")"
+            ;;
+        *.md)
+            base_name="$(basename "$task_file" .md)"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    if [[ "$base_name" == "$slug" || "$base_name" == "pilot-${slug}" ]]; then
+        return 0
+    fi
+
+    [[ "$base_name" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}-${slug}$ ]]
+}
+
+_v2_should_preserve_flat_task_file() {
+    local task_file="$1"
+
+    case "$task_file" in
+        */docs/tasks/open/nightshift/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]-*.md)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 _resolve_v2_task_file() {
@@ -101,20 +206,63 @@ _resolve_v2_task_file() {
     local flat_task="${open_root}/${slug}.md"
     local dir_task="${task_dir}/task.md"
     local candidate=""
+    local nested_matches=""
+    local first_nested=""
+    local second_nested=""
+    local hint_task="${LAUREN_LOOP_TASK_FILE_HINT:-}"
+    local nightshift_matches=""
+    local first_nightshift=""
+    local second_nightshift=""
+
+    if [[ -n "$hint_task" && "$hint_task" != /* ]]; then
+        hint_task="${SCRIPT_DIR}/${hint_task#./}"
+    fi
 
     if [[ -f "$dir_task" && -f "$flat_task" ]]; then
         echo "ERROR: ambiguous task slug '$slug' matches both $flat_task and $dir_task" >&2
         return 2
     fi
 
-    if [[ -f "$dir_task" ]]; then
+    if _v2_task_file_hint_matches_slug "$hint_task" "$slug"; then
+        candidate="$hint_task"
+    elif [[ -f "$dir_task" ]]; then
         candidate="$dir_task"
     elif [[ -f "$flat_task" ]]; then
         candidate="$flat_task"
     elif [[ -f "${open_root}/pilot-${slug}.md" ]]; then
         candidate="${open_root}/pilot-${slug}.md"
-    elif [[ -d "$task_dir" ]]; then
-        candidate=$(find "$task_dir" -maxdepth 1 -name "*.md" ! -path "*/competitive/*" ! -path "*/logs/*" | sort | head -1)
+    else
+        nested_matches=$(_v2_collect_nested_exact_task_matches "$open_root" "$slug" "$dir_task" "$flat_task")
+        first_nested=$(printf '%s\n' "$nested_matches" | sed -n '1p')
+        second_nested=$(printf '%s\n' "$nested_matches" | sed -n '2p')
+        if [[ -n "$second_nested" ]]; then
+            echo "ERROR: ambiguous task slug '$slug' matches multiple nested task files:" >&2
+            while IFS= read -r candidate; do
+                [[ -n "$candidate" ]] || continue
+                printf '  %s\n' "$candidate" >&2
+            done <<< "$nested_matches"
+            return 2
+        fi
+        if [[ -n "$first_nested" ]]; then
+            candidate="$first_nested"
+        else
+            nightshift_matches="$(_v2_collect_nightshift_manager_matches "$open_root" "$slug")"
+            first_nightshift=$(printf '%s\n' "$nightshift_matches" | sed -n '1p')
+            second_nightshift=$(printf '%s\n' "$nightshift_matches" | sed -n '2p')
+            if [[ -n "$second_nightshift" ]]; then
+                echo "ERROR: ambiguous nightshift task slug '$slug' matches multiple manager task files:" >&2
+                while IFS= read -r candidate; do
+                    [[ -n "$candidate" ]] || continue
+                    printf '  %s\n' "$candidate" >&2
+                done <<< "$nightshift_matches"
+                return 2
+            fi
+            if [[ -n "$first_nightshift" ]]; then
+                candidate="$first_nightshift"
+            elif [[ -d "$task_dir" ]]; then
+                candidate=$(find "$task_dir" -maxdepth 1 -name "*.md" ! -path "*/competitive/*" ! -path "*/logs/*" | sort | head -1)
+            fi
+        fi
     fi
 
     [[ -n "$candidate" && -f "$candidate" ]] || return 1
@@ -186,8 +334,22 @@ _reviewer_timeout_resolution_source() {
     fi
 }
 
+# Run manifest schema:
+# Root fields:
+#   run_id, slug, goal, started_at, model, engines, force_rerun, current_phase,
+#   active_engines, diff_risk, effective_timeouts, phases, completed_at,
+#   total_cost_usd, final_status, fix_cycles, traditional_dev_proxy.
+# Phase entry fields:
+#   phase, name, started_at, completed_at, status, verdict, cost.
+# Error metadata fields (present only when provided by the caller):
+#   error_class, error_detail.
+# Canonical error_class values currently include:
+#   unknown, timeout, invalid_artifact, scope_violation, merge_failure,
+#   codex_capacity, codex_stream, codex_circuit_breaker.
 _init_run_manifest() {
-    local manifest="${comp_dir}/run-manifest.json"
+    local manifest_dir="${comp_dir:-}"
+    [[ -n "$manifest_dir" ]] || return 0
+    local manifest="${manifest_dir}/run-manifest.json"
     command -v jq >/dev/null 2>&1 || return 0
     local tmp
     tmp=$(same_dir_temp_file "$manifest") || return 1
@@ -205,6 +367,9 @@ _init_run_manifest() {
         --arg engine_reviewer_a "$ENGINE_REVIEWER_A" \
         --arg engine_reviewer_b "$ENGINE_REVIEWER_B" \
         --arg engine_fix "$ENGINE_FIX" \
+        --arg engine_final_verify "$ENGINE_FINAL_VERIFY" \
+        --arg engine_final_falsify "$ENGINE_FINAL_FALSIFY" \
+        --arg engine_final_fix "$ENGINE_FINAL_FIX" \
         --argjson force_rerun "$([ "$FORCE_RERUN" = true ] && echo true || echo false)" \
         '{
             run_id: $run_id,
@@ -220,7 +385,10 @@ _init_run_manifest() {
                 executor: $engine_executor,
                 reviewer_a: $engine_reviewer_a,
                 reviewer_b: $engine_reviewer_b,
-                fix: $engine_fix
+                fix: $engine_fix,
+                final_verify: $engine_final_verify,
+                final_falsify: $engine_final_falsify,
+                final_fix: $engine_final_fix
             },
             force_rerun: $force_rerun,
             current_phase: null,
@@ -232,7 +400,10 @@ _init_run_manifest() {
                 executor: $engine_executor,
                 reviewer_a: $engine_reviewer_a,
                 reviewer_b: $engine_reviewer_b,
-                fix: $engine_fix
+                fix: $engine_fix,
+                final_verify: $engine_final_verify,
+                final_falsify: $engine_final_falsify,
+                final_fix: $engine_final_fix
             },
             diff_risk: null,
             effective_timeouts: {
@@ -245,7 +416,11 @@ _init_run_manifest() {
 _update_run_manifest_state() {
     local current_phase="$1" diff_risk="${2:-}" reviewer_timeout="${3:-}"
     local reviewer_a_engine="${4:-$ENGINE_REVIEWER_A}" reviewer_b_engine="${5:-$ENGINE_REVIEWER_B}"
-    local manifest="${comp_dir}/run-manifest.json"
+    local final_verify_engine="${6:-$ENGINE_FINAL_VERIFY}" final_falsify_engine="${7:-$ENGINE_FINAL_FALSIFY}"
+    local final_fix_engine="${8:-$ENGINE_FINAL_FIX}"
+    local manifest_dir="${comp_dir:-}"
+    [[ -n "$manifest_dir" ]] || return 0
+    local manifest="${manifest_dir}/run-manifest.json"
     command -v jq >/dev/null 2>&1 || return 0
     [[ -f "$manifest" ]] || return 0
     local tmp
@@ -259,6 +434,9 @@ _update_run_manifest_state() {
        --arg engine_reviewer_a "$reviewer_a_engine" \
        --arg engine_reviewer_b "$reviewer_b_engine" \
        --arg engine_fix "$ENGINE_FIX" \
+       --arg engine_final_verify "$final_verify_engine" \
+       --arg engine_final_falsify "$final_falsify_engine" \
+       --arg engine_final_fix "$final_fix_engine" \
        --arg diff_risk "$diff_risk" \
        --arg reviewer_timeout "$reviewer_timeout" \
        '(.diff_risk // null) as $existing_diff_risk |
@@ -272,7 +450,10 @@ _update_run_manifest_state() {
             executor: $engine_executor,
             reviewer_a: $engine_reviewer_a,
             reviewer_b: $engine_reviewer_b,
-            fix: $engine_fix
+            fix: $engine_fix,
+            final_verify: $engine_final_verify,
+            final_falsify: $engine_final_falsify,
+            final_fix: $engine_final_fix
         } |
         .diff_risk = (if $diff_risk == "" then $existing_diff_risk else $diff_risk end) |
         .effective_timeouts = ($existing_timeouts + {
@@ -282,10 +463,22 @@ _update_run_manifest_state() {
 
 _append_manifest_phase() {
     local phase="$1" name="$2" started_at="$3" completed_at="$4" status="$5"
-    local verdict="${6:-}" cost="${7:-}"
-    local manifest="${comp_dir}/run-manifest.json"
+    local verdict="${6:-}" cost="${7:-}" error_class="${8:-}" error_detail="${9:-}" recovery_json="${10:-null}"
+    local normalized_error_detail="$error_detail"
+    local manifest_dir="${comp_dir:-}"
+    [[ -n "$manifest_dir" ]] || return 0
+    local manifest="${manifest_dir}/run-manifest.json"
     command -v jq >/dev/null 2>&1 || return 0
     [[ -f "$manifest" ]] || return 0
+    if ! printf '%s' "$recovery_json" | jq -e . >/dev/null 2>&1; then
+        recovery_json="null"
+    fi
+    if [[ -n "$error_class" || -n "$error_detail" ]]; then
+        normalized_error_detail=$(printf '%s' "$error_detail" | tr '\r\n' '  ')
+        if [[ ${#normalized_error_detail} -gt 200 ]]; then
+            normalized_error_detail="${normalized_error_detail:0:200}"
+        fi
+    fi
     local tmp
     tmp=$(same_dir_temp_file "$manifest") || return 1
     jq --arg phase "$phase" \
@@ -295,27 +488,63 @@ _append_manifest_phase() {
        --arg status "$status" \
        --arg verdict "$verdict" \
        --arg cost "$cost" \
-       '.phases += [{
-           phase: $phase,
-           name: $name,
-           started_at: $started_at,
-           completed_at: $completed_at,
-           status: $status,
-           verdict: (if $verdict == "" then null else $verdict end),
-           cost: (if $cost == "" then null else $cost end)
-       }]' "$manifest" > "$tmp" && mv "$tmp" "$manifest" || { rm -f "$tmp"; return 1; }
+       --arg error_class "$error_class" \
+       --arg error_detail "$normalized_error_detail" \
+       --argjson recovery "$recovery_json" \
+       '.phases += [(
+           {
+               phase: $phase,
+               name: $name,
+               started_at: $started_at,
+               completed_at: $completed_at,
+               status: $status,
+               verdict: (if $verdict == "" then null else $verdict end),
+               cost: (if $cost == "" then null else $cost end)
+           } +
+           (if $error_class == "" and $error_detail == "" then {} else {
+               error_class: (if $error_class == "" then null else $error_class end),
+               error_detail: $error_detail
+           } end) +
+           (if $recovery == null then {} else {
+               recovery: $recovery
+           } end)
+       )]' "$manifest" > "$tmp" && mv "$tmp" "$manifest" || { rm -f "$tmp"; return 1; }
+}
+
+_run_manifest_is_finalized() {
+    local manifest="${1:-}"
+    if [[ -z "$manifest" ]]; then
+        [[ -n "${comp_dir:-}" ]] || return 1
+        manifest="${comp_dir}/run-manifest.json"
+    fi
+    command -v jq >/dev/null 2>&1 || return 1
+    [[ -f "$manifest" ]] || return 1
+    jq -e '
+        (.final_status? | type == "string" and length > 0) and
+        (.completed_at? | type == "string" and length > 0)
+    ' "$manifest" >/dev/null 2>&1
 }
 
 _finalize_run_manifest() {
     local final_status="$1" fix_cycles="$2"
-    local manifest="${comp_dir}/run-manifest.json"
+    local manifest_dir="${comp_dir:-}"
+    [[ -n "$manifest_dir" ]] || return 0
+    local manifest="${manifest_dir}/run-manifest.json"
     local traditional_proxy_json="null"
+    local task_log_dir="${TASK_LOG_DIR:-${_CURRENT_TASK_LOG_DIR:-}}"
     command -v jq >/dev/null 2>&1 || return 0
     [[ -f "$manifest" ]] || return 0
-    _merge_cost_csvs || true
+    _run_manifest_is_finalized "$manifest" && return 0
+    if [[ -n "$task_log_dir" ]]; then
+        [[ -n "${TASK_LOG_DIR:-}" ]] || TASK_LOG_DIR="$task_log_dir"
+        _merge_cost_csvs || true
+    fi
     local total_cost="0.0000"
-    local cost_csv="${TASK_LOG_DIR}/cost.csv"
-    if [[ -f "$cost_csv" ]]; then
+    local cost_csv=""
+    if [[ -n "$task_log_dir" ]]; then
+        cost_csv="${task_log_dir}/cost.csv"
+    fi
+    if [[ -n "$cost_csv" && -f "$cost_csv" ]]; then
         total_cost=$(awk -F',' 'NR > 1 && $11 != "" { sum += $11 } END { printf "%.4f", sum + 0 }' "$cost_csv" 2>/dev/null || echo "0.0000")
     fi
     if [[ -n "${_CURRENT_TASK_FILE:-}" ]]; then
@@ -339,6 +568,38 @@ _finalize_run_manifest() {
            fix_cycles: $fix_cycles,
            traditional_dev_proxy: $traditional_dev_proxy
        }' "$manifest" > "$tmp" && mv "$tmp" "$manifest" || { rm -f "$tmp"; return 1; }
+}
+
+_manifest_phase_measured_cost() {
+    local task_log_dir="${1:-${TASK_LOG_DIR:-${_CURRENT_TASK_LOG_DIR:-}}}"
+    local cost_csv="" measured_phase_cost=""
+    [[ -n "$task_log_dir" ]] || {
+        printf '0.00\n'
+        return 0
+    }
+    [[ -n "${TASK_LOG_DIR:-}" ]] || TASK_LOG_DIR="$task_log_dir"
+    _merge_cost_csvs || true
+    cost_csv="${task_log_dir}/cost.csv"
+    if [[ -f "$cost_csv" ]]; then
+        measured_phase_cost=$(
+            awk -F',' '
+                NR > 1 && $11 ~ /^[[:space:]]*[0-9]+(\.[0-9]+)?[[:space:]]*$/ {
+                    sum += $11 + 0
+                    found = 1
+                }
+                END {
+                    if (found) {
+                        printf "%.4f", sum + 0
+                    }
+                }
+            ' "$cost_csv" 2>/dev/null || true
+        )
+        if [[ -n "$measured_phase_cost" ]]; then
+            printf '%s\n' "$measured_phase_cost"
+            return 0
+        fi
+    fi
+    printf '0.00\n'
 }
 
 ## _model_name_for_engine — now in lib/lauren-loop-utils.sh
@@ -422,6 +683,209 @@ _codex_attempt_fallback_reason() {
     fi
 
     return 1
+}
+
+_classify_agent_exit_error_class() {
+    local engine="$1" exit_code="$2" log_file="${3:-}"
+
+    if [[ "$exit_code" -eq 124 ]]; then
+        printf 'timeout\n'
+        return 0
+    fi
+
+    case "$engine" in
+        codex*)
+            if [[ -n "$log_file" && -f "$log_file" ]]; then
+                if _codex_attempt_indicates_capacity_failure "$log_file"; then
+                    printf 'codex_capacity\n'
+                    return 0
+                fi
+                if _codex_attempt_indicates_stream_failure "$log_file"; then
+                    printf 'codex_stream\n'
+                    return 0
+                fi
+            fi
+            ;;
+    esac
+
+    # TODO: refine error_class when stable non-timeout/non-log failure signals emerge.
+    printf 'unknown\n'
+}
+
+_v2_record_codex_outcome() {
+    local engine="$1" exit_code="$2"
+    [[ "$engine" == "codex" ]] || return 0
+    if [[ "$exit_code" -ne 0 ]]; then
+        _V2_CODEX_RUN_FAILURES=$((_V2_CODEX_RUN_FAILURES + 1))
+    fi
+    # No reset on success: a single run is 30-60 min. If Codex was broken
+    # enough to fail twice (after internal retries each time), it's not
+    # recovering mid-run. Resetting would allow 4-6 wasted dispatches in
+    # a run with intermittent Codex issues.
+}
+
+_v2_reset_codex_auth_preflight_state() {
+    _V2_CODEX_AUTH_PREFLIGHT_RAN=false
+    _V2_CODEX_AUTH_CIRCUIT_OPEN=false
+    _V2_CODEX_AUTH_CIRCUIT_MESSAGE=""
+    _V2_EFFECTIVE_ENGINE=""
+    _V2_LAST_ENGINE_RESOLUTION_REASON="none"
+    _V2_LAST_ENGINE_RESOLUTION_REQUESTED=""
+    _V2_LAST_ENGINE_RESOLUTION_RESULT=""
+    export _V2_CODEX_AUTH_PREFLIGHT_RAN _V2_CODEX_AUTH_CIRCUIT_OPEN _V2_CODEX_AUTH_CIRCUIT_MESSAGE
+}
+
+_v2_preflight_codex_auth_once() {
+    local stderr_file="" exit_code=0 normalized_message=""
+
+    [[ "${_V2_CODEX_AUTH_PREFLIGHT_RAN:-false}" == "true" ]] && return 0
+
+    _V2_CODEX_AUTH_PREFLIGHT_RAN=true
+    export _V2_CODEX_AUTH_PREFLIGHT_RAN
+
+    if ! type codex54_auth_preflight >/dev/null 2>&1; then
+        return 0
+    fi
+
+    stderr_file=$(mktemp "${TMPDIR:-/tmp}/lauren-loop-codex-auth.XXXXXX") || return 1
+
+    if codex54_auth_preflight 2>"$stderr_file"; then
+        _V2_CODEX_AUTH_CIRCUIT_OPEN=false
+        _V2_CODEX_AUTH_CIRCUIT_MESSAGE=""
+        export _V2_CODEX_AUTH_CIRCUIT_OPEN _V2_CODEX_AUTH_CIRCUIT_MESSAGE
+        rm -f "$stderr_file"
+        return 0
+    fi
+    exit_code=$?
+
+    if grep -qi 'Key Vault' "$stderr_file" 2>/dev/null; then
+        normalized_message="No cached or env Codex 5.4 API key was available and Key Vault lookup failed"
+    elif grep -qiE 'az login|Azure authentication required' "$stderr_file" 2>/dev/null; then
+        normalized_message="No cached or env Codex 5.4 API key was available and Azure login is required for Key Vault"
+    else
+        normalized_message="Codex auth preflight failed"
+    fi
+
+    _V2_CODEX_AUTH_CIRCUIT_OPEN=true
+    _V2_CODEX_AUTH_CIRCUIT_MESSAGE="$normalized_message"
+    export _V2_CODEX_AUTH_CIRCUIT_OPEN _V2_CODEX_AUTH_CIRCUIT_MESSAGE
+    rm -f "$stderr_file"
+    return "$exit_code"
+}
+
+_v2_codex_skip_reason() {
+    if [[ "${_V2_CODEX_AUTH_CIRCUIT_OPEN:-false}" == "true" ]]; then
+        printf 'auth_preflight\n'
+        return 0
+    fi
+
+    if [[ "${_V2_CODEX_RUN_FAILURES:-0}" -ge 2 ]]; then
+        printf 'run_failures\n'
+        return 0
+    fi
+
+    return 1
+}
+
+_v2_should_skip_codex() {
+    _v2_codex_skip_reason >/dev/null 2>&1
+}
+
+# _resolve_effective_engine <requested_engine>
+# Mutates Codex preflight/breaker state in the current shell. Do not call this
+# helper via command substitution; read `_V2_EFFECTIVE_ENGINE` after invoking it.
+_resolve_effective_engine() {
+    local requested_engine="$1"
+    local skip_reason=""
+
+    _V2_LAST_ENGINE_RESOLUTION_REQUESTED="$requested_engine"
+    _V2_LAST_ENGINE_RESOLUTION_REASON="none"
+    _V2_LAST_ENGINE_RESOLUTION_RESULT="$requested_engine"
+    _V2_EFFECTIVE_ENGINE="$requested_engine"
+
+    if [[ "$requested_engine" != "codex" ]]; then
+        return 0
+    fi
+
+    skip_reason=$(_v2_codex_skip_reason 2>/dev/null || true)
+    if [[ -z "$skip_reason" ]] && [[ "${_V2_CODEX_AUTH_PREFLIGHT_RAN:-false}" != "true" ]]; then
+        _v2_preflight_codex_auth_once || true
+        skip_reason=$(_v2_codex_skip_reason 2>/dev/null || true)
+    fi
+
+    case "$skip_reason" in
+        auth_preflight|run_failures)
+            _V2_EFFECTIVE_ENGINE="claude"
+            _V2_LAST_ENGINE_RESOLUTION_REASON="$skip_reason"
+            _V2_LAST_ENGINE_RESOLUTION_RESULT="claude"
+            ;;
+        *)
+            _V2_EFFECTIVE_ENGINE="codex"
+            _V2_LAST_ENGINE_RESOLUTION_REASON="none"
+            _V2_LAST_ENGINE_RESOLUTION_RESULT="codex"
+            ;;
+    esac
+}
+
+_v2_engine_resolution_skipped_codex() {
+    local requested_engine="$1" effective_engine="$2"
+    [[ "$requested_engine" == "codex" && "$effective_engine" != "codex" ]]
+}
+
+_jittered_backoff() {
+    local base_delay="${1:-0}"
+    local jitter_max=0
+    if [[ ! "$base_delay" =~ ^[0-9]+$ ]]; then
+        printf '0\n'
+        return 0
+    fi
+    jitter_max=$((base_delay / 4))
+    printf '%s\n' $((base_delay + (RANDOM % (jitter_max + 1))))
+}
+
+_v2_log_codex_circuit_breaker_trip() {
+    local task_file="$1" dispatch_label="$2"
+    local skip_reason=""
+    skip_reason=$(_v2_codex_skip_reason 2>/dev/null || true)
+
+    case "$skip_reason" in
+        auth_preflight)
+            echo -e "${YELLOW}Codex auth preflight failed — using Claude for ${dispatch_label}${NC}"
+            log_execution "$task_file" "Codex auth preflight failed for ${dispatch_label}; overriding codex→claude (${_V2_CODEX_AUTH_CIRCUIT_MESSAGE:-Codex auth preflight failed})" || true
+            ;;
+        *)
+            local failure_count="${_V2_CODEX_RUN_FAILURES:-0}"
+            echo -e "${YELLOW}Codex circuit breaker active — using Claude for ${dispatch_label} (${failure_count} cumulative Codex failures in this run)${NC}"
+            log_execution "$task_file" "Codex circuit breaker active for ${dispatch_label}; overriding codex→claude (${failure_count} cumulative Codex failures in this run)" || true
+            ;;
+    esac
+}
+
+_v2_append_codex_circuit_breaker_skip() {
+    local phase="$1" name="$2" started_at="$3" dispatch_label="$4"
+    local skip_reason="" error_class="codex_circuit_breaker" error_detail=""
+    skip_reason=$(_v2_codex_skip_reason 2>/dev/null || true)
+
+    case "$skip_reason" in
+        auth_preflight)
+            error_class="codex_auth_preflight"
+            error_detail="dispatch=${dispatch_label}; skipped_engine=codex; fallback_engine=claude; reason=auth_preflight"
+            ;;
+        *)
+            error_detail="dispatch=${dispatch_label}; skipped_engine=codex; fallback_engine=claude; cumulative_failures=${_V2_CODEX_RUN_FAILURES:-0}"
+            ;;
+    esac
+
+    _append_manifest_phase \
+        "$phase" \
+        "$name" \
+        "$started_at" \
+        "$(_iso_timestamp)" \
+        "skipped" \
+        "" \
+        "" \
+        "$error_class" \
+        "$error_detail" || true
 }
 
 _codex_attempt_artifact_path() {
@@ -893,9 +1357,260 @@ release_lock() {
 # Execution worktree helpers — isolate Phase 4/7 execution
 # ============================================================
 
+_v2_reset_merge_recovery_state() {
+    _V2_EXEC_TARGET_REF=""
+    _V2_EXEC_TARGET_HEAD_SHA=""
+    _V2_LAST_MERGE_RECOVERABLE=false
+    _V2_PRESERVED_EXEC_WORKTREE_PATH=""
+    _V2_PRESERVED_EXEC_WORKTREE_BRANCH=""
+    _V2_PRESERVED_EXEC_TARGET_REF=""
+    _V2_PRESERVED_EXEC_TARGET_HEAD_SHA=""
+    _V2_PRESERVED_EXEC_COMMIT_SHA=""
+    _V2_PRESERVED_RECOVERY_DIR=""
+    _V2_PRESERVED_COMBINED_PATCH=""
+    _V2_PRESERVED_COMMIT_LOG=""
+    _V2_PRESERVED_FORMAT_PATCH_DIR=""
+    _V2_PRESERVED_WORKTREE_PATCH=""
+}
+
+_v2_capture_execution_merge_target() {
+    local target_ref=""
+    local target_head_sha=""
+
+    target_ref=$(git symbolic-ref -q HEAD 2>/dev/null || true)
+    [[ -n "$target_ref" ]] || target_ref="HEAD"
+
+    target_head_sha=$(git rev-parse "$target_ref" 2>/dev/null || true)
+    [[ -n "$target_head_sha" ]] || target_head_sha=$(git rev-parse HEAD 2>/dev/null || true)
+
+    _V2_EXEC_TARGET_REF="$target_ref"
+    _V2_EXEC_TARGET_HEAD_SHA="$target_head_sha"
+    _V2_LAST_MERGE_RECOVERABLE=false
+}
+
+_v2_saved_diff_base_dir() {
+    local save_dir=""
+
+    if [[ -n "${_CURRENT_TASK_FILE:-}" && -f "$_CURRENT_TASK_FILE" ]]; then
+        local task_dir=""
+        task_dir=$(_v2_task_dir_for_task_file "$_CURRENT_TASK_FILE" 2>/dev/null || true)
+        if [[ -n "$task_dir" ]]; then
+            save_dir="${task_dir}/competitive/saved-diffs"
+        fi
+    fi
+
+    printf '%s\n' "${save_dir:-/tmp/lauren-loop-saved-diffs}"
+}
+
+_v2_write_worktree_local_patch() {
+    local wt_path="$1"
+    local patch_file="$2"
+    local untracked=""
+    local f=""
+
+    : > "$patch_file"
+    git -C "$wt_path" diff HEAD > "$patch_file" 2>/dev/null || true
+
+    untracked=$(git -C "$wt_path" ls-files --others --exclude-standard 2>/dev/null || true)
+    if [[ -n "$untracked" ]]; then
+        while IFS= read -r f; do
+            [[ -n "$f" ]] || continue
+            git -C "$wt_path" diff --no-index -- /dev/null "$wt_path/$f" >> "$patch_file" 2>/dev/null || true
+        done <<< "$untracked"
+    fi
+
+    [[ -s "$patch_file" ]]
+}
+
+_v2_has_recoverable_execution_commit() {
+    local target_head_sha="$1"
+    local worktree_head="$2"
+
+    [[ -n "$target_head_sha" && -n "$worktree_head" ]] || return 1
+    [[ "$target_head_sha" != "$worktree_head" ]] || return 1
+    git merge-base --is-ancestor "$target_head_sha" "$worktree_head" 2>/dev/null
+}
+
+_v2_recovery_manifest_json() {
+    command -v jq >/dev/null 2>&1 || {
+        printf 'null\n'
+        return 0
+    }
+
+    jq -cn \
+        --arg target_ref "${_V2_PRESERVED_EXEC_TARGET_REF:-}" \
+        --arg target_head_sha "${_V2_PRESERVED_EXEC_TARGET_HEAD_SHA:-}" \
+        --arg branch "${_V2_PRESERVED_EXEC_WORKTREE_BRANCH:-}" \
+        --arg worktree_path "${_V2_PRESERVED_EXEC_WORKTREE_PATH:-}" \
+        --arg preserved_commit "${_V2_PRESERVED_EXEC_COMMIT_SHA:-}" \
+        --arg recovery_dir "${_V2_PRESERVED_RECOVERY_DIR:-}" \
+        --arg combined_patch "${_V2_PRESERVED_COMBINED_PATCH:-}" \
+        --arg commit_log "${_V2_PRESERVED_COMMIT_LOG:-}" \
+        --arg format_patch_dir "${_V2_PRESERVED_FORMAT_PATCH_DIR:-}" \
+        --arg worktree_patch "${_V2_PRESERVED_WORKTREE_PATCH:-}" \
+        '{
+            target_ref: $target_ref,
+            target_head_sha: $target_head_sha,
+            branch: $branch,
+            worktree_path: $worktree_path,
+            preserved_commit: $preserved_commit,
+            recovery_dir: $recovery_dir,
+            combined_patch: $combined_patch,
+            commit_log: $commit_log,
+            format_patch_dir: $format_patch_dir,
+            worktree_patch: $worktree_patch
+        } | with_entries(select(.value != ""))'
+}
+
+_v2_log_recovery_details() {
+    local task_file="$1"
+
+    [[ -n "$task_file" && -f "$task_file" ]] || return 0
+    [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]] || return 0
+
+    log_execution "$task_file" "  recovery branch: ${_V2_PRESERVED_EXEC_WORKTREE_BRANCH:-unknown}" || true
+    log_execution "$task_file" "  recovery worktree: ${_V2_PRESERVED_EXEC_WORKTREE_PATH:-unknown}" || true
+    log_execution "$task_file" "  recovery preserved commit: ${_V2_PRESERVED_EXEC_COMMIT_SHA:-unknown}" || true
+    if [[ -n "${_V2_PRESERVED_RECOVERY_DIR:-}" ]]; then
+        log_execution "$task_file" "  recovery artifacts: ${_V2_PRESERVED_RECOVERY_DIR}" || true
+    fi
+    if [[ -n "${_V2_PRESERVED_COMBINED_PATCH:-}" ]]; then
+        log_execution "$task_file" "  recovery combined diff: ${_V2_PRESERVED_COMBINED_PATCH}" || true
+    fi
+    if [[ -n "${_V2_PRESERVED_COMMIT_LOG:-}" ]]; then
+        log_execution "$task_file" "  recovery commit log: ${_V2_PRESERVED_COMMIT_LOG}" || true
+    fi
+    if [[ -n "${_V2_PRESERVED_FORMAT_PATCH_DIR:-}" ]]; then
+        log_execution "$task_file" "  recovery format-patch dir: ${_V2_PRESERVED_FORMAT_PATCH_DIR}" || true
+    fi
+    if [[ -n "${_V2_PRESERVED_WORKTREE_PATCH:-}" ]]; then
+        log_execution "$task_file" "  recovery worktree patch: ${_V2_PRESERVED_WORKTREE_PATCH}" || true
+    fi
+}
+
+_v2_execution_merge_branch_label() {
+    printf '%s\n' "${_V2_EXEC_WORKTREE_BRANCH:-${_V2_PRESERVED_EXEC_WORKTREE_BRANCH:-unknown}}"
+}
+
+_v2_cleanup_after_failed_merge() {
+    local save_diff="${1:-false}"
+
+    if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then
+        return 0
+    fi
+
+    if [[ "$save_diff" == true ]]; then
+        _v2_save_worktree_diff || true
+    fi
+    _v2_cleanup_execution_worktree || true
+}
+
+_v2_save_merge_failure_recovery_artifacts() {
+    local wt_path="$1"
+    local preserved_commit="$2"
+    local save_root=""
+    local timestamp=""
+    local recovery_dir=""
+    local combined_patch=""
+    local commit_log=""
+    local format_patch_dir=""
+    local worktree_patch=""
+    local merge_base=""
+
+    save_root=$(_v2_saved_diff_base_dir)
+    mkdir -p "$save_root" 2>/dev/null || return 0
+
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    recovery_dir="${save_root}/${SLUG:-unknown}-${timestamp}"
+    mkdir -p "$recovery_dir" 2>/dev/null || return 0
+
+    _V2_PRESERVED_RECOVERY_DIR="$recovery_dir"
+
+    if [[ -n "${_V2_PRESERVED_EXEC_TARGET_REF:-}" ]]; then
+        merge_base=$(git merge-base "${_V2_PRESERVED_EXEC_TARGET_REF}" "$preserved_commit" 2>/dev/null || true)
+    fi
+    if [[ -z "$merge_base" && -n "${_V2_PRESERVED_EXEC_TARGET_HEAD_SHA:-}" ]]; then
+        merge_base=$(git merge-base "${_V2_PRESERVED_EXEC_TARGET_HEAD_SHA}" "$preserved_commit" 2>/dev/null || true)
+    fi
+    if [[ -z "$merge_base" ]]; then
+        merge_base="${_V2_PRESERVED_EXEC_TARGET_HEAD_SHA:-}"
+    fi
+
+    if [[ -n "$merge_base" ]]; then
+        combined_patch="${recovery_dir}/combined.patch"
+        git diff "${merge_base}..${preserved_commit}" > "$combined_patch" 2>/dev/null || true
+        if [[ -s "$combined_patch" ]]; then
+            _V2_PRESERVED_COMBINED_PATCH="$combined_patch"
+        else
+            rm -f "$combined_patch"
+        fi
+
+        commit_log="${recovery_dir}/commits.txt"
+        git log --reverse --format=fuller "${merge_base}..${preserved_commit}" > "$commit_log" 2>/dev/null || true
+        if [[ -s "$commit_log" ]]; then
+            _V2_PRESERVED_COMMIT_LOG="$commit_log"
+        else
+            rm -f "$commit_log"
+        fi
+
+        format_patch_dir="${recovery_dir}/format-patch"
+        mkdir -p "$format_patch_dir" 2>/dev/null || true
+        git format-patch --quiet -o "$format_patch_dir" "${merge_base}..${preserved_commit}" >/dev/null 2>&1 || true
+        if compgen -G "${format_patch_dir}/*.patch" >/dev/null; then
+            _V2_PRESERVED_FORMAT_PATCH_DIR="$format_patch_dir"
+        else
+            rmdir "$format_patch_dir" 2>/dev/null || true
+        fi
+    fi
+
+    worktree_patch="${recovery_dir}/worktree.patch"
+    if _v2_write_worktree_local_patch "$wt_path" "$worktree_patch"; then
+        _V2_PRESERVED_WORKTREE_PATCH="$worktree_patch"
+    else
+        rm -f "$worktree_patch"
+    fi
+}
+
+_v2_preserve_recoverable_merge_failure() {
+    local wt_path="$1"
+    local wt_branch="$2"
+    local worktree_head="$3"
+
+    _V2_LAST_MERGE_RECOVERABLE=true
+    _V2_PRESERVED_EXEC_WORKTREE_PATH="$wt_path"
+    _V2_PRESERVED_EXEC_WORKTREE_BRANCH="$wt_branch"
+    _V2_PRESERVED_EXEC_TARGET_REF="${_V2_EXEC_TARGET_REF:-}"
+    _V2_PRESERVED_EXEC_TARGET_HEAD_SHA="${_V2_EXEC_TARGET_HEAD_SHA:-}"
+    _V2_PRESERVED_EXEC_COMMIT_SHA="$worktree_head"
+    _V2_PRESERVED_RECOVERY_DIR=""
+    _V2_PRESERVED_COMBINED_PATCH=""
+    _V2_PRESERVED_COMMIT_LOG=""
+    _V2_PRESERVED_FORMAT_PATCH_DIR=""
+    _V2_PRESERVED_WORKTREE_PATCH=""
+
+    _v2_save_merge_failure_recovery_artifacts "$wt_path" "$worktree_head" || true
+    git merge --abort >/dev/null 2>&1 || true
+
+    echo -e "${RED}Merge conflict from execution worktree branch ${wt_branch}${NC}" >&2
+    echo -e "${YELLOW}Recoverable merge failure — execution worktree preserved at ${wt_path}${NC}" >&2
+    echo -e "${YELLOW}Preserved branch: ${wt_branch}${NC}" >&2
+    echo -e "${YELLOW}Preserved commit: ${worktree_head}${NC}" >&2
+    if [[ -n "${_V2_PRESERVED_RECOVERY_DIR:-}" ]]; then
+        echo -e "${YELLOW}Recovery artifacts: ${_V2_PRESERVED_RECOVERY_DIR}${NC}" >&2
+    fi
+
+    _V2_EXEC_WORKTREE_PATH=""
+    _V2_EXEC_WORKTREE_BRANCH=""
+    _V2_EXEC_TARGET_REF=""
+    _V2_EXEC_TARGET_HEAD_SHA=""
+}
+
 _v2_create_execution_worktree() {
     local branch_name="ll-exec-${SLUG:-unknown}-${RANDOM}"
     local worktree_path="/tmp/lauren-loop-wt-${SLUG:-unknown}-$$"
+
+    _v2_reset_merge_recovery_state
+    _v2_capture_execution_merge_target
 
     # Clean up stale worktree from a previous crash at the same path
     if [[ -d "$worktree_path" ]]; then
@@ -916,21 +1631,92 @@ _v2_create_execution_worktree() {
     echo -e "${BLUE}Created execution worktree: ${worktree_path} (branch: ${branch_name})${NC}"
 }
 
+_v2_commit_execution_worktree_pending_changes() {
+    local wt_path="${_V2_EXEC_WORKTREE_PATH:-}"
+    local untracked="" path=""
+    local tracked_files=""
+
+    [[ -n "$wt_path" && -d "$wt_path" ]] || return 0
+
+    tracked_files=$(git -C "$wt_path" ls-files 2>/dev/null || true)
+    if [[ -n "$tracked_files" ]]; then
+        git -C "$wt_path" add -u -- . || return 1
+    fi
+
+    untracked=$(git -C "$wt_path" ls-files --others --exclude-standard 2>/dev/null || true)
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if _is_ignored_untracked_path "$path"; then
+            continue
+        fi
+        git -C "$wt_path" add -- "$path" || return 1
+    done <<< "$untracked"
+
+    if git -C "$wt_path" diff --cached --quiet HEAD -- 2>/dev/null; then
+        return 0
+    fi
+
+    git -C "$wt_path" \
+        -c user.name="Lauren Loop" \
+        -c user.email="lauren-loop@local" \
+        commit -m "lauren-loop: persist execution worktree changes" >/dev/null 2>&1 || {
+            echo -e "${RED}Failed to commit pending execution worktree changes${NC}" >&2
+            return 1
+        }
+}
+
+_v2_prestage_baseline_diff_if_missing() {
+    # Belt-and-suspenders: if the fix-execution worktree is missing the
+    # baseline code changes (e.g., commit-before-merge failed silently),
+    # auto-apply the latest execution diff patch before fix-executor starts.
+    local wt_path="${_V2_EXEC_WORKTREE_PATH:-}"
+    local comp_dir="$1"
+
+    [[ -n "$wt_path" && -d "$wt_path" ]] || return 0
+
+    # Find the latest diff to check: fix-diff-cycleN.patch or execution-diff.patch
+    local latest_patch=""
+    latest_patch=$(ls -t "$comp_dir"/fix-diff-cycle*.patch 2>/dev/null | head -1)
+    [[ -z "$latest_patch" ]] && latest_patch="${comp_dir}/execution-diff.patch"
+    [[ -f "$latest_patch" && -s "$latest_patch" ]] || return 0
+
+    # Check if the patch would apply (meaning changes are NOT already present)
+    if git -C "$wt_path" apply --check "$latest_patch" 2>/dev/null; then
+        echo -e "${YELLOW}Worktree missing baseline changes — auto-applying ${latest_patch}${NC}"
+        if git -C "$wt_path" apply "$latest_patch"; then
+            echo -e "${GREEN}Baseline diff pre-staged successfully${NC}"
+            return 0
+        else
+            echo -e "${RED}Failed to pre-stage baseline diff — fix-executor may report BLOCKED${NC}" >&2
+            return 1
+        fi
+    fi
+    # Patch would not apply cleanly = changes already present (or conflict). Nothing to do.
+    return 0
+}
+
 _v2_merge_execution_worktree() {
     [[ -n "$_V2_EXEC_WORKTREE_PATH" ]] || return 0
 
     cd "$SCRIPT_DIR"
+    _V2_LAST_MERGE_RECOVERABLE=false
+
+    _v2_commit_execution_worktree_pending_changes || return 1
 
     # Check if the worktree branch has any commits beyond our starting point
     local worktree_head=""
     worktree_head=$(git -C "$_V2_EXEC_WORKTREE_PATH" rev-parse HEAD 2>/dev/null || true)
-    local main_head=""
-    main_head=$(git rev-parse HEAD 2>/dev/null || true)
+    local target_head=""
+    target_head=$(git rev-parse "${_V2_EXEC_TARGET_REF:-HEAD}" 2>/dev/null || true)
+    [[ -n "$target_head" ]] || target_head=$(git rev-parse HEAD 2>/dev/null || true)
 
-    if [[ -n "$worktree_head" && "$worktree_head" != "$main_head" ]]; then
+    if [[ -n "$worktree_head" && "$worktree_head" != "$target_head" ]]; then
         git merge --no-edit "$_V2_EXEC_WORKTREE_BRANCH" || {
-            echo -e "${RED}Merge conflict from execution worktree branch ${_V2_EXEC_WORKTREE_BRANCH}${NC}" >&2
-            echo -e "${RED}Worktree preserved at ${_V2_EXEC_WORKTREE_PATH} for manual resolution${NC}" >&2
+            if _v2_has_recoverable_execution_commit "${_V2_EXEC_TARGET_HEAD_SHA:-}" "$worktree_head"; then
+                _v2_preserve_recoverable_merge_failure "$_V2_EXEC_WORKTREE_PATH" "$_V2_EXEC_WORKTREE_BRANCH" "$worktree_head"
+            else
+                git merge --abort >/dev/null 2>&1 || true
+            fi
             return 1
         }
     fi
@@ -941,10 +1727,14 @@ _v2_merge_execution_worktree() {
 _v2_cleanup_execution_worktree() {
     local wt_path="$_V2_EXEC_WORKTREE_PATH"
     local wt_branch="$_V2_EXEC_WORKTREE_BRANCH"
+    local merge_recoverable="$_V2_LAST_MERGE_RECOVERABLE"
 
-    # Clear globals first so re-entry is safe
+    # Clear active execution globals first so re-entry is safe
     _V2_EXEC_WORKTREE_PATH=""
     _V2_EXEC_WORKTREE_BRANCH=""
+    _V2_EXEC_TARGET_REF=""
+    _V2_EXEC_TARGET_HEAD_SHA=""
+    _V2_LAST_MERGE_RECOVERABLE=false
 
     # Ensure we're not inside the worktree being removed
     cd "$SCRIPT_DIR" 2>/dev/null || true
@@ -956,6 +1746,279 @@ _v2_cleanup_execution_worktree() {
         git branch -D "$wt_branch" 2>/dev/null || true
     fi
     git worktree prune 2>/dev/null || true
+
+    if [[ "$merge_recoverable" != true ]]; then
+        _V2_PRESERVED_EXEC_WORKTREE_PATH=""
+        _V2_PRESERVED_EXEC_WORKTREE_BRANCH=""
+        _V2_PRESERVED_EXEC_TARGET_REF=""
+        _V2_PRESERVED_EXEC_TARGET_HEAD_SHA=""
+        _V2_PRESERVED_EXEC_COMMIT_SHA=""
+        _V2_PRESERVED_RECOVERY_DIR=""
+        _V2_PRESERVED_COMBINED_PATCH=""
+        _V2_PRESERVED_COMMIT_LOG=""
+        _V2_PRESERVED_FORMAT_PATCH_DIR=""
+        _V2_PRESERVED_WORKTREE_PATCH=""
+    fi
+}
+
+_v2_save_worktree_diff() {
+    local wt_path="${_V2_EXEC_WORKTREE_PATH:-}"
+    [[ -n "$wt_path" && -d "$wt_path" ]] || return 0
+
+    local has_changes=false
+    if ! git -C "$wt_path" diff --quiet HEAD 2>/dev/null; then
+        has_changes=true
+    fi
+    if ! git -C "$wt_path" diff --cached --quiet HEAD 2>/dev/null; then
+        has_changes=true
+    fi
+    local untracked=""
+    untracked=$(git -C "$wt_path" ls-files --others --exclude-standard 2>/dev/null || true)
+    if [[ -n "$untracked" ]]; then
+        has_changes=true
+    fi
+    [[ "$has_changes" == true ]] || return 0
+
+    local save_dir=""
+    save_dir=$(_v2_saved_diff_base_dir)
+    mkdir -p "$save_dir" 2>/dev/null || return 0
+
+    local timestamp
+    timestamp=$(date +%Y%m%d-%H%M%S)
+    local patch_file="${save_dir}/${SLUG:-unknown}-${timestamp}.patch"
+
+    if _v2_write_worktree_local_patch "$wt_path" "$patch_file"; then
+        echo -e "${YELLOW}Saved worktree diff before cleanup: ${patch_file}${NC}"
+    else
+        rm -f "$patch_file"
+    fi
+}
+
+_v2_main_repo_relative_path() {
+    local path="$1"
+    if [[ "$path" == "$SCRIPT_DIR" ]]; then
+        printf '.\n'
+        return 0
+    fi
+    case "$path" in
+        "$SCRIPT_DIR/"*)
+            printf '%s\n' "${path#$SCRIPT_DIR/}"
+            ;;
+        /*)
+            return 1
+            ;;
+        *)
+            printf '%s\n' "$path"
+            ;;
+    esac
+}
+
+_v2_execution_worktree_path_for() {
+    local path="$1" rel_path=""
+    [[ -n "$_V2_EXEC_WORKTREE_PATH" ]] || return 1
+    rel_path=$(_v2_main_repo_relative_path "$path") || return 1
+    if [[ "$rel_path" == "." ]]; then
+        printf '%s\n' "$_V2_EXEC_WORKTREE_PATH"
+    else
+        printf '%s/%s\n' "$_V2_EXEC_WORKTREE_PATH" "$rel_path"
+    fi
+}
+
+_v2_execution_runtime_rel_dir() {
+    printf '.lauren-loop-runtime/%s\n' "$SLUG"
+}
+
+_v2_execution_runtime_task_rel_path() {
+    printf '%s/task.md\n' "$(_v2_execution_runtime_rel_dir)"
+}
+
+_v2_execution_runtime_task_path() {
+    [[ -n "$_V2_EXEC_WORKTREE_PATH" ]] || return 1
+    printf '%s/%s\n' "$_V2_EXEC_WORKTREE_PATH" "$(_v2_execution_runtime_task_rel_path)"
+}
+
+_v2_stage_execution_worktree_file() {
+    local source_path="$1" worktree_path=""
+    [[ -f "$source_path" ]] || return 1
+    worktree_path=$(_v2_execution_worktree_path_for "$source_path") || return 1
+    mkdir -p "$(dirname "$worktree_path")" || return 1
+    cp "$source_path" "$worktree_path" || return 1
+}
+
+_v2_stage_execution_runtime_task_file() {
+    local source_path="$1" runtime_task_path=""
+    [[ -f "$source_path" ]] || return 1
+    runtime_task_path=$(_v2_execution_runtime_task_path) || return 1
+    mkdir -p "$(dirname "$runtime_task_path")" || return 1
+    cp "$source_path" "$runtime_task_path" || return 1
+}
+
+_v2_stage_execution_worktree_files() {
+    local source_path=""
+    for source_path in "$@"; do
+        [[ -n "$source_path" ]] || continue
+        _v2_stage_execution_worktree_file "$source_path" || return 1
+    done
+}
+
+_v2_sync_execution_worktree_file() {
+    local target_path="$1" worktree_path=""
+    worktree_path=$(_v2_execution_worktree_path_for "$target_path") || return 1
+    [[ -f "$worktree_path" ]] || return 0
+    mkdir -p "$(dirname "$target_path")" || return 1
+    cp "$worktree_path" "$target_path" || return 1
+}
+
+_v2_sync_execution_worktree_files() {
+    local target_path=""
+    for target_path in "$@"; do
+        [[ -n "$target_path" ]] || continue
+        _v2_sync_execution_worktree_file "$target_path" || return 1
+    done
+}
+
+_phase7_handoff_poll_interval_seconds() {
+    printf '%s\n' "${LAUREN_LOOP_PHASE7_HANDOFF_POLL_INTERVAL_SEC:-30}"
+}
+
+_phase7_handoff_grace_seconds() {
+    printf '%s\n' "${LAUREN_LOOP_PHASE7_HANDOFF_GRACE_SEC:-15}"
+}
+
+_phase7_normalize_status_token() {
+    local raw="$1"
+    local normalized=""
+
+    normalized=$(printf '%s' "$raw" \
+        | tr -d '\r' \
+        | sed 's/\*//g; s/^[[:space:]]*//; s/[[:space:]]*$//')
+    [[ -n "$normalized" ]] || return 0
+
+    normalized=$(printf '%s' "$normalized" | tr '[:lower:]' '[:upper:]')
+    case "$normalized" in
+        BLOCKED|BLOCKED\ *)
+            printf 'BLOCKED\n'
+            ;;
+        COMPLETE|COMPLETE\ *|EXECUTION\ COMPLETE|EXECUTION\ COMPLETE\ *)
+            printf 'COMPLETE\n'
+            ;;
+        FAILED|FAILED\ *|EXECUTION\ FAILED|EXECUTION\ FAILED\ *)
+            printf 'FAILED\n'
+            ;;
+    esac
+}
+
+_phase7_read_sidecar_status() {
+    local artifact="$1"
+    local sidecar="${artifact%.*}.contract.json"
+    local raw=""
+
+    [[ -f "$sidecar" ]] || return 0
+
+    if command -v jq >/dev/null 2>&1; then
+        raw=$(jq -r 'if has("status") then .status else empty end' "$sidecar" 2>/dev/null || true)
+    else
+        raw=$(grep -oE '"status"[[:space:]]*:[[:space:]]*"[^"]+"' "$sidecar" 2>/dev/null \
+            | tail -1 \
+            | sed -E 's/.*"status"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/')
+    fi
+
+    _phase7_normalize_status_token "$raw"
+}
+
+_phase7_read_status_signal() {
+    local artifact="$1"
+    local status=""
+
+    status=$(_phase7_read_sidecar_status "$artifact")
+    if [[ -n "$status" ]]; then
+        printf '%s\n' "$status"
+        return 0
+    fi
+
+    _parse_contract "$artifact" "status"
+}
+
+_phase7_sync_fix_execution_artifacts() {
+    local comp_dir="$1"
+    _v2_sync_execution_worktree_files "${comp_dir}/fix-execution.md" "${comp_dir}/fix-execution.contract.json"
+}
+
+_phase7_poll_fix_execution_handoff() {
+    local comp_dir="$1" fix_executor_pid="$2" result_file="$3" log_file="${4:-}"
+    local poll_interval=""
+    local terminal_status=""
+    local artifact="${comp_dir}/fix-execution.md"
+
+    poll_interval=$(_phase7_handoff_poll_interval_seconds)
+    : > "$result_file"
+
+    while kill -0 "$fix_executor_pid" 2>/dev/null; do
+        if _phase7_sync_fix_execution_artifacts "$comp_dir"; then
+            terminal_status=$(_phase7_read_sidecar_status "$artifact")
+            case "$terminal_status" in
+                COMPLETE|FAILED)
+                    printf '%s\n' "$terminal_status" > "$result_file"
+                    if [[ -n "$log_file" ]]; then
+                        printf '[phase7-handoff] synced status=%s -> terminating fix executor pid=%s\n' \
+                            "$terminal_status" "$fix_executor_pid" >> "$log_file"
+                    fi
+                    _terminate_pid_tree "$fix_executor_pid" "$(_phase7_handoff_grace_seconds)"
+                    return 0
+                    ;;
+            esac
+        elif [[ -n "$log_file" ]]; then
+            printf '[phase7-handoff] WARN: failed to sync fix execution artifacts\n' >> "$log_file"
+        fi
+
+        sleep "$poll_interval"
+    done
+}
+
+_v2_file_size_bytes() {
+    local path="$1"
+    if [[ ! -f "$path" ]]; then
+        printf '0\n'
+        return 0
+    fi
+    wc -c < "$path" | tr -d '[:space:]'
+}
+
+_v2_filtered_worktree_status_lines() {
+    local status_line="" status_path=""
+    git status --short --untracked-files=all 2>/dev/null | while IFS= read -r status_line; do
+        [[ -n "$status_line" ]] || continue
+        status_path="${status_line#?? }"
+        case "$status_path" in
+            *" -> "*)
+                status_path="${status_path##* -> }"
+                ;;
+        esac
+        if _v2_is_pipeline_owned_phase4_noise "$status_path"; then
+            continue
+        fi
+        printf '%s\n' "$status_line"
+    done
+}
+
+_v2_phase_execution_diagnostic_lines() {
+    local log_activity="$1" log_path="$2" diff_file="$3"
+    local worktree_root="" numstat_file="" status_lines=""
+    worktree_root=$(git rev-parse --show-toplevel 2>/dev/null || true)
+    numstat_file=$(_v2_numstat_artifact_path "$diff_file")
+    status_lines=$(_v2_filtered_worktree_status_lines)
+
+    printf 'active worktree path: %s\n' "${_V2_EXEC_WORKTREE_PATH:-unknown}"
+    printf 'worktree repo root: %s\n' "${worktree_root:-unknown}"
+    printf 'execution log path: %s\n' "$log_path"
+    printf 'execution log activity detected: %s\n' "$log_activity"
+    printf 'diff artifact state: %s (%s)\n' "$diff_file" "$([[ -s "$diff_file" ]] && printf 'non-empty' || printf 'empty')"
+    printf 'numstat artifact state: %s (%s)\n' "$numstat_file" "$([[ -s "$numstat_file" ]] && printf 'non-empty' || printf 'empty')"
+    if [[ -n "$status_lines" ]]; then
+        _v2_prefix_lines "worktree status" "$status_lines"
+    else
+        printf 'worktree status: clean\n'
+    fi
 }
 
 # Active runtime state
@@ -978,6 +2041,21 @@ _clear_active_runtime_state() {
     local runtime_dir
     runtime_dir=$(_active_agent_meta_dir)
     rm -f "$(_interrupt_marker_path)" "$runtime_dir"/.active-agent.*.meta "$runtime_dir"/.active-agent.tmp.*
+    _V2_EXEC_WORKTREE_PATH=""
+    _V2_EXEC_WORKTREE_BRANCH=""
+    _V2_EXEC_TARGET_REF=""
+    _V2_EXEC_TARGET_HEAD_SHA=""
+    _V2_LAST_MERGE_RECOVERABLE=false
+    _V2_PRESERVED_EXEC_WORKTREE_PATH=""
+    _V2_PRESERVED_EXEC_WORKTREE_BRANCH=""
+    _V2_PRESERVED_EXEC_TARGET_REF=""
+    _V2_PRESERVED_EXEC_TARGET_HEAD_SHA=""
+    _V2_PRESERVED_EXEC_COMMIT_SHA=""
+    _V2_PRESERVED_RECOVERY_DIR=""
+    _V2_PRESERVED_COMBINED_PATCH=""
+    _V2_PRESERVED_COMMIT_LOG=""
+    _V2_PRESERVED_FORMAT_PATCH_DIR=""
+    _V2_PRESERVED_WORKTREE_PATCH=""
 }
 _list_active_job_pids() {
     jobs -p 2>/dev/null || true
@@ -1027,6 +2105,7 @@ cleanup_v2() {
         return 0
     fi
     _CLEANUP_V2_RUNNING=true
+    local _cleanup_fix_cycles="${fix_cycle:-0}"
 
     # Safety net: if the task is still "in progress" when cleanup runs,
     # something exited without setting a terminal status (e.g. set -e).
@@ -1040,8 +2119,10 @@ cleanup_v2() {
         fi
     fi
 
-    _v2_cleanup_execution_worktree || true
     _terminate_active_jobs || true
+    _finalize_run_manifest "cleanup" "$_cleanup_fix_cycles" || true
+    _v2_save_worktree_diff || true
+    _v2_cleanup_execution_worktree || true
     release_lock || true
     _clear_active_runtime_state || true
     _CLEANUP_V2_RUNNING=false
@@ -1052,6 +2133,7 @@ trap cleanup_v2 EXIT
 _interrupted() {
     local signal="$1"
     local exit_code=1
+    local _interrupt_fix_cycles="${fix_cycle:-0}"
     case "$signal" in
         INT) exit_code=130 ;;
         TERM) exit_code=143 ;;
@@ -1065,13 +2147,17 @@ _interrupted() {
         set_task_status "$_CURRENT_TASK_FILE" "blocked" || true
         log_execution "$_CURRENT_TASK_FILE" "Pipeline interrupted (signal ${signal})" || true
         _set_interrupt_marker || true
-        _v2_cleanup_execution_worktree || true
-        _terminate_active_jobs || true
-        _append_interrupted_cost_rows "$signal" || true
-        _print_cost_summary || true
-        _print_phase_timing || true
-        finalize_v2_task_metadata "$_CURRENT_TASK_FILE" "interrupted-${signal}" "interrupted" "0" || true
     fi
+    _terminate_active_jobs || true
+    _append_interrupted_cost_rows "$signal" || true
+    _finalize_run_manifest "interrupted" "$_interrupt_fix_cycles" || true
+    _print_cost_summary || true
+    _print_phase_timing || true
+    if [[ -n "$_CURRENT_TASK_FILE" && -f "$_CURRENT_TASK_FILE" ]]; then
+        finalize_v2_task_metadata "$_CURRENT_TASK_FILE" "interrupted-${signal}" "interrupted" "$_interrupt_fix_cycles" || true
+    fi
+    _v2_save_worktree_diff || true
+    _v2_cleanup_execution_worktree || true
 
     notify_terminal_state "interrupted" "Pipeline interrupted (${signal}) — ${SLUG:-unknown}" || true
     cleanup_v2 || true
@@ -1158,6 +2244,7 @@ run_agent() {
         local codex_profile="$LAUREN_LOOP_CODEX_PROFILE_HIGH"
         local attempt_log=""
         local fallback_backoff=""
+        local jittered_backoff=""
         local fallback_reason=""
         local attempt_number=1
         local attempt_output_file="$output_file"
@@ -1166,11 +2253,17 @@ run_agent() {
         local canonical_summary_file=""
         local attempt_artifact_state="not_applicable"
         local tool_written_artifact=false
+        local timeout_seconds=0
+        local dispatch_start_ts=0
+        local elapsed_seconds=0
+        local retry_stopped_for_wall_cap=false
         attempt_log=$(mktemp "${TMPDIR:-/tmp}/lauren-loop-codex-attempt.XXXXXX") || {
             _remove_active_agent_meta "$meta_path"
             echo "ERROR: Failed to create Codex attempt log for $role" >&2
             return 1
         }
+        timeout_seconds=$(_duration_to_seconds "$timeout")
+        dispatch_start_ts=$(date +%s)
 
         if _codex_role_uses_tool_written_artifact "$role"; then
             tool_written_artifact=true
@@ -1215,8 +2308,28 @@ run_agent() {
             codex_profile="$LAUREN_LOOP_CODEX_PROFILE_HIGH"
 
             for fallback_backoff in 15 30 60; do
-                echo "WARN: Codex ${fallback_reason} failure for $role; retrying with profile ${codex_profile} after ${fallback_backoff}s backoff." >> "$log_file"
-                sleep "$fallback_backoff"
+                elapsed_seconds=$(( $(date +%s) - dispatch_start_ts ))
+                if (( elapsed_seconds < 0 )); then
+                    elapsed_seconds=0
+                fi
+                if (( elapsed_seconds * 2 >= timeout_seconds * 3 )); then
+                    retry_stopped_for_wall_cap=true
+                    echo "WARN: Codex ${fallback_reason} failure for $role hit wall-time cap after ${elapsed_seconds}s across ${attempt_number} attempt(s); wall_cap=${timeout_seconds}s*1.5." >> "$log_file"
+                    break
+                fi
+
+                jittered_backoff=$(_jittered_backoff "$fallback_backoff")
+                echo "WARN: Codex ${fallback_reason} failure for $role; retrying with profile ${codex_profile} after ${jittered_backoff}s jittered backoff (base=${fallback_backoff}s)." >> "$log_file"
+                sleep "$jittered_backoff"
+                elapsed_seconds=$(( $(date +%s) - dispatch_start_ts ))
+                if (( elapsed_seconds < 0 )); then
+                    elapsed_seconds=0
+                fi
+                if (( elapsed_seconds * 2 >= timeout_seconds * 3 )); then
+                    retry_stopped_for_wall_cap=true
+                    echo "WARN: Codex ${fallback_reason} failure for $role hit wall-time cap after ${elapsed_seconds}s across ${attempt_number} attempt(s); wall_cap=${timeout_seconds}s*1.5." >> "$log_file"
+                    break
+                fi
                 reasoning_effort=$(_reasoning_effort_for_engine "$engine" "$codex_profile")
                 _set_active_agent_reasoning "$meta_path" "$reasoning_effort" || true
                 attempt_number=$((attempt_number + 1))
@@ -1264,6 +2377,14 @@ run_agent() {
                     break
                 fi
             done
+
+            if [[ "$retry_stopped_for_wall_cap" != true ]] && [[ -n "$fallback_reason" ]] && [[ "$attempt_artifact_state" != "valid" ]] && [[ "$attempt_artifact_state" != "complete_fallback" ]]; then
+                elapsed_seconds=$(( $(date +%s) - dispatch_start_ts ))
+                if (( elapsed_seconds < 0 )); then
+                    elapsed_seconds=0
+                fi
+                echo "WARN: Codex ${fallback_reason} failure for $role exhausted retries after ${elapsed_seconds}s across ${attempt_number} attempt(s)." >> "$log_file"
+            fi
         fi
 
         rm -f "$attempt_log"
@@ -1745,26 +2866,6 @@ _v2_extract_files_to_modify_paths() {
         | _v2_unique_nonblank_lines
 }
 
-_v2_extract_xml_task_paths() {
-    local source_file="$1"
-    [[ -f "$source_file" ]] || return 0
-    awk '
-        {
-            line = $0
-            while (match(line, /<files>[^<]+<\/files>/)) {
-                inner = substr(line, RSTART + 7, RLENGTH - 15)
-                print inner
-                line = substr(line, RSTART + RLENGTH)
-            }
-        }
-    ' "$source_file" \
-        | tr ',' '\n' \
-        | while IFS= read -r path; do
-            _v2_normalize_scope_path "$path" || true
-        done \
-        | _v2_unique_nonblank_lines
-}
-
 _v2_extract_relevant_file_paths() {
     local task_file="$1"
     [[ -f "$task_file" ]] || return 0
@@ -1798,7 +2899,7 @@ _v2_resolve_scope_paths() {
             return 0
         fi
 
-        _V2_SCOPE_PATHS=$(_v2_extract_xml_task_paths "$plan_file")
+        _V2_SCOPE_PATHS=$(_extract_xml_task_paths "$plan_file" | _reject_slug_internal_paths "$SLUG")
         if [[ -n "$_V2_SCOPE_PATHS" ]]; then
             _V2_SCOPE_SOURCE="plan-xml-files"
             return 0
@@ -1994,6 +3095,7 @@ _is_ignored_untracked_path() {
         "docs/tasks/open/${SLUG}/task.md"|\
         "docs/tasks/open/${SLUG}/competitive/"*|\
         "docs/tasks/open/${SLUG}/logs/"*|\
+        ".lauren-loop-runtime/${SLUG}/"*|\
         .playwright-cli/*|\
         .claude/*|\
         .codex/*|\
@@ -2168,11 +3270,13 @@ _filter_to_preexisting() {
     comm -12 <(printf '%s\n' "$current" | sort) <(printf '%s\n' "$snapshot" | sort)
 }
 
+# NOTE: relies on ambient _FAIL_PHASE_* phase context set by caller
 _block_on_untracked_files() {
     local task_file="$1" phase_label="$2" plan_file="${3:-}" before_sha="${4:-}"
     local untracked_files=""
     local scope_source=""
     local fallback_warning=""
+    local untracked_summary=""
     _v2_resolve_scope_paths "$task_file" "$plan_file" "$before_sha" || true
     scope_source="$_V2_SCOPE_SOURCE"
     fallback_warning=$(_v2_scope_fallback_warning_message "$scope_source")
@@ -2188,13 +3292,19 @@ _block_on_untracked_files() {
 
     echo -e "${RED}${phase_label}: blocking on untracked files overlapping task scope${NC}" >&2
     printf '%s\n' "$untracked_files" >&2
-    set_task_status "$task_file" "blocked" || true
     log_execution "$task_file" "${phase_label}: Untracked files detected within task scope (source: ${scope_source})" || true
     if [[ -n "$fallback_warning" ]]; then
         log_execution "$task_file" "${phase_label}: WARN: ${fallback_warning}" || true
     fi
     _log_diagnostic_lines "$task_file" "$(_v2_scope_diagnostic_lines "$_V2_SCOPE_PATHS")"
     _log_diagnostic_lines "$task_file" "$untracked_files"
+    untracked_summary=$(printf '%s\n' "$untracked_files" | paste -sd ',' -)
+    _fail_phase \
+        "validating-scope" \
+        "${phase_label}: Untracked files detected within task scope" \
+        "Move or stage the overlapping untracked files, then retry" \
+        "scope_violation" \
+        "phase_label=${phase_label}; scope_source=${scope_source}; files=${untracked_summary}" || true
     _print_cost_summary || true
     return 1
 }
@@ -2408,7 +3518,8 @@ _v2_is_pipeline_owned_phase4_noise() {
     case "$path" in
         "docs/tasks/open/${SLUG}/task.md"|\
         "docs/tasks/open/${SLUG}/competitive/"*|\
-        "docs/tasks/open/${SLUG}/logs/"*)
+        "docs/tasks/open/${SLUG}/logs/"*|\
+        ".lauren-loop-runtime/${SLUG}/"*)
             return 0
             ;;
     esac
@@ -2860,19 +3971,30 @@ _v2_run_scope_triage() {
         echo -e "${YELLOW}WARN: ${phase_label} scope triage skipped agent call because candidate volume exceeded ${_V2_SCOPE_TRIAGE_MAX_AGENT_CANDIDATES} files${NC}"
         log_execution "$task_file" "${phase_label}: WARNING scope triage skipped agent call because candidate volume exceeded ${_V2_SCOPE_TRIAGE_MAX_AGENT_CANDIDATES} files" || true
     else
+        local _requested_scope_triage_engine="$ENGINE_EVALUATOR"
+        local _effective_scope_triage_engine="$ENGINE_EVALUATOR"
+        _resolve_effective_engine "$_requested_scope_triage_engine"
+        _effective_scope_triage_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_scope_triage_engine" "$_effective_scope_triage_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "scope-triage"
+            _v2_append_codex_circuit_breaker_skip "phase-4" "scope-triage" "$start_ts" "scope-triage"
+        fi
         triage_output_path="$raw_output_file"
-        if [[ "$ENGINE_EVALUATOR" == "codex" ]]; then
+        if [[ "$_effective_scope_triage_engine" == "codex" ]]; then
             triage_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
         fi
         triage_instruction=$(_v2_build_scope_triage_instruction "$task_file" "$plan_file" "$triage_output_path" "$scope_paths" "$triage_candidates" "$before_sha")
 
-        if ! prepare_agent_request "$ENGINE_EVALUATOR" "$scope_triage_prompt" "$triage_instruction"; then
+        if ! prepare_agent_request "$_effective_scope_triage_engine" "$scope_triage_prompt" "$triage_instruction"; then
             failure_reason="Failed to assemble scope triage prompt"
         else
             local exit_triage=0
             touch "${log_dir}/scope-triage.log"
-            run_agent "scope-triage" "$ENGINE_EVALUATOR" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+            run_agent "scope-triage" "$_effective_scope_triage_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
                 "$raw_output_file" "${log_dir}/scope-triage.log" "$EVALUATE_TIMEOUT" "100" "Bash,WebFetch,WebSearch" || exit_triage=$?
+            if [[ "$_effective_scope_triage_engine" == "codex" ]]; then
+                _v2_record_codex_outcome "$_effective_scope_triage_engine" "$exit_triage"
+            fi
             if [[ "$exit_triage" -ne 0 ]]; then
                 if [[ "$exit_triage" -eq 124 ]]; then
                     failure_reason="Scope triage timed out (${EVALUATE_TIMEOUT})"
@@ -3006,7 +4128,7 @@ _v2_select_phase7_scope_plan_file() {
     local fix_plan="${comp_dir}/fix-plan.md"
     local revised_plan="${comp_dir}/revised-plan.md"
 
-    if [[ -f "$fix_plan" ]] && [[ -n "$(_v2_extract_xml_task_paths "$fix_plan")" ]]; then
+    if [[ -f "$fix_plan" ]] && [[ -n "$(_extract_xml_task_paths "$fix_plan" | _reject_slug_internal_paths "$SLUG")" ]]; then
         printf '%s\n' "$fix_plan"
         return 0
     fi
@@ -3083,12 +4205,16 @@ lauren_loop_competitive() {
     _apply_effective_strict_mode "$slug" "$goal"
 
     # Directory setup
-    local task_dir="$(_v2_task_artifact_dir "$slug")"
-    local comp_dir="${task_dir}/competitive"
-    local TASK_LOG_DIR="${task_dir}/logs"
-    local log_dir="$TASK_LOG_DIR"
+    local default_task_dir="$(_v2_task_artifact_dir "$slug")"
+    local task_dir="$default_task_dir"
+    local comp_dir=""
+    local TASK_LOG_DIR=""
+    local log_dir=""
     local task_file=""
     local blinding_message=""
+    local _FAIL_PHASE_PHASE_ID=""
+    local _FAIL_PHASE_PHASE_NAME=""
+    local _FAIL_PHASE_PHASE_STARTED_AT=""
     local resolve_rc=0
     task_file="$(_resolve_v2_task_file "$slug")" || resolve_rc=$?
     case "$resolve_rc" in
@@ -3097,51 +4223,39 @@ lauren_loop_competitive() {
         2) exit 1 ;;
         *) exit "$resolve_rc" ;;
     esac
+    if [[ -f "$task_file" ]]; then
+        task_dir=$(_v2_task_dir_for_task_file "$task_file") || task_dir="$default_task_dir"
+    fi
+    comp_dir="${task_dir}/competitive"
+    TASK_LOG_DIR="${task_dir}/logs"
+    log_dir="$TASK_LOG_DIR"
     mkdir -p "$comp_dir" "$TASK_LOG_DIR"
 
     # Consolidate flat/pilot task files into directory layout
-    if [[ -f "$task_file" && "$task_file" != "${task_dir}/"* ]]; then
+    if [[ -f "$task_file" && "$task_file" != "${task_dir}/"* ]] && ! _v2_should_preserve_flat_task_file "$task_file"; then
         _consolidate_task_to_dir "$task_file" "$task_dir"
         task_file="${task_dir}/task.md"
     fi
 
     _CURRENT_TASK_FILE="$task_file"
     _CURRENT_TASK_LOG_DIR="$TASK_LOG_DIR"
+    _v2_reset_codex_auth_preflight_state
     _clear_active_runtime_state
     if [[ "$FORCE_RERUN" == "true" ]]; then
         _backup_artifacts_on_force "$comp_dir"
         _clear_force_artifacts "$comp_dir" "$TASK_LOG_DIR"
     fi
+    [[ ! -f "${comp_dir}/run-manifest.json" ]] && _init_run_manifest || true
     _ensure_cost_csv_header "${TASK_LOG_DIR}/cost.csv"
     _merge_cost_csvs || true
-    [[ ! -f "${comp_dir}/run-manifest.json" ]] && _init_run_manifest || true
     _PIPELINE_PRE_SHA=$(git rev-parse HEAD 2>/dev/null || true)
 
     # Task file creation (if not resuming)
     if [[ ! -f "$task_file" ]]; then
-        cat > "$task_file" <<TASKEOF
-## Task: ${slug}
-## Status: in progress
-## Execution Mode: competitive
-## Goal: ${goal}
-## Relevant Files:
-- `lauren-loop-v2.sh` — competitive Lauren Loop flow
-- `lib/lauren-loop-utils.sh` — shared task-file logging and state helpers
-## Context:
-Created by lauren-loop-v2 for a new competitive run.
-## Done Criteria:
-- [ ] Competitive run completes and leaves task in needs verification or blocked with artifacts preserved
-## Left Off At:
-Competitive run has started.
-
-## Execution Log
-
-## Attempts:
-(none yet)
-
-## Current Plan
-
-TASKEOF
+        _write_v2_task_file "$task_file" "$slug" "$goal" || {
+            echo -e "${RED}Failed to create task file: ${task_file}${NC}"
+            exit 1
+        }
         echo -e "${GREEN}Created task file: ${task_file}${NC}"
     fi
 
@@ -3189,13 +4303,17 @@ TASKEOF
     local review_evaluator_prompt="$SCRIPT_DIR/prompts/review-evaluator.md"
     local fix_plan_author_prompt="$SCRIPT_DIR/prompts/fix-plan-author.md"
     local fix_executor_prompt="$SCRIPT_DIR/prompts/fix-executor.md"
+    local final_verify_prompt="$SCRIPT_DIR/prompts/final-verifier.md"
+    local final_falsify_prompt="$SCRIPT_DIR/prompts/final-falsifier.md"
+    local final_fix_prompt="$SCRIPT_DIR/prompts/final-fixer.md"
 
     # Prompt file gate — fail fast before any phase runs
     local missing=0
     for pf in "$explore_prompt" "$planner_a_prompt" "$planner_b_prompt" \
               "$evaluator_prompt" "$critic_prompt" "$reviser_prompt" \
               "$executor_prompt" "$scope_triage_prompt" "$reviewer_a_prompt" "$reviewer_b_prompt" \
-              "$review_evaluator_prompt" "$fix_plan_author_prompt" "$fix_executor_prompt"; do
+              "$review_evaluator_prompt" "$fix_plan_author_prompt" "$fix_executor_prompt" \
+              "$final_verify_prompt" "$final_falsify_prompt" "$final_fix_prompt"; do
         if [[ ! -f "$pf" ]]; then
             echo -e "${RED}Missing prompt: $pf${NC}" >&2
             missing=$((missing + 1))
@@ -3256,6 +4374,65 @@ TASKEOF
             echo "- Review ${comp_dir}/fix-plan.md and ${comp_dir}/fix-execution.md to see what the last automated fix cycle attempted."
             echo "- Review ${latest_fix_diff:-${comp_dir}/execution-diff.patch} for the latest code changes under review."
             echo "- Confirm whether the remaining findings are valid fixes, false positives, or need a narrower follow-up task."
+        } > "$tmp_file"
+
+        mv "$tmp_file" "$handoff_file"
+    }
+
+    _write_phase8_human_review_handoff() {
+        local phase8_halt_subphase="$1"
+        local handoff_file="${comp_dir}/human-review-handoff.md"
+        local final_verify_file="${comp_dir}/final-verify.md"
+        local final_falsify_file="${comp_dir}/final-falsify.md"
+        local final_fix_file="${comp_dir}/final-fix.md"
+        local final_verify_initial_file="${comp_dir}/final-verify.initial.md"
+        local final_falsify_initial_file="${comp_dir}/final-falsify.initial.md"
+        local final_verify_contract="${comp_dir}/final-verify.contract.json"
+        local final_falsify_contract="${comp_dir}/final-falsify.contract.json"
+        local final_fix_contract="${comp_dir}/final-fix.contract.json"
+        local final_verify_initial_contract="${comp_dir}/final-verify.initial.contract.json"
+        local final_falsify_initial_contract="${comp_dir}/final-falsify.initial.contract.json"
+        local final_verify_verdict=""
+        local final_falsify_verdict=""
+        local final_fix_status=""
+        local final_verify_initial_verdict=""
+        local final_falsify_initial_verdict=""
+        local tmp_file
+        final_verify_verdict=$(_parse_contract "$final_verify_file" "verdict")
+        final_falsify_verdict=$(_parse_contract "$final_falsify_file" "verdict")
+        final_fix_status=$(_parse_contract "$final_fix_file" "status")
+        final_verify_initial_verdict=$(_parse_contract "$final_verify_initial_file" "verdict")
+        final_falsify_initial_verdict=$(_parse_contract "$final_falsify_initial_file" "verdict")
+        tmp_file=$(mktemp "${TMPDIR:-/tmp}/human-review-handoff.XXXXXX")
+
+        {
+            echo "# Human Review Handoff"
+            echo
+            echo "**Task:** ${task_file}"
+            echo "**Phase 8 halt sub-phase:** ${phase8_halt_subphase}"
+            echo "**Final verify verdict:** ${final_verify_verdict:-not available}"
+            echo "**Final falsify verdict:** ${final_falsify_verdict:-not available}"
+            echo "**Final fix status:** ${final_fix_status:-not available}"
+            echo
+            echo "## Phase 8 Halt Reason"
+            echo "- Halted in ${phase8_halt_subphase}."
+            echo "- final-verify verdict: ${final_verify_verdict:-not available}"
+            echo "- final-falsify verdict: ${final_falsify_verdict:-not available}"
+            echo "- final-fix status: ${final_fix_status:-not available}"
+            echo
+            echo "## Original Findings"
+            echo "- final-verify.initial: ${final_verify_initial_file} (contract: ${final_verify_initial_contract}; verdict: ${final_verify_initial_verdict:-not available})"
+            echo "- final-falsify.initial: ${final_falsify_initial_file} (contract: ${final_falsify_initial_contract}; verdict: ${final_falsify_initial_verdict:-not available})"
+            echo
+            echo "## Post-fix Results"
+            echo "- final-verify: ${final_verify_file} (contract: ${final_verify_contract}; verdict: ${final_verify_verdict:-not available})"
+            echo "- final-falsify: ${final_falsify_file} (contract: ${final_falsify_contract}; verdict: ${final_falsify_verdict:-not available})"
+            echo "- final-fix: ${final_fix_file} (contract: ${final_fix_contract}; status: ${final_fix_status:-not available})"
+            echo
+            echo "## Human Reviewer Focus"
+            echo "- Compare the original findings snapshots against the canonical Phase 8 artifacts to confirm what changed after the automated fix."
+            echo "- Use ${final_verify_contract}, ${final_falsify_contract}, and ${final_fix_contract} to confirm the parsed Phase 8 verdicts/status."
+            echo "- Inspect ${final_verify_file}, ${final_falsify_file}, and ${final_fix_file} for the full verifier, falsifier, and fixer narratives."
         } > "$tmp_file"
 
         mv "$tmp_file" "$handoff_file"
@@ -3335,6 +4512,34 @@ TASKEOF
         fi
     }
 
+    _log_phase_artifact_diagnostics() {
+        local phase_label="$1"
+        local artifact_path="$2"
+        local artifact_label="$3"
+        local artifact_log="${4:-}"
+        local validation_err="${5:-}"
+        local artifact_state=""
+        local normalized_validation=""
+
+        artifact_state=$(_describe_artifact_state "$artifact_path")
+        log_execution "$task_file" "${phase_label}: ${artifact_label} path: ${artifact_path}" || true
+        log_execution "$task_file" "${phase_label}: ${artifact_label} state: ${artifact_state}" || true
+
+        normalized_validation="${validation_err//$'\n'/ | }"
+        if [[ -n "$normalized_validation" ]]; then
+            log_execution "$task_file" "${phase_label}: ${artifact_label} validation failure: ${normalized_validation}" || true
+        fi
+
+        if [[ -f "$artifact_log" ]] && [[ -s "$artifact_log" ]]; then
+            local artifact_log_tail=""
+            artifact_log_tail=$(tail -20 "$artifact_log" 2>/dev/null || true)
+            if [[ -n "$artifact_log_tail" ]]; then
+                log_execution "$task_file" "${phase_label}: Agent log tail (last 20 lines):" || true
+                _log_diagnostic_lines "$task_file" "$artifact_log_tail"
+            fi
+        fi
+    }
+
     _capture_reviewer_a_raw_artifact() {
         local source_task_file="$1"
         local output_file="$2"
@@ -3394,15 +4599,61 @@ EOF
     }
 
     _fail_phase() {
-        local phase_status="$1" error_message="$2" recovery_hint="${3:-}"
+        local phase_status="$1" error_message="$2" recovery_hint="${3:-}" error_class="${4:-unknown}" error_detail="${5:-}"
+        local task_log_dir="${TASK_LOG_DIR:-${_CURRENT_TASK_LOG_DIR:-}}"
+        local cost_csv="" phase_cost="0.00" measured_phase_cost=""
+        local manifest_phase="${_FAIL_PHASE_PHASE_ID:-}"
+        local manifest_name="${_FAIL_PHASE_PHASE_NAME:-}"
+        local manifest_started_at="${_FAIL_PHASE_PHASE_STARTED_AT:-}"
+        local completed_at=""
+        [[ -n "$error_class" ]] || error_class="unknown"
         echo -e "${RED}${error_message}${NC}"
         if [[ -n "$recovery_hint" ]]; then
             echo -e "${YELLOW}  Hint: ${recovery_hint}${NC}"
         fi
+        if [[ -n "$task_log_dir" ]]; then
+            [[ -n "${TASK_LOG_DIR:-}" ]] || TASK_LOG_DIR="$task_log_dir"
+            _merge_cost_csvs || true
+            cost_csv="${task_log_dir}/cost.csv"
+            if [[ -f "$cost_csv" ]]; then
+                measured_phase_cost=$(
+                    awk -F',' '
+                        NR > 1 && $11 ~ /^[[:space:]]*[0-9]+(\.[0-9]+)?[[:space:]]*$/ {
+                            sum += $11 + 0
+                            found = 1
+                        }
+                        END {
+                            if (found) {
+                                printf "%.4f", sum + 0
+                            }
+                        }
+                    ' "$cost_csv" 2>/dev/null || true
+                )
+                if [[ -n "$measured_phase_cost" ]]; then
+                    phase_cost="$measured_phase_cost"
+                fi
+            fi
+        fi
+        completed_at=$(_iso_timestamp)
+        [[ -n "$manifest_started_at" ]] || manifest_started_at="$completed_at"
+        _append_manifest_phase \
+            "$manifest_phase" \
+            "$manifest_name" \
+            "$manifest_started_at" \
+            "$completed_at" \
+            "failed" \
+            "" \
+            "$phase_cost" \
+            "$error_class" \
+            "$error_detail" \
+            "$(if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then _v2_recovery_manifest_json; else printf 'null\n'; fi)" || true
         set_task_status "$task_file" "blocked"
         log_execution "$task_file" "Pipeline FAILED while ${phase_status}: ${error_message}"
         if [[ -n "$recovery_hint" ]]; then
             log_execution "$task_file" "  recovery hint: ${recovery_hint}"
+        fi
+        if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then
+            _v2_log_recovery_details "$task_file"
         fi
         _finalize_run_manifest "blocked" "${fix_cycle:-0}" || true
         finalize_v2_task_metadata "$task_file" "$phase_status" "blocked" "${fix_cycle:-0}" || true
@@ -3416,10 +4667,20 @@ EOF
 
     _require_valid_artifact() {
         local artifact="$1" phase_status="$2" error_message="$3" recovery_hint="${4:-}"
-        if _validate_agent_output "$artifact"; then
+        local diagnostics_label="${5:-}" diagnostics_log="${6:-}" artifact_label="${7:-Artifact}" error_class="${8:-invalid_artifact}"
+        local validation_err=""
+        local error_detail=""
+        if validation_err=$(_validate_agent_output "$artifact" 2>&1 1>/dev/null); then
             return 0
         fi
-        _fail_phase "$phase_status" "$error_message" "$recovery_hint"
+        if [[ -n "$diagnostics_label" ]]; then
+            _log_phase_artifact_diagnostics "$diagnostics_label" "$artifact" "$artifact_label" "$diagnostics_log" "$validation_err"
+        fi
+        error_detail="artifact=${artifact}; label=${artifact_label}"
+        if [[ -n "$validation_err" ]]; then
+            error_detail="${error_detail}; validation=${validation_err}"
+        fi
+        _fail_phase "$phase_status" "$error_message" "$recovery_hint" "$error_class" "$error_detail"
         return 1
     }
 
@@ -3428,6 +4689,60 @@ EOF
         echo -e "${YELLOW}WARN: Resume checkpoint invalid for ${target} (${reason}); restarting from Phase 5.${NC}"
         log_execution "$task_file" "WARN: Resume checkpoint invalid for ${target} (${reason}); restarting from Phase 5"
         _resume_to_subphase=""
+    }
+
+    _phase8_contract_artifact_ready() {
+        local artifact="$1" field="$2"
+        local contract="${artifact%.*}.contract.json"
+        local parsed=""
+        [[ -f "$contract" ]] || return 1
+        parsed=$(_parse_contract "$artifact" "$field")
+        [[ -n "$parsed" ]]
+    }
+
+    _phase8c_route_label() {
+        case "$1" in
+            phase-8a) printf '%s\n' "phase-8a initial FAIL -> phase-8c" ;;
+            phase-8b) printf '%s\n' "phase-8b initial FAIL -> phase-8c" ;;
+            *) return 1 ;;
+        esac
+    }
+
+    _phase8c_route_requires_falsify() {
+        [[ "$1" == "phase-8b" ]]
+    }
+
+    _phase8c_route_required_inputs() {
+        local comp_dir="$1" predecessor="$2"
+        printf '%s\n' "${comp_dir}/final-verify.md"
+        printf '%s\n' "${comp_dir}/final-verify.contract.json"
+        if _phase8c_route_requires_falsify "$predecessor"; then
+            printf '%s\n' "${comp_dir}/final-falsify.md"
+            printf '%s\n' "${comp_dir}/final-falsify.contract.json"
+        fi
+    }
+
+    _phase8c_route_first_missing_input() {
+        local comp_dir="$1" predecessor="$2"
+        local required_input=""
+        while IFS= read -r required_input; do
+            [[ -n "$required_input" ]] || continue
+            if [[ ! -f "$required_input" ]]; then
+                printf '%s\n' "$required_input"
+                return 0
+            fi
+        done < <(_phase8c_route_required_inputs "$comp_dir" "$predecessor")
+        return 1
+    }
+
+    _phase8c_final_fix_input_instruction() {
+        local verify_rel="$1" verify_contract_rel="$2" predecessor="$3"
+        local falsify_rel="${4:-}" falsify_contract_rel="${5:-}"
+        if _phase8c_route_requires_falsify "$predecessor"; then
+            printf '%s\n' "Read ${verify_rel}, ${verify_contract_rel}, ${falsify_rel}, and ${falsify_contract_rel}."
+        else
+            printf '%s\n' "Read ${verify_rel} and ${verify_contract_rel}. Do not require competitive/final-falsify.md or competitive/final-falsify.contract.json on this route."
+        fi
     }
 
     _resume_target_ready() {
@@ -3462,6 +4777,43 @@ EOF
                 _clear_resume_checkpoint "$target" "$phase7_reason"
                 return 1
                 ;;
+            phase-8a)
+                return 0
+                ;;
+            phase-8b)
+                if _phase8_contract_artifact_ready "${comp_dir}/final-verify.md" "verdict"; then
+                    return 0
+                fi
+                _clear_resume_checkpoint "$target" "missing parseable final-verify.contract.json"
+                return 1
+                ;;
+            phase-8c)
+                case "$CYCLE_STATE_LAST_COMPLETED" in
+                    phase-8a)
+                        if _phase8_contract_artifact_ready "${comp_dir}/final-verify.md" "verdict"; then
+                            return 0
+                        fi
+                        _clear_resume_checkpoint "$target" "missing parseable final-verify.contract.json for phase-8a/${CYCLE_STATE_PHASE8_RESULT:-unknown}"
+                        return 1
+                        ;;
+                    phase-8b)
+                        if _phase8_contract_artifact_ready "${comp_dir}/final-falsify.md" "verdict"; then
+                            return 0
+                        fi
+                        _clear_resume_checkpoint "$target" "missing parseable final-falsify.contract.json for phase-8b/${CYCLE_STATE_PHASE8_RESULT:-unknown}"
+                        return 1
+                        ;;
+                    phase-8c)
+                        if _phase8_contract_artifact_ready "${comp_dir}/final-fix.md" "status"; then
+                            return 0
+                        fi
+                        _clear_resume_checkpoint "$target" "missing parseable final-fix.contract.json for phase-8c/${CYCLE_STATE_PHASE8_RESULT:-unknown}"
+                        return 1
+                        ;;
+                esac
+                _clear_resume_checkpoint "$target" "unexpected phase-8c resume predecessor: ${CYCLE_STATE_LAST_COMPLETED:-unknown}"
+                return 1
+                ;;
             *)
                 return 0
                 ;;
@@ -3487,6 +4839,9 @@ EOF
     local _phase_start=""
     echo -e "${BLUE}=== Phase 1: Explore ===${NC}"
     _phase_start=$(_iso_timestamp)
+    _FAIL_PHASE_PHASE_ID="phase-1"
+    _FAIL_PHASE_PHASE_NAME="explore"
+    _FAIL_PHASE_PHASE_STARTED_AT="$_phase_start"
     _update_run_manifest_state "phase-1" || true
     if [[ "$FORCE_RERUN" != "true" ]] && [[ -s "${comp_dir}/exploration-summary.md" ]]; then
         echo -e "${GREEN}Phase 1: Skipped (checkpoint — exploration-summary.md exists)${NC}"
@@ -3503,26 +4858,46 @@ Read the task file at ${task_file} for context. Explore the codebase to understa
 2. Current behavior vs desired behavior
 3. Key constraints and dependencies
 4. Recommended approach"
-        prepare_agent_request "$ENGINE_EXPLORE" "$explore_prompt" "$explore_instruction" || {
-            _fail_phase "exploring" "Failed to assemble explorer prompt" "Check agent log at ${log_dir}/explorer.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
+        # TODO: refine error_class if prompt assembly failures split into stable categories.
+        local _requested_explore_engine="$ENGINE_EXPLORE"
+        local _effective_explore_engine="$ENGINE_EXPLORE"
+        _resolve_effective_engine "$_requested_explore_engine"
+        _effective_explore_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_explore_engine" "$_effective_explore_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "explorer"
+            _v2_append_codex_circuit_breaker_skip "phase-1" "explorer" "$_phase_start" "explorer"
+        fi
+
+        prepare_agent_request "$_effective_explore_engine" "$explore_prompt" "$explore_instruction" || {
+            _fail_phase "exploring" "Failed to assemble explorer prompt" "Check agent log at ${log_dir}/explorer.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                "unknown" "role=explorer; step=prepare_agent_request"
         }
         local explore_prompt_body="$AGENT_PROMPT_BODY"
         local explore_sysprompt="$AGENT_SYSTEM_PROMPT"
 
         local exit_explore=0
-        run_agent "explorer" "$ENGINE_EXPLORE" "$explore_prompt_body" "$explore_sysprompt" \
+        run_agent "explorer" "$_effective_explore_engine" "$explore_prompt_body" "$explore_sysprompt" \
             "${comp_dir}/exploration-summary.md" "${log_dir}/explorer.log" \
             "$EXPLORE_TIMEOUT" "200" "WebFetch,WebSearch" || exit_explore=$?
+        if [[ "$_effective_explore_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_explore_engine" "$exit_explore"
+        fi
 
         if [[ "$exit_explore" -ne 0 ]]; then
+            local explore_error_class=""
+            local explore_error_message=""
+            explore_error_class=$(_classify_agent_exit_error_class "$_effective_explore_engine" "$exit_explore" "${log_dir}/explorer.log")
             if [[ "$exit_explore" -eq 124 ]]; then
-                echo -e "${RED}Phase 1 timed out (${EXPLORE_TIMEOUT})${NC}"
-                log_execution "$task_file" "Phase 1: Explore timed out (${EXPLORE_TIMEOUT})"
+                explore_error_message="Phase 1: Explore timed out (${EXPLORE_TIMEOUT})"
             else
-                echo -e "${RED}Phase 1 failed (exit $exit_explore)${NC}"
-                log_execution "$task_file" "Phase 1: Explore FAILED (exit $exit_explore)"
+                explore_error_message="Phase 1: Explore FAILED (exit $exit_explore)"
             fi
-            set_task_status "$task_file" "blocked"
+            _fail_phase \
+                "exploring" \
+                "$explore_error_message" \
+                "Check agent log at ${log_dir}/explorer.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                "$explore_error_class" \
+                "role=explorer; engine=${_effective_explore_engine}; exit_code=${exit_explore}; log=${log_dir}/explorer.log" || true
             _print_cost_summary
             return 1
         fi
@@ -3530,7 +4905,10 @@ Read the task file at ${task_file} for context. Explore the codebase to understa
             "${comp_dir}/exploration-summary.md" \
             "exploring" \
             "Phase 1 produced an invalid exploration summary" \
-            "Check ${comp_dir}/exploration-summary.md and agent log ${log_dir}/explorer.log, then retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" || return 1
+            "Check ${comp_dir}/exploration-summary.md and agent log ${log_dir}/explorer.log, then retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+            "Phase 1" \
+            "${log_dir}/explorer.log" \
+            "Exploration summary" || return 1
         log_execution "$task_file" "Phase 1: Explore completed"
         _append_manifest_phase "phase-1" "explore" "$_phase_start" "$(_iso_timestamp)" "completed" || true
     fi
@@ -3541,6 +4919,9 @@ Read the task file at ${task_file} for context. Explore the codebase to understa
     local plan_b_valid=false
     echo -e "${BLUE}=== Phase 2: Parallel Planning ===${NC}"
     _phase_start=$(_iso_timestamp)
+    _FAIL_PHASE_PHASE_ID="phase-2"
+    _FAIL_PHASE_PHASE_NAME="planning"
+    _FAIL_PHASE_PHASE_STARTED_AT="$_phase_start"
     _update_run_manifest_state "phase-2" || true
     if [[ "$FORCE_RERUN" != "true" ]] && { [[ -s "${comp_dir}/plan-a.md" ]] || [[ -s "${comp_dir}/plan-b.md" ]]; }; then
         phase2_skipped=true
@@ -3551,19 +4932,40 @@ Read the task file at ${task_file} for context. Explore the codebase to understa
         set_task_status "$task_file" "in progress"
         log_execution "$task_file" "Phase 2: Planning started (parallel)"
 
-        local plan_a_instruction="You are Planner A (Claude). Goal: ${goal}
+        local plan_a_instruction="You are Planner A. Goal: ${goal}
 
 Read the exploration summary at ${comp_dir}/exploration-summary.md and the task file at ${task_file}.
 Write a detailed implementation plan to ${comp_dir}/plan-a.md."
-        local plan_a_fallback_instruction="$plan_a_instruction"
-        prepare_agent_request "$ENGINE_PLANNER_A" "$planner_a_prompt" "$plan_a_instruction" || {
-            _fail_phase "planning" "Failed to assemble planner-a prompt" "Check agent log at ${log_dir}/planner-a.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
+        local plan_a_fallback_instruction="You are Planner A (Claude). Goal: ${goal}
+
+Read the exploration summary at ${comp_dir}/exploration-summary.md and the task file at ${task_file}.
+Write a detailed implementation plan to ${comp_dir}/plan-a.md."
+        local _requested_planner_a_engine="$ENGINE_PLANNER_A"
+        local _effective_planner_a_engine="$ENGINE_PLANNER_A"
+        _resolve_effective_engine "$_requested_planner_a_engine"
+        _effective_planner_a_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_planner_a_engine" "$_effective_planner_a_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "planner-a"
+            _v2_append_codex_circuit_breaker_skip "phase-2" "planning-a" "$_phase_start" "planner-a"
+        fi
+        # TODO: refine error_class if planner prompt assembly failures split into stable categories.
+        prepare_agent_request "$_effective_planner_a_engine" "$planner_a_prompt" "$plan_a_instruction" || {
+            _fail_phase "planning" "Failed to assemble planner-a prompt" "Check agent log at ${log_dir}/planner-a.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                "unknown" "role=planner-a; step=prepare_agent_request"
         }
         local plan_a_prompt_body="$AGENT_PROMPT_BODY"
         local plan_a_sysprompt="$AGENT_SYSTEM_PROMPT"
 
+        local _requested_planner_b_engine="$ENGINE_PLANNER_B"
+        local _effective_planner_b_engine="$ENGINE_PLANNER_B"
+        _resolve_effective_engine "$_requested_planner_b_engine"
+        _effective_planner_b_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_planner_b_engine" "$_effective_planner_b_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "planner-b"
+            _v2_append_codex_circuit_breaker_skip "phase-2" "planning-b" "$_phase_start" "planner-b"
+        fi
         local plan_b_output_path="${comp_dir}/plan-b.md"
-        if [[ "$ENGINE_PLANNER_B" == "codex" ]]; then
+        if [[ "$_effective_planner_b_engine" == "codex" ]]; then
             plan_b_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
         fi
         local plan_b_instruction="Goal: ${goal}
@@ -3574,33 +4976,38 @@ Write a detailed implementation plan to ${plan_b_output_path}."
 
 Read the exploration summary at ${comp_dir}/exploration-summary.md and the task file at ${task_file}.
 Write a detailed implementation plan to ${comp_dir}/plan-b.md."
-        prepare_agent_request "$ENGINE_PLANNER_B" "$planner_b_prompt" "$plan_b_instruction" || {
-            _fail_phase "planning" "Failed to assemble planner-b prompt" "Check agent log at ${log_dir}/planner-b.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
+
+        prepare_agent_request "$_effective_planner_b_engine" "$planner_b_prompt" "$plan_b_instruction" || {
+            _fail_phase "planning" "Failed to assemble planner-b prompt" "Check agent log at ${log_dir}/planner-b.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                "unknown" "role=planner-b; step=prepare_agent_request"
         }
         local plan_b_prompt_body="$AGENT_PROMPT_BODY"
         local plan_b_sysprompt="$AGENT_SYSTEM_PROMPT"
 
-        echo -e "${BLUE}Spawning parallel: planner-a (${ENGINE_PLANNER_A}) + planner-b (${ENGINE_PLANNER_B})${NC}"
+        echo -e "${BLUE}Spawning parallel: planner-a (${_effective_planner_a_engine}) + planner-b (${_effective_planner_b_engine})${NC}"
 
         local planner_a_start_ts=0 planner_b_start_ts=0
         local planner_a_duration=0
         local planner_b_backstopped=false
 
         planner_a_start_ts=$(date +%s)
-        run_agent "planner-a" "$ENGINE_PLANNER_A" "$plan_a_prompt_body" "$plan_a_sysprompt" \
+        run_agent "planner-a" "$_effective_planner_a_engine" "$plan_a_prompt_body" "$plan_a_sysprompt" \
             "${comp_dir}/plan-a.md" "${log_dir}/planner-a.log" "$PLANNER_TIMEOUT" "100" &
         local pid_a=$!
 
         planner_b_start_ts=$(date +%s)
-        run_agent "planner-b" "$ENGINE_PLANNER_B" "$plan_b_prompt_body" "$plan_b_sysprompt" \
+        run_agent "planner-b" "$_effective_planner_b_engine" "$plan_b_prompt_body" "$plan_b_sysprompt" \
             "${comp_dir}/plan-b.md" "${log_dir}/planner-b.log" "$PLANNER_TIMEOUT" "100" &
         local pid_b=$!
 
         local exit_a=0 exit_b=0
         wait $pid_a || exit_a=$?
+        if [[ "$_effective_planner_a_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_planner_a_engine" "$exit_a"
+        fi
         planner_a_duration=$(( $(date +%s) - planner_a_start_ts ))
         (( planner_a_duration < 0 )) && planner_a_duration=0
-        if [[ "$ENGINE_PLANNER_A" == "claude" ]] && [[ "$ENGINE_PLANNER_B" == "codex" ]] && \
+        if [[ "$_effective_planner_a_engine" == "claude" ]] && [[ "$_effective_planner_b_engine" == "codex" ]] && \
            _validate_agent_output_for_role "planner-a" "${comp_dir}/plan-a.md" >/dev/null 2>&1 && \
            kill -0 "$pid_b" 2>/dev/null; then
             if ! _enforce_codex_phase_backstop "$pid_b" "planner-b" "$planner_b_start_ts" "$PLANNER_TIMEOUT" "$planner_a_duration" "${log_dir}/planner-b.log" "${comp_dir}/plan-b.md"; then
@@ -3608,6 +5015,9 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
             fi
         fi
         wait $pid_b || exit_b=$?
+        if [[ "$_effective_planner_b_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_planner_b_engine" "$exit_b"
+        fi
         if [[ "$planner_b_backstopped" == true ]]; then
             _append_interrupted_cost_rows TERM || true
         fi
@@ -3623,7 +5033,8 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
                 _fail_phase \
                     "planning" \
                     "Phase 2 planner A produced an invalid plan artifact" \
-                    "Check ${comp_dir}/plan-a.md and agent log ${log_dir}/planner-a.log, then retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
+                    "Check ${comp_dir}/plan-a.md and agent log ${log_dir}/planner-a.log, then retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                    "invalid_artifact" "role=planner-a; artifact=${comp_dir}/plan-a.md"
                 return 1
                 ;;
         esac
@@ -3636,7 +5047,8 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
                 _fail_phase \
                     "planning" \
                     "Phase 2 planner B produced an invalid plan artifact" \
-                    "Check ${comp_dir}/plan-b.md and agent log ${log_dir}/planner-b.log, then retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
+                    "Check ${comp_dir}/plan-b.md and agent log ${log_dir}/planner-b.log, then retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                    "invalid_artifact" "role=planner-b; artifact=${comp_dir}/plan-b.md"
                 return 1
                 ;;
         esac
@@ -3671,7 +5083,8 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
                 _fail_phase \
                     "planning" \
                     "Phase 2 checkpointed plan-a.md is invalid" \
-                    "Check ${comp_dir}/plan-a.md and agent log ${log_dir}/planner-a.log, then regenerate Phase 2 with --force if needed: bash lauren-loop-v2.sh ${SLUG} '${goal}' --force"
+                    "Check ${comp_dir}/plan-a.md and agent log ${log_dir}/planner-a.log, then regenerate Phase 2 with --force if needed: bash lauren-loop-v2.sh ${SLUG} '${goal}' --force" \
+                    "checkpoint_corruption" "artifact=${comp_dir}/plan-a.md; source=checkpoint"
                 return 1
                 ;;
         esac
@@ -3684,7 +5097,8 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
                 _fail_phase \
                     "planning" \
                     "Phase 2 checkpointed plan-b.md is invalid" \
-                    "Check ${comp_dir}/plan-b.md and agent log ${log_dir}/planner-b.log, then regenerate Phase 2 with --force if needed: bash lauren-loop-v2.sh ${SLUG} '${goal}' --force"
+                    "Check ${comp_dir}/plan-b.md and agent log ${log_dir}/planner-b.log, then regenerate Phase 2 with --force if needed: bash lauren-loop-v2.sh ${SLUG} '${goal}' --force" \
+                    "checkpoint_corruption" "artifact=${comp_dir}/plan-b.md; source=checkpoint"
                 return 1
                 ;;
         esac
@@ -3796,6 +5210,9 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
     fi
 
     _phase_start=$(_iso_timestamp)
+    _FAIL_PHASE_PHASE_ID="phase-3"
+    _FAIL_PHASE_PHASE_NAME="evaluate-critic"
+    _FAIL_PHASE_PHASE_STARTED_AT="$_phase_start"
     _update_run_manifest_state "phase-3" || true
     if [[ "$FORCE_RERUN" != "true" ]] && [[ -s "${comp_dir}/revised-plan.md" ]] && \
        [[ -s "${comp_dir}/plan-critique.md" ]] && \
@@ -3827,27 +5244,47 @@ Write a detailed implementation plan to ${comp_dir}/plan-b.md."
 - Task file: ${task_file}
 
 Score each plan on all six dimensions, then select the better plan or synthesize a hybrid.
-Write your evaluation to ${comp_dir}/plan-evaluation.md. Include a ## Selected Plan section containing the full winning or hybrid plan.
+            Write your evaluation to ${comp_dir}/plan-evaluation.md. Include a ## Selected Plan section containing the full winning or hybrid plan.
 Do NOT modify the task file."
-            prepare_agent_request "$ENGINE_EVALUATOR" "$evaluator_prompt" "$eval_instruction" || {
-                _fail_phase "evaluating" "Failed to assemble evaluator prompt" "Check agent log at ${log_dir}/evaluator.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
+            # TODO: refine error_class if evaluator prompt assembly failures split into stable categories.
+            local _requested_plan_evaluator_engine="$ENGINE_EVALUATOR"
+            local _effective_plan_evaluator_engine="$ENGINE_EVALUATOR"
+            _resolve_effective_engine "$_requested_plan_evaluator_engine"
+            _effective_plan_evaluator_engine="$_V2_EFFECTIVE_ENGINE"
+            if _v2_engine_resolution_skipped_codex "$_requested_plan_evaluator_engine" "$_effective_plan_evaluator_engine"; then
+                _v2_log_codex_circuit_breaker_trip "$task_file" "phase-3 evaluator"
+                _v2_append_codex_circuit_breaker_skip "phase-3" "evaluator" "$_phase_start" "phase-3-evaluator"
+            fi
+
+            prepare_agent_request "$_effective_plan_evaluator_engine" "$evaluator_prompt" "$eval_instruction" || {
+                _fail_phase "evaluating" "Failed to assemble evaluator prompt" "Check agent log at ${log_dir}/evaluator.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                    "unknown" "role=evaluator; step=prepare_agent_request"
             }
 
             local exit_eval=0
             rm -f "${comp_dir}/plan-evaluation.contract.json"
-            run_agent "evaluator" "$ENGINE_EVALUATOR" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+            run_agent "evaluator" "$_effective_plan_evaluator_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
                 "${comp_dir}/plan-evaluation.md" "${log_dir}/evaluator.log" \
                 "$EVALUATE_TIMEOUT" "100" || exit_eval=$?
+            if [[ "$_effective_plan_evaluator_engine" == "codex" ]]; then
+                _v2_record_codex_outcome "$_effective_plan_evaluator_engine" "$exit_eval"
+            fi
 
             if [[ "$exit_eval" -ne 0 ]]; then
+                local eval_error_class=""
+                local eval_error_message=""
+                eval_error_class=$(_classify_agent_exit_error_class "$_effective_plan_evaluator_engine" "$exit_eval" "${log_dir}/evaluator.log")
                 if [[ "$exit_eval" -eq 124 ]]; then
-                    echo -e "${RED}Phase 3 timed out (${EVALUATE_TIMEOUT})${NC}"
-                    log_execution "$task_file" "Phase 3: Evaluation timed out (${EVALUATE_TIMEOUT})"
+                    eval_error_message="Phase 3: Evaluation timed out (${EVALUATE_TIMEOUT})"
                 else
-                    echo -e "${RED}Phase 3 failed (exit $exit_eval)${NC}"
-                    log_execution "$task_file" "Phase 3: Evaluation FAILED (exit $exit_eval)"
+                    eval_error_message="Phase 3: Evaluation FAILED (exit $exit_eval)"
                 fi
-                set_task_status "$task_file" "blocked"
+                _fail_phase \
+                    "evaluating" \
+                    "$eval_error_message" \
+                    "Check agent log at ${log_dir}/evaluator.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                    "$eval_error_class" \
+                    "role=evaluator; engine=${_effective_plan_evaluator_engine}; exit_code=${exit_eval}; log=${log_dir}/evaluator.log" || true
                 _print_cost_summary
                 return 1
             fi
@@ -3861,28 +5298,34 @@ Do NOT modify the task file."
                 local _eval_present=""
                 _eval_present=$(_parse_contract "${comp_dir}/plan-evaluation.md" "selected_plan_present")
                 if [[ "$_eval_present" != "true" ]]; then
-                    echo -e "${RED}Strict mode requires plan-evaluation.contract.json selected_plan_present=true${NC}"
-                    set_task_status "$task_file" "blocked"
-                    log_execution "$task_file" "Phase 3: Strict contract failure for plan-evaluation selected_plan_present"
+                    _fail_phase \
+                        "evaluating" \
+                        "Strict mode requires plan-evaluation.contract.json selected_plan_present=true" \
+                        "Check ${comp_dir}/plan-evaluation.contract.json and ${comp_dir}/plan-evaluation.md, then retry" \
+                        "invalid_artifact" \
+                        "artifact=${comp_dir}/plan-evaluation.contract.json; field=selected_plan_present; value=${_eval_present:-empty}" || true
                     _print_cost_summary
                     return 1
                 fi
             fi
 
             if ! extract_markdown_section_to_file "${comp_dir}/plan-evaluation.md" "## Selected Plan" "${comp_dir}/revised-plan.md"; then
-                echo -e "${RED}ERROR: Evaluator did not produce ## Selected Plan — cannot continue${NC}"
-                set_task_status "$task_file" "blocked"
-                log_execution "$task_file" "Phase 3: Evaluator failed to produce ## Selected Plan"
                 grep -i 'selected.plan' "${comp_dir}/plan-evaluation.md" | head -5 | while IFS= read -r _line; do
                     log_execution "$task_file" "  diagnostic: found heading: $_line"
                 done
+                _fail_phase \
+                    "evaluating" \
+                    "Phase 3: Evaluator failed to produce ## Selected Plan" \
+                    "Check ${comp_dir}/plan-evaluation.md and ${log_dir}/evaluator.log, then retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                    "invalid_artifact" \
+                    "artifact=${comp_dir}/plan-evaluation.md; section=## Selected Plan; state=missing_or_empty" || true
                 _print_cost_summary
                 return 1
             fi
             log_execution "$task_file" "Phase 3: Evaluation completed and revised-plan.md seeded"
             blinding_message="Plan randomization: $(cat "${comp_dir}/.plan-mapping")"
             _atomic_append "${comp_dir}/blinding-metadata.log" "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $blinding_message"
-            blinding_message="Plan engine mapping: plan-a=${ENGINE_PLANNER_A}, plan-b=${ENGINE_PLANNER_B}"
+            blinding_message="Plan engine mapping: plan-a=${_effective_planner_a_engine}, plan-b=${_effective_planner_b_engine}"
             _atomic_append "${comp_dir}/blinding-metadata.log" "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] $blinding_message"
             log_execution "$task_file" "Phase 3: Plan evaluation completed"
         fi
@@ -3897,7 +5340,15 @@ Do NOT modify the task file."
 
         echo -e "${BLUE}=== Phase 3: Critic Loop ===${NC}"
         local plan_critic_result=0
-        run_critic_loop "$task_file" "$comp_dir" "$critic_prompt" "$reviser_prompt" "${comp_dir}/revised-plan.md" "${comp_dir}/plan-critique.md" 3 "plan-critic" "needs verification" "$ENGINE_CRITIC" || plan_critic_result=$?
+        local _requested_plan_critic_engine="$ENGINE_CRITIC"
+        local _effective_plan_critic_engine="$ENGINE_CRITIC"
+        _resolve_effective_engine "$_requested_plan_critic_engine"
+        _effective_plan_critic_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_plan_critic_engine" "$_effective_plan_critic_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "plan-critic"
+            _v2_append_codex_circuit_breaker_skip "phase-3" "plan-critic" "$_phase_start" "plan-critic"
+        fi
+        run_critic_loop "$task_file" "$comp_dir" "$critic_prompt" "$reviser_prompt" "${comp_dir}/revised-plan.md" "${comp_dir}/plan-critique.md" 3 "plan-critic" "needs verification" "$_effective_plan_critic_engine" || plan_critic_result=$?
         case "$plan_critic_result" in
             0)
                 set_task_status "$task_file" "in progress"
@@ -3936,6 +5387,9 @@ Do NOT modify the task file."
 
     echo -e "${BLUE}=== Phase 4: Execute ===${NC}"
     _phase_start=$(_iso_timestamp)
+    _FAIL_PHASE_PHASE_ID="phase-4"
+    _FAIL_PHASE_PHASE_NAME="execute"
+    _FAIL_PHASE_PHASE_STARTED_AT="$_phase_start"
     _update_run_manifest_state "phase-4" || true
     if _v2_handle_phase4_checkpoint "$task_file" "$baseline_diff" "$scope_triage_state_file" "$phase4_scope_plan_file"; then
         phase4_before_sha="${_V2_PHASE4_CHECKPOINT_BEFORE_SHA:-}"
@@ -3951,38 +5405,107 @@ Do NOT modify the task file."
         pre_exec_untracked=$(_collect_blocking_untracked_files "$task_file" "${comp_dir}/revised-plan.md" "$pre_exec_sha")
         local pre_exec_dirty=""
         pre_exec_dirty=$(_v2_snapshot_dirty_files)
+        local pre_exec_log_bytes=0
+        local post_exec_log_bytes=0
+        local exec_log_activity="false"
+        pre_exec_log_bytes=$(_v2_file_size_bytes "${comp_dir}/execution-log.md")
+        # TODO: refine error_class for Phase 4 setup failures if git/worktree helpers return structured causes.
         if ! _normalize_verify_tags_with_timeout_in_file "${comp_dir}/revised-plan.md" "V2 phase 4 plan"; then
-            _fail_phase "executing" "Failed to wrap repo-standard pytest verification commands in revised-plan.md" "Check ${comp_dir}/revised-plan.md for verify tag formatting drift, then retry"
+            _fail_phase "executing" "Failed to wrap repo-standard pytest verification commands in revised-plan.md" "Check ${comp_dir}/revised-plan.md for verify tag formatting drift, then retry" \
+                "unknown" "artifact=${comp_dir}/revised-plan.md; step=normalize_verify_tags"
             return 1
         fi
         if ! _validate_verify_commands_in_file "${comp_dir}/revised-plan.md" "V2 phase 4 plan"; then
-            _fail_phase "executing" "Invalid verify commands found in revised-plan.md" "Check ${comp_dir}/revised-plan.md for bad verify commands, then retry"
+            _fail_phase "executing" "Invalid verify commands found in revised-plan.md" "Check ${comp_dir}/revised-plan.md for bad verify commands, then retry" \
+                "unknown" "artifact=${comp_dir}/revised-plan.md; step=validate_verify_commands"
             return 1
-        fi
-        local exec_instruction="You are the Executor. Read the approved plan at ${comp_dir}/revised-plan.md and the task file at ${task_file}.
-Implement the plan step by step. Write execution progress to ${comp_dir}/execution-log.md.
-Work in small, verifiable steps and stop with BLOCKED if the plan cannot be completed safely.
-If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_message) - <command>' and stop immediately."
-        prepare_agent_request "$ENGINE_EXECUTOR" "$executor_prompt" "$exec_instruction" || {
-            _fail_phase "executing" "Failed to assemble executor prompt" "Check agent log at ${log_dir}/executor.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
-        }
-        if [[ "$ENGINE_EXECUTOR" == "claude" ]]; then
-            AGENT_SYSTEM_PROMPT=$(printf '%s' "$AGENT_SYSTEM_PROMPT" | _normalize_executor_prompt_timeout_content "V2 phase 4 executor prompt") || {
-                _fail_phase "executing" "Executor prompt timeout normalization drifted" "Check ${executor_prompt} for repo-standard pytest command changes before retrying"
-                return 1
-            }
-        else
-            AGENT_PROMPT_BODY=$(printf '%s' "$AGENT_PROMPT_BODY" | _normalize_executor_prompt_timeout_content "V2 phase 4 executor prompt") || {
-                _fail_phase "executing" "Executor prompt timeout normalization drifted" "Check ${executor_prompt} for repo-standard pytest command changes before retrying"
-                return 1
-            }
         fi
 
         # Create isolated worktree for execution
         _v2_create_execution_worktree || {
-            _fail_phase "executing" "Failed to create execution worktree" "Check disk space and git state"
+            _fail_phase "executing" "Failed to create execution worktree" "Check disk space and git state" \
+                "unknown" "step=_v2_create_execution_worktree"
             return 1
         }
+        _v2_stage_execution_runtime_task_file "$task_file" || {
+            _fail_phase "executing" "Failed to stage runtime task file into worktree" "Check worktree path permissions and task artifacts, then retry" \
+                "unknown" "artifact=${task_file}; step=_v2_stage_execution_runtime_task_file"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        _v2_stage_execution_worktree_files "${comp_dir}/revised-plan.md" || {
+            _fail_phase "executing" "Failed to stage execution context into worktree" "Check worktree path permissions and task artifacts, then retry" \
+                "unknown" "artifact=${comp_dir}/revised-plan.md; step=_v2_stage_execution_worktree_files"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        if [[ -f "${comp_dir}/execution-log.md" ]]; then
+            _v2_stage_execution_worktree_file "${comp_dir}/execution-log.md" || {
+                _fail_phase "executing" "Failed to stage execution log into worktree" "Check worktree path permissions and task artifacts, then retry" \
+                    "unknown" "artifact=${comp_dir}/execution-log.md; step=_v2_stage_execution_worktree_file"
+                _v2_save_worktree_diff || true
+                _v2_cleanup_execution_worktree || true
+                return 1
+            }
+        fi
+        local exec_plan_rel=""
+        local exec_task_rel=""
+        local exec_log_rel=""
+        exec_plan_rel=$(_v2_main_repo_relative_path "${comp_dir}/revised-plan.md") || {
+            _fail_phase "executing" "Failed to resolve worktree-local plan path" "Check task artifact location, then retry" \
+                "unknown" "artifact=${comp_dir}/revised-plan.md; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        exec_task_rel=$(_v2_execution_runtime_task_rel_path)
+        exec_log_rel=$(_v2_main_repo_relative_path "${comp_dir}/execution-log.md") || {
+            _fail_phase "executing" "Failed to resolve worktree-local execution log path" "Check task artifact location, then retry" \
+                "unknown" "artifact=${comp_dir}/execution-log.md; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        local exec_instruction="You are the Executor. Your project root is the current working directory (${_V2_EXEC_WORKTREE_PATH}).
+Read the approved plan at ${exec_plan_rel} and the task file at ${exec_task_rel}.
+Implement the plan step by step. Write execution progress to ${exec_log_rel}.
+All repo file reads and writes must stay inside the current working directory. Do not use absolute paths under ${SCRIPT_DIR}.
+        Work in small, verifiable steps and stop with BLOCKED if the plan cannot be completed safely.
+        If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_message) - <command>' and stop immediately."
+        local _requested_executor_engine="$ENGINE_EXECUTOR"
+        local _effective_executor_engine="$ENGINE_EXECUTOR"
+        _resolve_effective_engine "$_requested_executor_engine"
+        _effective_executor_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_executor_engine" "$_effective_executor_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "executor"
+            _v2_append_codex_circuit_breaker_skip "phase-4" "executor" "$_phase_start" "executor"
+        fi
+        prepare_agent_request "$_effective_executor_engine" "$executor_prompt" "$exec_instruction" || {
+            _fail_phase "executing" "Failed to assemble executor prompt" "Check agent log at ${log_dir}/executor.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                "unknown" "role=executor; step=prepare_agent_request"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        if [[ "$_effective_executor_engine" == "claude" ]]; then
+            AGENT_SYSTEM_PROMPT=$(printf '%s' "$AGENT_SYSTEM_PROMPT" | _normalize_executor_prompt_timeout_content "V2 phase 4 executor prompt") || {
+                _fail_phase "executing" "Executor prompt timeout normalization drifted" "Check ${executor_prompt} for repo-standard pytest command changes before retrying" \
+                    "unknown" "artifact=${executor_prompt}; step=_normalize_executor_prompt_timeout_content; target=system_prompt"
+                _v2_save_worktree_diff || true
+                _v2_cleanup_execution_worktree || true
+                return 1
+            }
+        else
+            AGENT_PROMPT_BODY=$(printf '%s' "$AGENT_PROMPT_BODY" | _normalize_executor_prompt_timeout_content "V2 phase 4 executor prompt") || {
+                _fail_phase "executing" "Executor prompt timeout normalization drifted" "Check ${executor_prompt} for repo-standard pytest command changes before retrying" \
+                    "unknown" "artifact=${executor_prompt}; step=_normalize_executor_prompt_timeout_content; target=prompt_body"
+                _v2_save_worktree_diff || true
+                _v2_cleanup_execution_worktree || true
+                return 1
+            }
+        fi
         cd "$_V2_EXEC_WORKTREE_PATH"
 
         local exit_exec=0
@@ -3992,11 +5515,25 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
         pre_exec_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/execution-log.md")
         touch "${log_dir}/executor.log"
         start_agent_monitor "${log_dir}/executor.log" "$task_file"
-        run_agent "executor" "$ENGINE_EXECUTOR" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+        run_agent "executor" "$_effective_executor_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
             "/dev/null" "${log_dir}/executor.log" \
             "$EXECUTOR_TIMEOUT" "300" "WebFetch,WebSearch" || exit_exec=$?
         stop_agent_monitor
+        if [[ "$_effective_executor_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_executor_engine" "$exit_exec"
+        fi
+        _v2_sync_execution_worktree_files "${comp_dir}/execution-log.md" || {
+            _fail_phase "executing" "Failed to sync execution log from worktree" "Inspect worktree task artifacts, then retry" \
+                "unknown" "artifact=${comp_dir}/execution-log.md; step=_v2_sync_execution_worktree_files"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
         post_exec_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/execution-log.md")
+        post_exec_log_bytes=$(_v2_file_size_bytes "${comp_dir}/execution-log.md")
+        if [[ "${post_exec_log_bytes:-0}" -gt "${pre_exec_log_bytes:-0}" ]]; then
+            exec_log_activity="true"
+        fi
         if [[ "${post_exec_timeout_blocks:-0}" -gt "${pre_exec_timeout_blocks:-0}" ]]; then
             exec_timeout_block_line=$(_latest_timeout_block_line "${comp_dir}/execution-log.md" || true)
             echo -e "${YELLOW}$(_verification_timeout_message)${NC}"
@@ -4006,20 +5543,28 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                 echo "  Reason: $exec_timeout_block_line"
             fi
             _print_cost_summary
+            _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
         fi
 
         if [[ "$exit_exec" -ne 0 ]]; then
+            local exec_error_class=""
+            local exec_error_message=""
+            exec_error_class=$(_classify_agent_exit_error_class "$_effective_executor_engine" "$exit_exec" "${log_dir}/executor.log")
             if [[ "$exit_exec" -eq 124 ]]; then
-                echo -e "${RED}Phase 4 timed out (${EXECUTOR_TIMEOUT})${NC}"
-                log_execution "$task_file" "Phase 4: Execution timed out (${EXECUTOR_TIMEOUT})"
+                exec_error_message="Phase 4: Execution timed out (${EXECUTOR_TIMEOUT})"
             else
-                echo -e "${RED}Phase 4 failed (exit $exit_exec)${NC}"
-                log_execution "$task_file" "Phase 4: Execution FAILED (exit $exit_exec)"
+                exec_error_message="Phase 4: Execution FAILED (exit $exit_exec)"
             fi
-            set_task_status "$task_file" "blocked"
+            _fail_phase \
+                "executing" \
+                "$exec_error_message" \
+                "Check agent log at ${log_dir}/executor.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                "$exec_error_class" \
+                "role=executor; engine=${_effective_executor_engine}; exit_code=${exit_exec}; log=${log_dir}/executor.log" || true
             _print_cost_summary
+            _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
         fi
@@ -4031,10 +5576,28 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
         phase4_pre_exec_dirty="$pre_exec_dirty"
         capture_diff_artifact "$pre_exec_sha" "$baseline_diff" "$task_file" "${comp_dir}/revised-plan.md" "$pre_exec_dirty"
         if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null && [[ -z "${_V2_LAST_CAPTURE_UNTRACKED_FILES:-}" ]]; then
-            echo -e "${RED}Executor produced no code changes${NC}"
-            set_task_status "$task_file" "blocked"
-            log_execution "$task_file" "Phase 4: Executor produced no code changes"
+            local phase4_worktree_error_message=""
+            local phase4_worktree_error_detail=""
+            _log_diagnostic_lines "$task_file" "$(_v2_phase_execution_diagnostic_lines "$exec_log_activity" "${comp_dir}/execution-log.md" "$baseline_diff")"
+            if [[ "$exec_log_activity" == "true" ]]; then
+                echo -e "${RED}Execution activity detected but execution worktree is clean${NC}"
+                log_execution "$task_file" "Phase 4: Execution activity detected but execution worktree is clean — suspected out-of-worktree write or non-persisted executor change"
+                phase4_worktree_error_message="Phase 4: Execution activity detected but execution worktree is clean — suspected out-of-worktree write or non-persisted executor change"
+                phase4_worktree_error_detail="phase=phase-4; activity_detected=true; worktree=clean; diff=${baseline_diff}"
+            else
+                echo -e "${RED}Executor produced no code changes${NC}"
+                log_execution "$task_file" "Phase 4: Executor produced no code changes"
+                phase4_worktree_error_message="Phase 4: Executor produced no code changes"
+                phase4_worktree_error_detail="phase=phase-4; activity_detected=false; worktree=clean; diff=${baseline_diff}"
+            fi
+            _fail_phase \
+                "executing" \
+                "$phase4_worktree_error_message" \
+                "Inspect ${comp_dir}/execution-log.md and ${comp_dir}/revised-plan.md, then retry after keeping executor writes inside the execution worktree" \
+                "scope_violation" \
+                "$phase4_worktree_error_detail" || true
             _print_cost_summary
+            _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
         fi
@@ -4047,14 +5610,25 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
         fi
 
         _block_on_untracked_files "$task_file" "Phase 4" "${comp_dir}/revised-plan.md" "$pre_exec_sha" "$pre_exec_untracked" || {
+            _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
         }
 
+        # Capture worktree diff count BEFORE merge (cleanup clears _V2_EXEC_WORKTREE_PATH)
+        _worktree_diff_lines=0
+        if [[ -d "${_V2_EXEC_WORKTREE_PATH:-}" ]]; then
+            _worktree_diff_lines=$(cd "$_V2_EXEC_WORKTREE_PATH" && git diff --stat HEAD | wc -l 2>/dev/null || echo "0")
+        fi
+
         # Merge worktree changes back to the main branch
         cd "$SCRIPT_DIR"
+        local phase4_merge_branch=""
+        phase4_merge_branch=$(_v2_execution_merge_branch_label)
         _v2_merge_execution_worktree || {
-            _fail_phase "executing" "Failed to merge execution worktree" "Check for merge conflicts; resolve manually then retry"
+            _fail_phase "executing" "Failed to merge execution worktree" "Check for merge conflicts; resolve manually then retry" \
+                "merge_failure" "phase=phase-4; step=_v2_merge_execution_worktree; branch=${phase4_merge_branch}"
+            _v2_cleanup_after_failed_merge true
             return 1
         }
 
@@ -4076,6 +5650,32 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                 log_execution "$task_file" "Phase 4: Diff scope check passed with warnings"
             fi
         fi
+    fi
+
+    # Activity-detected-but-empty-diff guard: halt if executor showed activity
+    # but scope triage left the in-scope diff empty (all changes were NOISE).
+    if [[ "$phase4_needs_triage" == true && ! -s "$baseline_diff" && "${exec_log_activity:-false}" == "true" ]]; then
+        local phase4_empty_diff_completed_at=""
+        local phase4_empty_diff_cost=""
+        phase4_empty_diff_completed_at=$(_iso_timestamp)
+        phase4_empty_diff_cost=$(_manifest_phase_measured_cost)
+        _append_manifest_phase \
+            "${_FAIL_PHASE_PHASE_ID:-phase-4}" \
+            "${_FAIL_PHASE_PHASE_NAME:-execute}" \
+            "${_FAIL_PHASE_PHASE_STARTED_AT:-$phase4_empty_diff_completed_at}" \
+            "$phase4_empty_diff_completed_at" \
+            "failed" \
+            "" \
+            "$phase4_empty_diff_cost" \
+            "scope_violation" \
+            "phase=phase-4; reason=activity_quarantined_by_scope_triage; diff=${baseline_diff}" || true
+        echo -e "${RED}Phase 4: Executor activity detected but in-scope diff is empty after scope triage — halting${NC}"
+        log_execution "$task_file" "Phase 4: HALTED — executor activity detected but all changes quarantined by scope triage. In-scope diff is empty. Review scope plan for accuracy, then re-run."
+        _write_human_review_handoff "BLOCKED" "0" || true
+        set_task_status "$task_file" "needs verification"
+        _finalize_run_manifest "human_review" 0 || true
+        _print_cost_summary
+        return 0
     fi
 
     local _diff_risk=""
@@ -4106,6 +5706,27 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
             ;;
     esac
 
+    local _worktree_diff_lines=0
+
+    # Empty-diff guard: halt if execution produced no captured files (phantom execution detection)
+    if [[ "$phase4_needs_triage" == true ]]; then
+        local _captured_count=0
+        _captured_count=$(echo "${_V2_LAST_CAPTURED_FILES:-}" | grep -c '.' 2>/dev/null || true)
+        # _worktree_diff_lines captured before merge (above) — worktree no longer exists here
+        if [[ "$_captured_count" -eq 0 && ! -s "$baseline_diff" && "$_worktree_diff_lines" -eq 0 ]]; then
+            echo -e "${RED}Phase 4: Execution produced no captured files, diff is empty, and worktree has no changes — halting (phantom execution suspected)${NC}"
+            log_execution "$task_file" "Phase 4: HALTED — zero captured files, empty diff, and clean worktree after scope triage. Phantom execution suspected. Re-run with FORCE_RERUN=true."
+            _fail_phase \
+                "executing" \
+                "Phase 4: Execution produced no captured files, diff is empty, and worktree has no changes — phantom execution suspected" \
+                "Re-run with FORCE_RERUN=true after checking scope triage and executor writes" \
+                "scope_violation" \
+                "phase=phase-4; captured_count=${_captured_count}; diff=empty; worktree_diff_lines=${_worktree_diff_lines}" || true
+            _print_cost_summary
+            return 1
+        fi
+    fi
+
     ensure_review_sections "$task_file" || {
         echo -e "${RED}Failed to ensure review sections${NC}"
         set_task_status "$task_file" "blocked"
@@ -4119,6 +5740,12 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
     local pipeline_success=false
     local pipeline_human_review_halt=false
     local _resume_to_subphase=""
+    local _resume_phase8_halt_subphase=""
+    local _phase8_round="initial"
+    local needs_phase8c=false
+    local _phase8c_source_phase=""
+    local _phase8_cumulative_diff=""
+    local _phase8_changed_files=""
 
     # Cycle checkpoint resume
     if [[ "$FORCE_RERUN" != "true" ]] && _read_cycle_state "$comp_dir"; then
@@ -4128,13 +5755,85 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
             phase-6a) _resume_to_subphase="phase-6b" ;;
             phase-6b) _resume_to_subphase="phase-6c" ;;
             phase-6c) _resume_to_subphase="phase-7" ;;
-            phase-7)  fix_cycle=$((fix_cycle + 1)); _resume_to_subphase="" ;;
+            phase-7)  _resume_to_subphase="phase-8a" ;;
+            phase-8a)
+                _phase8_round="${CYCLE_STATE_PHASE8_ROUND:-initial}"
+                case "${_phase8_round}:${CYCLE_STATE_PHASE8_RESULT:-}" in
+                    initial:PASS|post-fix:PASS)
+                        _resume_to_subphase="phase-8b"
+                        ;;
+                    initial:FAIL)
+                        _resume_to_subphase="phase-8c"
+                        needs_phase8c=true
+                        _phase8c_source_phase="phase-8a"
+                        ;;
+                    initial:BLOCKED|post-fix:FAIL|post-fix:BLOCKED)
+                        pipeline_finished=true
+                        pipeline_human_review_halt=true
+                        _resume_phase8_halt_subphase="phase-8a"
+                        ;;
+                    *)
+                        _clear_resume_checkpoint "phase-8a" "unsupported phase8 checkpoint: round=${_phase8_round:-empty}, result=${CYCLE_STATE_PHASE8_RESULT:-empty}"
+                        ;;
+                esac
+                ;;
+            phase-8b)
+                _phase8_round="${CYCLE_STATE_PHASE8_ROUND:-initial}"
+                case "${_phase8_round}:${CYCLE_STATE_PHASE8_RESULT:-}" in
+                    initial:PASS|post-fix:PASS)
+                        pipeline_finished=true
+                        pipeline_success=true
+                        ;;
+                    initial:FAIL)
+                        _resume_to_subphase="phase-8c"
+                        needs_phase8c=true
+                        _phase8c_source_phase="phase-8b"
+                        ;;
+                    initial:BLOCKED|post-fix:FAIL|post-fix:BLOCKED)
+                        pipeline_finished=true
+                        pipeline_human_review_halt=true
+                        _resume_phase8_halt_subphase="phase-8b"
+                        ;;
+                    *)
+                        _clear_resume_checkpoint "phase-8b" "unsupported phase8 checkpoint: round=${_phase8_round:-empty}, result=${CYCLE_STATE_PHASE8_RESULT:-empty}"
+                        ;;
+                esac
+                ;;
+            phase-8c)
+                _phase8_round="${CYCLE_STATE_PHASE8_ROUND:-post-fix}"
+                case "${_phase8_round}:${CYCLE_STATE_PHASE8_RESULT:-}" in
+                    post-fix:COMPLETE)
+                        _resume_to_subphase="phase-8a"
+                        ;;
+                    initial:BLOCKED)
+                        pipeline_finished=true
+                        pipeline_human_review_halt=true
+                        _resume_phase8_halt_subphase="phase-8c"
+                        ;;
+                    *)
+                        _clear_resume_checkpoint "phase-8c" "unsupported phase8 checkpoint: round=${_phase8_round:-empty}, result=${CYCLE_STATE_PHASE8_RESULT:-empty}"
+                        ;;
+                esac
+                ;;
             *)        _resume_to_subphase="" ;;
         esac
+        if [[ "$pipeline_human_review_halt" == true ]] && [[ -n "$_resume_phase8_halt_subphase" ]]; then
+            set_task_status "$task_file" "needs verification"
+            if ! _write_phase8_human_review_handoff "$_resume_phase8_halt_subphase"; then
+                set_task_status "$task_file" "blocked"
+                log_execution "$task_file" "Pipeline FAILED while human-review-handoff: Failed to write Phase 8 handoff artifacts"
+                _print_cost_summary
+                return 1
+            fi
+            log_execution "$task_file" "Cycle checkpoint resume: Phase 8 ${_resume_phase8_halt_subphase} requires human review. See competitive/human-review-handoff.md"
+        elif [[ "$pipeline_success" == true ]]; then
+            set_task_status "$task_file" "needs verification"
+            log_execution "$task_file" "Cycle checkpoint resume: success finalization from ${CYCLE_STATE_LAST_COMPLETED}"
+        fi
         if [[ -n "$_resume_to_subphase" ]]; then
             if _resume_target_ready "$_resume_to_subphase"; then
                 echo -e "${BLUE}Resuming from cycle state: fix_cycle=${fix_cycle}, resume_to=${_resume_to_subphase}${NC}"
-                log_execution "$task_file" "Cycle checkpoint resume: fix_cycle=${fix_cycle}, last_completed=${CYCLE_STATE_LAST_COMPLETED}, resume_to=${_resume_to_subphase}"
+                log_execution "$task_file" "Cycle checkpoint resume: fix_cycle=${fix_cycle}, last_completed=${CYCLE_STATE_LAST_COMPLETED}, resume_to=${_resume_to_subphase}, phase8_round=${CYCLE_STATE_PHASE8_ROUND:-}, phase8_result=${CYCLE_STATE_PHASE8_RESULT:-}"
             fi
         fi
     fi
@@ -4168,6 +5867,9 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
         _resume_to_subphase=""
         echo -e "${BLUE}=== Phase 5: Parallel Review (cycle $((fix_cycle + 1))) ===${NC}"
         _phase_start=$(_iso_timestamp)
+        _FAIL_PHASE_PHASE_ID="phase-5"
+        _FAIL_PHASE_PHASE_NAME="review-cycle-$((fix_cycle + 1))"
+        _FAIL_PHASE_PHASE_STARTED_AT="$_phase_start"
         _update_run_manifest_state "phase-5" "$_diff_risk" "$_effective_reviewer_timeout" || true
         set_task_status "$task_file" "in progress"
         log_execution "$task_file" "Phase 5: Review started (cycle $((fix_cycle + 1)))"
@@ -4184,22 +5886,41 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
             review_diff_context="${review_diff_context} Read the latest fix-cycle diff at ${latest_fix_diff}."
         fi
         local review_a_instruction="Read the task file at ${task_file}. ${review_diff_context} Review all changed files and write findings to ## Review Findings. This is review cycle $((fix_cycle + 1))."
+        local _requested_reviewer_a_engine="$ENGINE_REVIEWER_A"
+        local _effective_reviewer_a_engine="$ENGINE_REVIEWER_A"
+        _resolve_effective_engine "$_requested_reviewer_a_engine"
+        _effective_reviewer_a_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_reviewer_a_engine" "$_effective_reviewer_a_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "reviewer-a"
+            _v2_append_codex_circuit_breaker_skip "phase-5" "review-cycle-$((fix_cycle+1))-a" "$_phase_start" "reviewer-a"
+        fi
+        local _requested_reviewer_b_engine="$ENGINE_REVIEWER_B"
+        local _effective_reviewer_b_engine="$ENGINE_REVIEWER_B"
+        _resolve_effective_engine "$_requested_reviewer_b_engine"
+        _effective_reviewer_b_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_reviewer_b_engine" "$_effective_reviewer_b_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "reviewer-b"
+            _v2_append_codex_circuit_breaker_skip "phase-5" "review-cycle-$((fix_cycle+1))-b" "$_phase_start" "reviewer-b"
+        fi
         local review_b_output_path="${comp_dir}/reviewer-b.raw.md"
-        if [[ "$ENGINE_REVIEWER_B" == "codex" ]]; then
+        if [[ "$_effective_reviewer_b_engine" == "codex" ]]; then
             review_b_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
         fi
         local review_b_instruction="Read the task file at ${task_file}. ${review_diff_context} Read ${comp_dir}/exploration-summary.md for context. Write your review to ${review_b_output_path}. This is review cycle $((fix_cycle + 1))."
 
-        prepare_agent_request "$ENGINE_REVIEWER_A" "$reviewer_a_prompt_runtime" "$review_a_instruction" || {
+        # TODO: refine error_class if review prompt assembly and dual-reviewer failures split into stable categories.
+        prepare_agent_request "$_effective_reviewer_a_engine" "$reviewer_a_prompt_runtime" "$review_a_instruction" || {
             rm -f "$reviewer_a_prompt_runtime"
-            _fail_phase "reviewing" "Failed to assemble reviewer-a prompt" "Check agent log at ${log_dir}/reviewer-a*.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
+            _fail_phase "reviewing" "Failed to assemble reviewer-a prompt" "Check agent log at ${log_dir}/reviewer-a*.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                "unknown" "role=reviewer-a; step=prepare_agent_request"
         }
         local reviewer_a_body="$AGENT_PROMPT_BODY"
         local reviewer_a_system="$AGENT_SYSTEM_PROMPT"
 
-        prepare_agent_request "$ENGINE_REVIEWER_B" "$reviewer_b_prompt" "$review_b_instruction" || {
+        prepare_agent_request "$_effective_reviewer_b_engine" "$reviewer_b_prompt" "$review_b_instruction" || {
             rm -f "$reviewer_a_prompt_runtime"
-            _fail_phase "reviewing" "Failed to assemble reviewer-b prompt" "Check agent log at ${log_dir}/reviewer-b*.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'"
+            _fail_phase "reviewing" "Failed to assemble reviewer-b prompt" "Check agent log at ${log_dir}/reviewer-b*.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
+                "unknown" "role=reviewer-b; step=prepare_agent_request"
         }
         local reviewer_b_body="$AGENT_PROMPT_BODY"
         local reviewer_b_system="$AGENT_SYSTEM_PROMPT"
@@ -4218,17 +5939,20 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
         local reviewer_a_usable=false reviewer_b_backstopped=false
 
         reviewer_a_start_ts=$(date +%s)
-        run_agent "$reviewer_a_role" "$ENGINE_REVIEWER_A" "$reviewer_a_body" "$reviewer_a_system" \
+        run_agent "$reviewer_a_role" "$_effective_reviewer_a_engine" "$reviewer_a_body" "$reviewer_a_system" \
             "/dev/null" "$reviewer_a_log" "$_effective_reviewer_timeout" "100" &
         local pid_ra=$!
 
         reviewer_b_start_ts=$(date +%s)
-        run_agent "$reviewer_b_role" "$ENGINE_REVIEWER_B" "$reviewer_b_body" "$reviewer_b_system" \
+        run_agent "$reviewer_b_role" "$_effective_reviewer_b_engine" "$reviewer_b_body" "$reviewer_b_system" \
             "${comp_dir}/reviewer-b.raw.md" "$reviewer_b_log" "$_effective_reviewer_timeout" "100" &
         local pid_rb=$!
 
         local exit_ra=0 exit_rb=0
         wait $pid_ra || exit_ra=$?
+        if [[ "$_effective_reviewer_a_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_reviewer_a_engine" "$exit_ra"
+        fi
         reviewer_a_duration=$(( $(date +%s) - reviewer_a_start_ts ))
         (( reviewer_a_duration < 0 )) && reviewer_a_duration=0
 
@@ -4240,7 +5964,7 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
             done
         fi
 
-        if [[ "$ENGINE_REVIEWER_A" == "claude" ]] && [[ "$ENGINE_REVIEWER_B" == "codex" ]] && \
+        if [[ "$_effective_reviewer_a_engine" == "claude" ]] && [[ "$_effective_reviewer_b_engine" == "codex" ]] && \
            [[ "$reviewer_a_usable" == true ]] && \
            kill -0 "$pid_rb" 2>/dev/null; then
             if ! _enforce_codex_phase_backstop "$pid_rb" "$reviewer_b_role" "$reviewer_b_start_ts" "$_effective_reviewer_timeout" "$reviewer_a_duration" "$reviewer_b_log" "${comp_dir}/reviewer-b.raw.md"; then
@@ -4248,6 +5972,9 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
             fi
         fi
         wait $pid_rb || exit_rb=$?
+        if [[ "$_effective_reviewer_b_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_reviewer_b_engine" "$exit_rb"
+        fi
         if [[ "$reviewer_b_backstopped" == true ]]; then
             _append_interrupted_cost_rows TERM || true
         fi
@@ -4257,13 +5984,14 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
         _validate_agent_output_for_role "$reviewer_b_role" "${comp_dir}/reviewer-b.raw.md" || true
 
         if [[ "$exit_ra" -ne 0 && "$exit_rb" -ne 0 ]]; then
-            _fail_phase "reviewing" "Both reviewers failed (A=$exit_ra, B=$exit_rb)" "Both reviewers failed. Check ${log_dir}/reviewer-*.log. Retry with --force to re-run from Phase 5"
+            _fail_phase "reviewing" "Both reviewers failed (A=$exit_ra, B=$exit_rb)" "Both reviewers failed. Check ${log_dir}/reviewer-*.log. Retry with --force to re-run from Phase 5" \
+                "unknown" "reviewer_a_exit=${exit_ra}; reviewer_b_exit=${exit_rb}"
         fi
 
         echo -e "${BLUE}Review parallel done: A=$exit_ra, B=$exit_rb${NC}"
         local has_review_a=false has_review_b=false
-        local effective_reviewer_a_engine="$ENGINE_REVIEWER_A"
-        local effective_reviewer_b_engine="$ENGINE_REVIEWER_B"
+        local effective_reviewer_a_engine="$_effective_reviewer_a_engine"
+        local effective_reviewer_b_engine="$_effective_reviewer_b_engine"
         local reviewer_a_fallback_attempted=false reviewer_b_fallback_attempted=false
         local reviewer_a_fallback_succeeded=false reviewer_b_fallback_succeeded=false
         _validate_agent_output_for_role "$reviewer_a_role" "${comp_dir}/reviewer-a.raw.md" >/dev/null 2>&1 && has_review_a=true
@@ -4272,9 +6000,12 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
 
         if [[ "$has_review_a" == false && "$has_review_b" == false ]]; then
             echo -e "${RED}Parallel review failed to produce any usable raw review artifacts${NC}"
-            set_task_status "$task_file" "blocked"
-            log_execution "$task_file" "Phase 5: Review artifacts missing (A exit ${exit_ra}, A artifact ${has_review_a}; B exit ${exit_rb}, B artifact ${has_review_b})"
-            _finalize_run_manifest "blocked" "$fix_cycle" || true
+            _fail_phase \
+                "reviewing" \
+                "Phase 5: Review artifacts missing" \
+                "Check ${log_dir}/reviewer-*.log and the raw review artifacts, then retry Phase 5" \
+                "invalid_artifact" \
+                "reviewer_a_exit=${exit_ra}; reviewer_a_artifact=${has_review_a}; reviewer_b_exit=${exit_rb}; reviewer_b_artifact=${has_review_b}" || true
             _print_cost_summary
             return 1
         fi
@@ -4286,6 +6017,8 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
             local fallback_exit=0 fallback_prepared=false fallback_start_ts=0 fallback_duration=0
             local skip_engine_fallback=false fallback_review_b_output_path="" fallback_source_engine=""
             local reviewer_a_fallback_prompt_runtime="" fallback_diag_output="" fallback_output_state="" fallback_validation_err=""
+            local _effective_reviewer_fallback_engine=""
+            local fallback_dispatch_label=""
 
             if [[ "$has_review_a" == false ]]; then
                 fallback_missing_label="reviewer-a"
@@ -4294,8 +6027,6 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                 if [[ "$ENGINE_REVIEWER_A" == "codex" ]]; then
                     fallback_engine="claude"
                 fi
-                fallback_run_role="reviewer-a-${fallback_engine}-fallback${role_suffix}"
-                fallback_log="${log_dir}/${fallback_run_role}.log"
                 fallback_output="/dev/null"
                 fallback_diag_output="${comp_dir}/reviewer-a.raw.md"
                 fallback_instruction="$review_a_instruction"
@@ -4314,8 +6045,6 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                 if [[ "$ENGINE_REVIEWER_B" == "claude" ]]; then
                     fallback_engine="codex"
                 fi
-                fallback_run_role="reviewer-b-${fallback_engine}-fallback${role_suffix}"
-                fallback_log="${log_dir}/${fallback_run_role}.log"
                 fallback_output="${comp_dir}/reviewer-b.raw.md"
                 fallback_diag_output="$fallback_output"
                 fallback_review_b_output_path="$fallback_output"
@@ -4323,7 +6052,26 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                     fallback_review_b_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
                 fi
                 fallback_instruction="Read the task file at ${task_file}. ${review_diff_context} Read ${comp_dir}/exploration-summary.md for context. Write your review to ${fallback_review_b_output_path}. This is review cycle $((fix_cycle + 1))."
-                fallback_prompt_file="$reviewer_b_prompt"
+                    fallback_prompt_file="$reviewer_b_prompt"
+            fi
+
+            _effective_reviewer_fallback_engine="$fallback_engine"
+            fallback_dispatch_label="${fallback_missing_label}-fallback"
+            _resolve_effective_engine "$fallback_engine"
+            _effective_reviewer_fallback_engine="$_V2_EFFECTIVE_ENGINE"
+            if _v2_engine_resolution_skipped_codex "$fallback_engine" "$_effective_reviewer_fallback_engine"; then
+                _v2_log_codex_circuit_breaker_trip "$task_file" "$fallback_dispatch_label"
+                _v2_append_codex_circuit_breaker_skip "phase-5" "review-cycle-$((fix_cycle+1))" "$_phase_start" "$fallback_dispatch_label"
+            fi
+            fallback_run_role="${fallback_missing_label}-${_effective_reviewer_fallback_engine}-fallback${role_suffix}"
+            fallback_log="${log_dir}/${fallback_run_role}.log"
+            if [[ "$fallback_missing_label" == "reviewer-b" ]]; then
+                if [[ "$_effective_reviewer_fallback_engine" == "codex" ]]; then
+                    fallback_review_b_output_path="$CODEX_ARTIFACT_PATH_PLACEHOLDER"
+                else
+                    fallback_review_b_output_path="$fallback_output"
+                fi
+                fallback_instruction="Read the task file at ${task_file}. ${review_diff_context} Read ${comp_dir}/exploration-summary.md for context. Write your review to ${fallback_review_b_output_path}. This is review cycle $((fix_cycle + 1))."
             fi
 
             if [[ "$fallback_source_engine" == "codex" ]]; then
@@ -4343,12 +6091,12 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                 else
                     reviewer_b_fallback_attempted=true
                 fi
-                echo -e "${YELLOW}Single reviewer available — retrying ${fallback_missing_label} once with ${fallback_engine}${NC}"
-                log_execution "$task_file" "Phase 5: ${fallback_missing_label} missing, launching ${fallback_engine} fallback"
+                echo -e "${YELLOW}Single reviewer available — retrying ${fallback_missing_label} once with ${_effective_reviewer_fallback_engine}${NC}"
+                log_execution "$task_file" "Phase 5: ${fallback_missing_label} missing, launching ${_effective_reviewer_fallback_engine} fallback"
                 if [[ "$fallback_missing_label" == "reviewer-a" ]]; then
-                    _update_run_manifest_state "phase-5" "$_diff_risk" "$_effective_reviewer_timeout" "${fallback_engine} (fallback)" "$ENGINE_REVIEWER_B" || true
+                    _update_run_manifest_state "phase-5" "$_diff_risk" "$_effective_reviewer_timeout" "${_effective_reviewer_fallback_engine} (fallback)" "$effective_reviewer_b_engine" || true
                 else
-                    _update_run_manifest_state "phase-5" "$_diff_risk" "$_effective_reviewer_timeout" "$ENGINE_REVIEWER_A" "${fallback_engine} (fallback)" || true
+                    _update_run_manifest_state "phase-5" "$_diff_risk" "$_effective_reviewer_timeout" "$effective_reviewer_a_engine" "${_effective_reviewer_fallback_engine} (fallback)" || true
                 fi
 
                 if [[ "$fallback_missing_label" == "reviewer-a" ]]; then
@@ -4358,18 +6106,21 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                     rm -f "${comp_dir}/reviewer-b.raw.md"
                 fi
 
-                if prepare_agent_request "$fallback_engine" "$fallback_prompt_file" "$fallback_instruction"; then
+                if prepare_agent_request "$_effective_reviewer_fallback_engine" "$fallback_prompt_file" "$fallback_instruction"; then
                     fallback_prepared=true
                     fallback_prompt_body="$AGENT_PROMPT_BODY"
                     fallback_sysprompt="$AGENT_SYSTEM_PROMPT"
                     fallback_start_ts=$(date +%s)
-                    run_agent "$fallback_run_role" "$fallback_engine" "$fallback_prompt_body" "$fallback_sysprompt" \
+                    run_agent "$fallback_run_role" "$_effective_reviewer_fallback_engine" "$fallback_prompt_body" "$fallback_sysprompt" \
                         "$fallback_output" "$fallback_log" "$_effective_reviewer_timeout" "100"
                     fallback_exit=$?
+                    if [[ "$_effective_reviewer_fallback_engine" == "codex" ]]; then
+                        _v2_record_codex_outcome "$_effective_reviewer_fallback_engine" "$fallback_exit"
+                    fi
                     fallback_duration=$(( $(date +%s) - fallback_start_ts ))
                     (( fallback_duration < 0 )) && fallback_duration=0
                 else
-                    log_execution "$task_file" "Phase 5: Failed to assemble ${fallback_engine} fallback prompt for ${fallback_missing_label}"
+                    log_execution "$task_file" "Phase 5: Failed to assemble ${_effective_reviewer_fallback_engine} fallback prompt for ${fallback_missing_label}"
                 fi
 
                 _merge_cost_csvs || true
@@ -4377,7 +6128,7 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                 if [[ "$fallback_missing_label" == "reviewer-a" ]]; then
                     if fallback_validation_err=$(_capture_reviewer_a_raw_artifact "$task_file" "${comp_dir}/reviewer-a.raw.md" 2>&1 1>/dev/null); then
                         reviewer_a_fallback_succeeded=true
-                        effective_reviewer_a_engine="${fallback_engine} (fallback)"
+                        effective_reviewer_a_engine="${_effective_reviewer_fallback_engine} (fallback)"
                     else
                         fallback_output_state=$(_describe_artifact_state "$fallback_diag_output")
                     fi
@@ -4401,7 +6152,7 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
                         fi
                     fi
                     if [[ "$reviewer_b_fallback_succeeded" == true ]]; then
-                        effective_reviewer_b_engine="${fallback_engine} (fallback)"
+                        effective_reviewer_b_engine="${_effective_reviewer_fallback_engine} (fallback)"
                     fi
                 fi
 
@@ -4481,8 +6232,12 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
             _atomic_write "${comp_dir}/.review-mapping" "review-a=absent review-b=reviewer-b.raw"
         fi
         _snapshot_review_cycle_artifacts "$((fix_cycle + 1))" || {
-            set_task_status "$task_file" "blocked"
-            log_execution "$task_file" "Phase 5: Failed to snapshot per-cycle review artifacts"
+            _fail_phase \
+                "reviewing" \
+                "Phase 5: Failed to snapshot per-cycle review artifacts" \
+                "Check review-a.md, review-b.md, and .review-mapping, then retry the review snapshot step" \
+                "invalid_artifact" \
+                "phase=phase-5; step=_snapshot_review_cycle_artifacts; cycle=$((fix_cycle + 1))" || true
             _print_cost_summary
             return 1
         }
@@ -4544,6 +6299,9 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
         echo -e "${BLUE}=== Phase 6: Review Evaluation (cycle $((fix_cycle + 1))) ===${NC}"
         local _phase6_start=""
         _phase6_start=$(_iso_timestamp)
+        _FAIL_PHASE_PHASE_ID="phase-6a"
+        _FAIL_PHASE_PHASE_NAME="review-eval-cycle-$((fix_cycle + 1))"
+        _FAIL_PHASE_PHASE_STARTED_AT="$_phase6_start"
         _update_run_manifest_state "phase-6a" "$_diff_risk" "$_effective_reviewer_timeout" || true
         set_task_status "$task_file" "in progress"
         log_execution "$task_file" "Phase 6: Review evaluation started (cycle $((fix_cycle + 1)))"
@@ -4554,25 +6312,44 @@ If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_
         [[ -f "${comp_dir}/review-b.md" ]] && review_inputs="${review_inputs}- ${comp_dir}/review-b.md"$'\n'
         local review_eval_instruction="The task file is ${task_file}. Read ${comp_dir}/exploration-summary.md and the available review inputs:
 ${review_inputs}Synthesize only the review files that exist and write the result to ${comp_dir}/review-synthesis.md."
-        prepare_agent_request "$ENGINE_EVALUATOR" "$review_evaluator_prompt" "$review_eval_instruction" || {
-            _fail_phase "evaluating-reviews" "Failed to assemble review evaluator prompt" "Check ${comp_dir}/review-a.md and ${comp_dir}/review-b.md for review content. Agent log: ${log_dir}/${review_evaluator_role}.log"
+        # TODO: refine error_class if Phase 6 prompt assembly failures split into stable categories.
+        local _requested_review_evaluator_engine="$ENGINE_EVALUATOR"
+        local _effective_review_evaluator_engine="$ENGINE_EVALUATOR"
+        _resolve_effective_engine "$_requested_review_evaluator_engine"
+        _effective_review_evaluator_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_review_evaluator_engine" "$_effective_review_evaluator_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "phase-6 review synthesis"
+            _v2_append_codex_circuit_breaker_skip "phase-6a" "review-eval-cycle-$((fix_cycle+1))" "$_phase6_start" "phase-6-review-synthesis"
+        fi
+        prepare_agent_request "$_effective_review_evaluator_engine" "$review_evaluator_prompt" "$review_eval_instruction" || {
+            _fail_phase "evaluating-reviews" "Failed to assemble review evaluator prompt" "Check ${comp_dir}/review-a.md and ${comp_dir}/review-b.md for review content. Agent log: ${log_dir}/${review_evaluator_role}.log" \
+                "unknown" "role=review-evaluator; step=prepare_agent_request"
         }
 
         local exit_review_eval=0
         rm -f "${comp_dir}/review-synthesis.contract.json"
-        run_agent "$review_evaluator_role" "$ENGINE_EVALUATOR" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+        run_agent "$review_evaluator_role" "$_effective_review_evaluator_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
             "${comp_dir}/review-synthesis.md" "${log_dir}/${review_evaluator_role}.log" \
             "$SYNTHESIZE_TIMEOUT" "100" || exit_review_eval=$?
+        if [[ "$_effective_review_evaluator_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_review_evaluator_engine" "$exit_review_eval"
+        fi
 
         if [[ "$exit_review_eval" -ne 0 ]]; then
+            local review_eval_error_class=""
+            local review_eval_error_message=""
+            review_eval_error_class=$(_classify_agent_exit_error_class "$_effective_review_evaluator_engine" "$exit_review_eval" "${log_dir}/${review_evaluator_role}.log")
             if [[ "$exit_review_eval" -eq 124 ]]; then
-                echo -e "${RED}Phase 6 review evaluation timed out (${SYNTHESIZE_TIMEOUT})${NC}"
-                log_execution "$task_file" "Phase 6: Review evaluation timed out (${SYNTHESIZE_TIMEOUT})"
+                review_eval_error_message="Phase 6: Review evaluation timed out (${SYNTHESIZE_TIMEOUT})"
             else
-                echo -e "${RED}Phase 6 review evaluation failed (exit $exit_review_eval)${NC}"
-                log_execution "$task_file" "Phase 6: Review evaluation FAILED (exit $exit_review_eval)"
+                review_eval_error_message="Phase 6: Review evaluation FAILED (exit $exit_review_eval)"
             fi
-            set_task_status "$task_file" "blocked"
+            _fail_phase \
+                "evaluating-reviews" \
+                "$review_eval_error_message" \
+                "Check ${log_dir}/${review_evaluator_role}.log and retry the review evaluation step" \
+                "$review_eval_error_class" \
+                "role=${review_evaluator_role}; engine=${_effective_review_evaluator_engine}; exit_code=${exit_review_eval}; log=${log_dir}/${review_evaluator_role}.log" || true
             _print_cost_summary
             return 1
         fi
@@ -4587,9 +6364,12 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local review_verdict=""
         review_verdict=$(_parse_contract "${comp_dir}/review-synthesis.md" "verdict")
         if [[ -z "$review_verdict" ]]; then
-            echo -e "${RED}Phase 6 review evaluation produced no verdict${NC}"
-            set_task_status "$task_file" "blocked"
-            log_execution "$task_file" "Phase 6: Review evaluation missing verdict"
+            _fail_phase \
+                "evaluating-reviews" \
+                "Phase 6 review evaluation produced no verdict" \
+                "Check ${comp_dir}/review-synthesis.md and review-synthesis.contract.json, then retry" \
+                "invalid_artifact" \
+                "artifact=${comp_dir}/review-synthesis.contract.json; field=verdict; value=empty" || true
             _print_cost_summary
             return 1
         fi
@@ -4598,15 +6378,19 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         if [[ "$review_verdict" == "PASS" ]]; then
             set_task_status "$task_file" "needs verification"
             log_execution "$task_file" "Pipeline complete: review synthesis PASS"
-            _append_manifest_phase "phase-6" "review-eval-cycle-$((fix_cycle+1))" "$_phase6_start" "$(_iso_timestamp)" "completed" "PASS" || true
+            _append_manifest_phase "phase-6a" "review-eval-cycle-$((fix_cycle+1))" "$_phase6_start" "$(_iso_timestamp)" "completed" "PASS" || true
             pipeline_finished=true
             pipeline_success=true
             break
         fi
 
         if [[ "$review_verdict" != "CONDITIONAL" && "$review_verdict" != "FAIL" ]]; then
-            echo -e "${RED}Unexpected review verdict: $review_verdict${NC}"
-            set_task_status "$task_file" "blocked"
+            _fail_phase \
+                "evaluating-reviews" \
+                "Unexpected review verdict: $review_verdict" \
+                "Check ${comp_dir}/review-synthesis.md and review-synthesis.contract.json, then retry" \
+                "invalid_artifact" \
+                "artifact=${comp_dir}/review-synthesis.contract.json; field=verdict; value=${review_verdict}" || true
             _print_cost_summary
             return 1
         fi
@@ -4637,6 +6421,9 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local _phase6b_start=""
         _phase6b_start=$(_iso_timestamp)
         echo -e "${BLUE}=== Phase 6: Author Fix Plan (cycle $((fix_cycle + 1))) ===${NC}"
+        _FAIL_PHASE_PHASE_ID="phase-6b"
+        _FAIL_PHASE_PHASE_NAME="fix-plan-author-cycle-$((fix_cycle + 1))"
+        _FAIL_PHASE_PHASE_STARTED_AT="$_phase6b_start"
         _update_run_manifest_state "phase-6b" "$_diff_risk" "$_effective_reviewer_timeout" || true
         cost_gate_result=0
         _check_cost_ceiling "$task_file" "$comp_dir" "$fix_cycle" || cost_gate_result=$?
@@ -4658,25 +6445,43 @@ ${review_inputs}Synthesize only the review files that exist and write the result
 
         local fix_plan_author_role="fix-plan-author${role_suffix}"
         local fix_plan_instruction="The task file is ${task_file}. Read ${comp_dir}/review-synthesis.md and write the fix plan to ${comp_dir}/fix-plan.md."
-        prepare_agent_request "$ENGINE_EVALUATOR" "$fix_plan_author_prompt" "$fix_plan_instruction" || {
-            _fail_phase "authoring-fix-plan" "Failed to assemble fix-plan-author prompt" "Check ${comp_dir}/review-synthesis.md for synthesis verdict. Agent log: ${log_dir}/${fix_plan_author_role}.log"
+        local _requested_fix_plan_author_engine="$ENGINE_EVALUATOR"
+        local _effective_fix_plan_author_engine="$ENGINE_EVALUATOR"
+        _resolve_effective_engine "$_requested_fix_plan_author_engine"
+        _effective_fix_plan_author_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_fix_plan_author_engine" "$_effective_fix_plan_author_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "phase-6 fix-plan author"
+            _v2_append_codex_circuit_breaker_skip "phase-6b" "fix-plan-author-cycle-$((fix_cycle+1))" "$_phase6b_start" "phase-6-fix-plan-author"
+        fi
+        prepare_agent_request "$_effective_fix_plan_author_engine" "$fix_plan_author_prompt" "$fix_plan_instruction" || {
+            _fail_phase "authoring-fix-plan" "Failed to assemble fix-plan-author prompt" "Check ${comp_dir}/review-synthesis.md for synthesis verdict. Agent log: ${log_dir}/${fix_plan_author_role}.log" \
+                "unknown" "role=fix-plan-author; step=prepare_agent_request"
         }
 
         local exit_fix_plan=0
         rm -f "${comp_dir}/fix-plan.contract.json"
-        run_agent "$fix_plan_author_role" "$ENGINE_EVALUATOR" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+        run_agent "$fix_plan_author_role" "$_effective_fix_plan_author_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
             "${comp_dir}/fix-plan.md" "${log_dir}/${fix_plan_author_role}.log" \
             "$EVALUATE_TIMEOUT" "100" || exit_fix_plan=$?
+        if [[ "$_effective_fix_plan_author_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_fix_plan_author_engine" "$exit_fix_plan"
+        fi
 
         if [[ "$exit_fix_plan" -ne 0 ]]; then
+            local fix_plan_error_class=""
+            local fix_plan_error_message=""
+            fix_plan_error_class=$(_classify_agent_exit_error_class "$_effective_fix_plan_author_engine" "$exit_fix_plan" "${log_dir}/${fix_plan_author_role}.log")
             if [[ "$exit_fix_plan" -eq 124 ]]; then
-                echo -e "${RED}Phase 6 fix-plan-author timed out (${EVALUATE_TIMEOUT})${NC}"
-                log_execution "$task_file" "Phase 6: Fix plan author timed out (${EVALUATE_TIMEOUT})"
+                fix_plan_error_message="Phase 6: Fix plan author timed out (${EVALUATE_TIMEOUT})"
             else
-                echo -e "${RED}Phase 6 fix-plan-author failed (exit $exit_fix_plan)${NC}"
-                log_execution "$task_file" "Phase 6: Fix plan author FAILED (exit $exit_fix_plan)"
+                fix_plan_error_message="Phase 6: Fix plan author FAILED (exit $exit_fix_plan)"
             fi
-            set_task_status "$task_file" "blocked"
+            _fail_phase \
+                "authoring-fix-plan" \
+                "$fix_plan_error_message" \
+                "Check ${log_dir}/${fix_plan_author_role}.log and retry the fix-plan authoring step" \
+                "$fix_plan_error_class" \
+                "role=${fix_plan_author_role}; engine=${_effective_fix_plan_author_engine}; exit_code=${exit_fix_plan}; log=${log_dir}/${fix_plan_author_role}.log" || true
             _print_cost_summary
             return 1
         fi
@@ -4692,9 +6497,12 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local fix_plan_ready_upper=""
         fix_plan_ready_upper=$(echo "$fix_plan_ready" | tr '[:lower:]' '[:upper:]')
         if _strict_contract_mode && [[ "$fix_plan_ready_upper" != "YES" && "$fix_plan_ready_upper" != "NO" ]]; then
-            echo -e "${RED}Strict mode requires fix-plan.contract.json ready=true|false${NC}"
-            set_task_status "$task_file" "blocked"
-            log_execution "$task_file" "Phase 6: Strict contract failure for fix-plan ready signal"
+            _fail_phase \
+                "authoring-fix-plan" \
+                "Strict mode requires fix-plan.contract.json ready=true|false" \
+                "Check ${comp_dir}/fix-plan.md and fix-plan.contract.json, then retry" \
+                "invalid_artifact" \
+                "artifact=${comp_dir}/fix-plan.contract.json; field=ready; value=${fix_plan_ready:-empty}" || true
             _print_cost_summary
             return 1
         fi
@@ -4722,8 +6530,19 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local fix_critic_prefix="fix-critic${role_suffix}"
         local fix_critic_result=0
         echo -e "${BLUE}=== Phase 6: Critique Fix Plan (cycle $((fix_cycle + 1))) ===${NC}"
+        _FAIL_PHASE_PHASE_ID="phase-6c"
+        _FAIL_PHASE_PHASE_NAME="fix-plan-critic-cycle-$((fix_cycle + 1))"
+        _FAIL_PHASE_PHASE_STARTED_AT="$_phase6c_start"
         _update_run_manifest_state "phase-6c" "$_diff_risk" "$_effective_reviewer_timeout" || true
-        run_critic_loop "$task_file" "$comp_dir" "$critic_prompt" "$reviser_prompt" "${comp_dir}/fix-plan.md" "${comp_dir}/fix-critique.md" 3 "$fix_critic_prefix" "needs verification" "$ENGINE_CRITIC" || fix_critic_result=$?
+        local _requested_fix_critic_engine="$ENGINE_CRITIC"
+        local _effective_fix_critic_engine="$ENGINE_CRITIC"
+        _resolve_effective_engine "$_requested_fix_critic_engine"
+        _effective_fix_critic_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_fix_critic_engine" "$_effective_fix_critic_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "$fix_critic_prefix"
+            _v2_append_codex_circuit_breaker_skip "phase-6c" "fix-plan-critic-cycle-$((fix_cycle+1))" "$_phase6c_start" "$fix_critic_prefix"
+        fi
+        run_critic_loop "$task_file" "$comp_dir" "$critic_prompt" "$reviser_prompt" "${comp_dir}/fix-plan.md" "${comp_dir}/fix-critique.md" 3 "$fix_critic_prefix" "needs verification" "$_effective_fix_critic_engine" || fix_critic_result=$?
         case "$fix_critic_result" in
             0)
                 set_task_status "$task_file" "in progress"
@@ -4754,6 +6573,9 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         echo -e "${BLUE}=== Phase 7: Execute Review Fixes (cycle $((fix_cycle + 1))) ===${NC}"
         local _phase7_start=""
         _phase7_start=$(_iso_timestamp)
+        _FAIL_PHASE_PHASE_ID="phase-7"
+        _FAIL_PHASE_PHASE_NAME="fix-exec-cycle-$((fix_cycle + 1))"
+        _FAIL_PHASE_PHASE_STARTED_AT="$_phase7_start"
         _update_run_manifest_state "phase-7" "$_diff_risk" "$_effective_reviewer_timeout" || true
         cost_gate_result=0
         _check_cost_ceiling "$task_file" "$comp_dir" "$fix_cycle" || cost_gate_result=$?
@@ -4782,22 +6604,94 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local pre_fix_dirty=""
         pre_fix_dirty=$(_v2_snapshot_dirty_files)
         local fix_executor_role="fix-executor${role_suffix}"
+        # TODO: refine error_class for Phase 7 setup failures if git/worktree helpers return structured causes.
         if ! _normalize_verify_tags_with_timeout_in_file "${comp_dir}/fix-plan.md" "V2 phase 7 fix plan"; then
-            _fail_phase "executing-fixes" "Failed to wrap repo-standard pytest verification commands in fix-plan.md" "Check ${comp_dir}/fix-plan.md for verify tag formatting drift, then retry"
+            _fail_phase "executing-fixes" "Failed to wrap repo-standard pytest verification commands in fix-plan.md" "Check ${comp_dir}/fix-plan.md for verify tag formatting drift, then retry" \
+                "unknown" "artifact=${comp_dir}/fix-plan.md; step=normalize_verify_tags"
             return 1
         fi
         if ! _validate_verify_commands_in_file "${comp_dir}/fix-plan.md" "V2 phase 7 fix plan"; then
-            _fail_phase "executing-fixes" "Invalid verify commands found in fix-plan.md" "Check ${comp_dir}/fix-plan.md for bad verify commands, then retry"
+            _fail_phase "executing-fixes" "Invalid verify commands found in fix-plan.md" "Check ${comp_dir}/fix-plan.md for bad verify commands, then retry" \
+                "unknown" "artifact=${comp_dir}/fix-plan.md; step=validate_verify_commands"
             return 1
         fi
-        local fix_exec_instruction="The task file is ${task_file}. Read ${comp_dir}/review-synthesis.md and ${comp_dir}/fix-plan.md. Execute the planned fixes and write execution progress to ${comp_dir}/fix-execution.md. If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_message) - <command>' and stop immediately."
-        prepare_agent_request "$ENGINE_FIX" "$fix_executor_prompt" "$fix_exec_instruction" || {
-            _fail_phase "executing-fixes" "Failed to assemble fix-executor prompt" "See ${comp_dir}/fix-execution.md for blocking issues. Address manually, then retry"
-        }
-
         # Create isolated worktree for fix execution
         _v2_create_execution_worktree || {
-            _fail_phase "executing-fixes" "Failed to create fix execution worktree" "Check disk space and git state"
+            _fail_phase "executing-fixes" "Failed to create fix execution worktree" "Check disk space and git state" \
+                "unknown" "step=_v2_create_execution_worktree"
+            return 1
+        }
+        _v2_stage_execution_runtime_task_file "$task_file" || {
+            _fail_phase "executing-fixes" "Failed to stage runtime task file into worktree" "Check worktree path permissions and task artifacts, then retry" \
+                "unknown" "artifact=${task_file}; step=_v2_stage_execution_runtime_task_file"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        _v2_stage_execution_worktree_files "${comp_dir}/review-synthesis.md" "${comp_dir}/fix-plan.md" || {
+            _fail_phase "executing-fixes" "Failed to stage fix context into worktree" "Check worktree path permissions and fix artifacts, then retry" \
+                "unknown" "artifacts=${comp_dir}/review-synthesis.md,${comp_dir}/fix-plan.md; step=_v2_stage_execution_worktree_files"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        if [[ -f "${comp_dir}/fix-execution.md" ]]; then
+            _v2_stage_execution_worktree_file "${comp_dir}/fix-execution.md" || {
+                _fail_phase "executing-fixes" "Failed to stage fix execution log into worktree" "Check worktree path permissions and fix artifacts, then retry" \
+                    "unknown" "artifact=${comp_dir}/fix-execution.md; step=_v2_stage_execution_worktree_file"
+                _v2_save_worktree_diff || true
+                _v2_cleanup_execution_worktree || true
+                return 1
+            }
+        fi
+        # Pre-stage baseline diff if worktree is missing expected changes
+        _v2_prestage_baseline_diff_if_missing "$comp_dir" || {
+            log_execution "$task_file" "Phase 7: WARN — baseline diff pre-staging failed; fix-executor may report BLOCKED"
+        }
+        local fix_task_rel=""
+        local fix_review_rel=""
+        local fix_plan_rel=""
+        local fix_execution_rel=""
+        local pre_fix_execution_bytes=0
+        local post_fix_execution_bytes=0
+        local fix_execution_activity="false"
+        pre_fix_execution_bytes=$(_v2_file_size_bytes "${comp_dir}/fix-execution.md")
+        fix_task_rel=$(_v2_execution_runtime_task_rel_path)
+        fix_review_rel=$(_v2_main_repo_relative_path "${comp_dir}/review-synthesis.md") || {
+            _fail_phase "executing-fixes" "Failed to resolve worktree-local review synthesis path" "Check fix artifact location, then retry" \
+                "unknown" "artifact=${comp_dir}/review-synthesis.md; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        fix_plan_rel=$(_v2_main_repo_relative_path "${comp_dir}/fix-plan.md") || {
+            _fail_phase "executing-fixes" "Failed to resolve worktree-local fix plan path" "Check fix artifact location, then retry" \
+                "unknown" "artifact=${comp_dir}/fix-plan.md; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        fix_execution_rel=$(_v2_main_repo_relative_path "${comp_dir}/fix-execution.md") || {
+            _fail_phase "executing-fixes" "Failed to resolve worktree-local fix execution path" "Check fix artifact location, then retry" \
+                "unknown" "artifact=${comp_dir}/fix-execution.md; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        local fix_exec_instruction="The task file is ${fix_task_rel}. Your project root is the current working directory (${_V2_EXEC_WORKTREE_PATH}). Read ${fix_review_rel} and ${fix_plan_rel}. Execute the planned fixes and write execution progress to ${fix_execution_rel}. All repo file reads and writes must stay inside the current working directory. Do not use absolute paths under ${SCRIPT_DIR}. If any verification command exits 124, append 'BLOCKED: $(_verification_timeout_message) - <command>' and stop immediately."
+        local _requested_fix_executor_engine="$ENGINE_FIX"
+        local _effective_fix_executor_engine="$ENGINE_FIX"
+        _resolve_effective_engine "$_requested_fix_executor_engine"
+        _effective_fix_executor_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_fix_executor_engine" "$_effective_fix_executor_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "$fix_executor_role"
+            _v2_append_codex_circuit_breaker_skip "phase-7" "$fix_executor_role" "$_phase7_start" "$fix_executor_role"
+        fi
+        prepare_agent_request "$_effective_fix_executor_engine" "$fix_executor_prompt" "$fix_exec_instruction" || {
+            _fail_phase "executing-fixes" "Failed to assemble fix-executor prompt" "See ${comp_dir}/fix-execution.md for blocking issues. Address manually, then retry" \
+                "unknown" "role=fix-executor; step=prepare_agent_request"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
             return 1
         }
         cd "$_V2_EXEC_WORKTREE_PATH"
@@ -4806,15 +6700,55 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local pre_fix_timeout_blocks=0
         local post_fix_timeout_blocks=0
         local fix_timeout_block_detected=false
+        local phase7_handoff_status_file=""
+        local phase7_handoff_status=""
+        local phase7_handoff_poll_pid=""
         rm -f "${comp_dir}/fix-execution.contract.json"
         pre_fix_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/fix-execution.md")
         touch "${log_dir}/${fix_executor_role}.log"
+        phase7_handoff_status_file=$(mktemp "${TMPDIR:-/tmp}/lauren-loop-phase7-handoff.XXXXXX") || {
+            _fail_phase "executing-fixes" "Failed to create Phase 7 handoff tracker" "Check tmpdir permissions, then retry" \
+                "unknown" "step=mktemp_phase7_handoff_status_file"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
         start_agent_monitor "${log_dir}/${fix_executor_role}.log" "$task_file"
-        run_agent "$fix_executor_role" "$ENGINE_FIX" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+        run_agent "$fix_executor_role" "$_effective_fix_executor_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
             "/dev/null" "${log_dir}/${fix_executor_role}.log" \
-            "$EXECUTOR_TIMEOUT" "300" "WebFetch,WebSearch" || exit_fix_exec=$?
+            "$EXECUTOR_TIMEOUT" "300" "WebFetch,WebSearch" &
+        local pid_fix_exec=$!
+        _phase7_poll_fix_execution_handoff "$comp_dir" "$pid_fix_exec" "$phase7_handoff_status_file" \
+            "${log_dir}/${fix_executor_role}.log" &
+        phase7_handoff_poll_pid=$!
+        wait "$pid_fix_exec" || exit_fix_exec=$?
+        phase7_handoff_status=$(tr -d '[:space:]' < "$phase7_handoff_status_file" 2>/dev/null || true)
+        if [[ -n "$phase7_handoff_poll_pid" ]]; then
+            if [[ -n "$phase7_handoff_status" ]]; then
+                wait "$phase7_handoff_poll_pid" 2>/dev/null || true
+            else
+                kill "$phase7_handoff_poll_pid" 2>/dev/null || true
+                wait "$phase7_handoff_poll_pid" 2>/dev/null || true
+            fi
+        fi
         stop_agent_monitor
+        if [[ "$_effective_fix_executor_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_fix_executor_engine" "$exit_fix_exec"
+        fi
+        _phase7_sync_fix_execution_artifacts "$comp_dir" || {
+            rm -f "$phase7_handoff_status_file"
+            _fail_phase "executing-fixes" "Failed to sync fix execution artifacts from worktree" "Inspect worktree fix artifacts, then retry" \
+                "unknown" "artifact=${comp_dir}/fix-execution.md; step=_phase7_sync_fix_execution_artifacts"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        rm -f "$phase7_handoff_status_file"
         post_fix_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/fix-execution.md")
+        post_fix_execution_bytes=$(_v2_file_size_bytes "${comp_dir}/fix-execution.md")
+        if [[ "${post_fix_execution_bytes:-0}" -gt "${pre_fix_execution_bytes:-0}" ]]; then
+            fix_execution_activity="true"
+        fi
         if [[ "${post_fix_timeout_blocks:-0}" -gt "${pre_fix_timeout_blocks:-0}" ]]; then
             fix_timeout_block_detected=true
             printf '{"status":"BLOCKED"}\n' > "${comp_dir}/fix-execution.contract.json"
@@ -4826,20 +6760,35 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local fix_exec_status=""
         if [[ "$fix_timeout_block_detected" == true ]]; then
             fix_exec_status="BLOCKED"
+        elif [[ -n "$phase7_handoff_status" ]]; then
+            fix_exec_status="$phase7_handoff_status"
         else
-            fix_exec_status=$(_parse_contract "${comp_dir}/fix-execution.md" "status")
+            fix_exec_status=$(_phase7_read_status_signal "${comp_dir}/fix-execution.md")
         fi
         local fix_exec_status_upper=""
         fix_exec_status_upper=$(echo "$fix_exec_status" | tr '[:lower:]' '[:upper:]')
-        if _strict_contract_mode && [[ "$fix_exec_status_upper" != "COMPLETE" && "$fix_exec_status_upper" != "BLOCKED" ]]; then
-            echo -e "${RED}Strict mode requires fix-execution.contract.json status=COMPLETE|BLOCKED${NC}"
-            set_task_status "$task_file" "blocked"
-            log_execution "$task_file" "Phase 7: Strict contract failure for fix-execution status signal"
+        if _strict_contract_mode && [[ "$fix_exec_status_upper" != "COMPLETE" && "$fix_exec_status_upper" != "BLOCKED" && "$fix_exec_status_upper" != "FAILED" ]]; then
+            _fail_phase \
+                "executing-fixes" \
+                "Strict mode requires fix-execution.contract.json status=COMPLETE|BLOCKED|FAILED" \
+                "Check ${comp_dir}/fix-execution.md and fix-execution.contract.json, then retry" \
+                "invalid_artifact" \
+                "artifact=${comp_dir}/fix-execution.contract.json; field=status; value=${fix_exec_status:-empty}" || true
             _print_cost_summary
+            _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
         fi
         if [[ "$fix_exec_status_upper" == "BLOCKED" ]]; then
+            local phase7_blocked_completed_at=""
+            local phase7_blocked_cost=""
+            local phase7_blocked_error_class="unknown"
+            local phase7_blocked_recovery_json="null"
+            phase7_blocked_completed_at=$(_iso_timestamp)
+            phase7_blocked_cost=$(_manifest_phase_measured_cost)
+            if [[ "$fix_timeout_block_detected" == true ]]; then
+                phase7_blocked_error_class="timeout"
+            fi
             echo -e "${YELLOW}Fix executor signaled BLOCKED — halting for human review${NC}"
             set_task_status "$task_file" "needs verification"
             log_execution "$task_file" "Phase 7: Fix executor STATUS: BLOCKED — human review required"
@@ -4847,22 +6796,66 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             _mark_fix_execution_handoff || true
             # Merge partial work back for human review
             cd "$SCRIPT_DIR"
-            _v2_merge_execution_worktree || _v2_cleanup_execution_worktree || true
+            _v2_save_worktree_diff || true
+            if ! _v2_merge_execution_worktree 2>/dev/null; then
+                if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then
+                    phase7_blocked_recovery_json=$(_v2_recovery_manifest_json)
+                    _v2_log_recovery_details "$task_file"
+                else
+                    _v2_cleanup_after_failed_merge false
+                fi
+            fi
+            # TODO: refine error_class when non-timeout Phase 7 BLOCKED signals split into stable categories.
+            _append_manifest_phase \
+                "${_FAIL_PHASE_PHASE_ID:-phase-7}" \
+                "${_FAIL_PHASE_PHASE_NAME:-fix-exec-cycle-$((fix_cycle + 1))}" \
+                "${_FAIL_PHASE_PHASE_STARTED_AT:-$phase7_blocked_completed_at}" \
+                "$phase7_blocked_completed_at" \
+                "failed" \
+                "" \
+                "$phase7_blocked_cost" \
+                "$phase7_blocked_error_class" \
+                "status_signal=BLOCKED; timeout_block_detected=${fix_timeout_block_detected}; handoff_status=${phase7_handoff_status:-none}" \
+                "$phase7_blocked_recovery_json" || true
             pipeline_finished=true
             pipeline_human_review_halt=true
             break
         fi
+        if [[ "$fix_exec_status_upper" == "FAILED" ]]; then
+            _fail_phase \
+                "executing-fixes" \
+                "Phase 7: Fix executor STATUS: FAILED" \
+                "Check ${comp_dir}/fix-execution.md and fix-execution.contract.json, then retry" \
+                "invalid_artifact" \
+                "status_signal=FAILED; handoff_status=${phase7_handoff_status:-none}" || true
+            _print_cost_summary
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        fi
+
+        if [[ "$phase7_handoff_status" == "COMPLETE" ]]; then
+            exit_fix_exec=0
+            log_execution "$task_file" "Phase 7: Early handoff detected from synced fix-execution.contract.json (STATUS: COMPLETE)"
+        fi
 
         if [[ "$exit_fix_exec" -ne 0 ]]; then
+            local fix_exec_error_class=""
+            local fix_exec_error_message=""
+            fix_exec_error_class=$(_classify_agent_exit_error_class "$_effective_fix_executor_engine" "$exit_fix_exec" "${log_dir}/${fix_executor_role}.log")
             if [[ "$exit_fix_exec" -eq 124 ]]; then
-                echo -e "${RED}Phase 7 timed out (${EXECUTOR_TIMEOUT})${NC}"
-                log_execution "$task_file" "Phase 7: Fix execution timed out (${EXECUTOR_TIMEOUT})"
+                fix_exec_error_message="Phase 7: Fix execution timed out (${EXECUTOR_TIMEOUT})"
             else
-                echo -e "${RED}Phase 7 failed (exit $exit_fix_exec)${NC}"
-                log_execution "$task_file" "Phase 7: Fix execution FAILED (exit $exit_fix_exec)"
+                fix_exec_error_message="Phase 7: Fix execution FAILED (exit $exit_fix_exec)"
             fi
-            set_task_status "$task_file" "blocked"
+            _fail_phase \
+                "executing-fixes" \
+                "$fix_exec_error_message" \
+                "Check ${log_dir}/${fix_executor_role}.log and retry the fix execution step" \
+                "$fix_exec_error_class" \
+                "role=${fix_executor_role}; engine=${_effective_fix_executor_engine}; exit_code=${exit_fix_exec}; log=${log_dir}/${fix_executor_role}.log" || true
             _print_cost_summary
+            _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
         fi
@@ -4890,36 +6883,729 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             "$((fix_cycle + 1))"
         _v2_log_capture_scope_details "$task_file" "Phase 7"
         if [[ ! -s "$latest_fix_diff" ]]; then
+            _log_diagnostic_lines "$task_file" "$(_v2_phase_execution_diagnostic_lines "$fix_execution_activity" "${comp_dir}/fix-execution.md" "$latest_fix_diff")"
             if _strict_contract_mode; then
-                echo -e "${RED}Strict mode requires a non-empty fix execution diff${NC}"
-                set_task_status "$task_file" "blocked"
-                log_execution "$task_file" "Phase 7: Strict mode blocked empty fix execution diff"
+                local phase7_strict_empty_diff_message=""
+                if [[ "$fix_execution_activity" == "true" ]]; then
+                    echo -e "${RED}Fix execution activity detected but execution worktree is clean${NC}"
+                    log_execution "$task_file" "Phase 7: Fix execution activity detected but execution worktree is clean — suspected out-of-worktree write or non-persisted fix change"
+                    phase7_strict_empty_diff_message="Phase 7: Fix execution activity detected but execution worktree is clean — suspected out-of-worktree write or non-persisted fix change"
+                else
+                    echo -e "${RED}Strict mode requires a non-empty fix execution diff${NC}"
+                    log_execution "$task_file" "Phase 7: Strict mode blocked empty fix execution diff"
+                    phase7_strict_empty_diff_message="Phase 7: Strict mode blocked empty fix execution diff"
+                fi
+                _fail_phase \
+                    "executing-fixes" \
+                    "$phase7_strict_empty_diff_message" \
+                    "Inspect ${comp_dir}/fix-execution.md and the phase-7 scope plan, then retry after keeping fix writes in scope" \
+                    "scope_violation" \
+                    "phase=phase-7; strict_mode=true; activity_detected=${fix_execution_activity}; diff=${latest_fix_diff}" || true
                 _print_cost_summary
+                _v2_save_worktree_diff || true
                 _v2_cleanup_execution_worktree || true
                 return 1
             fi
-            echo -e "${YELLOW}WARN: Fix execution diff is empty after cycle $((fix_cycle + 1))${NC}"
-            log_execution "$task_file" "Phase 7: Fix execution diff captured but empty"
+            if [[ "$fix_execution_activity" == "true" ]]; then
+                local phase7_clean_worktree_completed_at=""
+                local phase7_clean_worktree_cost=""
+                phase7_clean_worktree_completed_at=$(_iso_timestamp)
+                phase7_clean_worktree_cost=$(_manifest_phase_measured_cost)
+                _append_manifest_phase \
+                    "${_FAIL_PHASE_PHASE_ID:-phase-7}" \
+                    "${_FAIL_PHASE_PHASE_NAME:-fix-exec-cycle-$((fix_cycle + 1))}" \
+                    "${_FAIL_PHASE_PHASE_STARTED_AT:-$phase7_clean_worktree_completed_at}" \
+                    "$phase7_clean_worktree_completed_at" \
+                    "failed" \
+                    "" \
+                    "$phase7_clean_worktree_cost" \
+                    "scope_violation" \
+                    "phase=phase-7; activity_detected=true; worktree=clean; diff=${latest_fix_diff}" || true
+                echo -e "${RED}Phase 7: Fix execution activity detected but worktree is clean — halting (suspected out-of-worktree write)${NC}"
+                log_execution "$task_file" "Phase 7: HALTED — fix execution activity detected but execution worktree is clean after cycle $((fix_cycle + 1)). Suspected out-of-worktree write or non-persisted fix change."
+                set_task_status "$task_file" "needs verification"
+                _write_human_review_handoff "BLOCKED" "$((fix_cycle + 1))" || true
+                _mark_fix_execution_handoff || true
+                cd "$SCRIPT_DIR"
+                _v2_save_worktree_diff || true
+                if ! _v2_merge_execution_worktree 2>/dev/null; then
+                    if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then
+                        _v2_log_recovery_details "$task_file"
+                    else
+                        _v2_cleanup_after_failed_merge false
+                    fi
+                fi
+                pipeline_finished=true
+                pipeline_human_review_halt=true
+                break
+            else
+                echo -e "${YELLOW}WARN: Fix execution diff is empty after cycle $((fix_cycle + 1))${NC}"
+                log_execution "$task_file" "Phase 7: Fix execution diff captured but empty"
+            fi
         else
             log_execution "$task_file" "Phase 7: Fix execution diff captured at ${latest_fix_diff}"
         fi
 
         _v2_log_out_of_scope_capture_warning "$task_file" "Phase 7" || true
         _block_on_untracked_files "$task_file" "Phase 7" "$phase7_scope_plan_file" "$pre_fix_sha" "$pre_fix_untracked" || {
+            _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
         }
 
         # Merge worktree changes back to the main branch
         cd "$SCRIPT_DIR"
+        local phase7_merge_branch=""
+        phase7_merge_branch=$(_v2_execution_merge_branch_label)
         _v2_merge_execution_worktree || {
-            _fail_phase "executing-fixes" "Failed to merge fix execution worktree" "Check for merge conflicts; resolve manually then retry"
+            _fail_phase "executing-fixes" "Failed to merge fix execution worktree" "Check for merge conflicts; resolve manually then retry" \
+                "merge_failure" "phase=phase-7; step=_v2_merge_execution_worktree; branch=${phase7_merge_branch}"
+            _v2_cleanup_after_failed_merge true
             return 1
         }
 
         _append_manifest_phase "phase-7" "fix-exec-cycle-$((fix_cycle+1))" "${_phase7_start:-$(_iso_timestamp)}" "$(_iso_timestamp)" "completed" || true
         _write_cycle_state "$comp_dir" "$fix_cycle" "phase-7" || true
+        set_task_status "$task_file" "needs verification"
+        log_execution "$task_file" "Pipeline complete: Phase 7 fix execution merged successfully"
+        _phase8_round="initial"
+        needs_phase8c=false
+        _phase8_cumulative_diff=$(git diff --stat "$_PIPELINE_PRE_SHA"..HEAD)
+        _phase8_changed_files=$(git diff --name-only "$_PIPELINE_PRE_SHA"..HEAD)
+        _resume_to_subphase="phase-8a"
         fi  # end Phase 7 skip guard
+
+        if [[ -n "$_resume_to_subphase" ]] && [[ "$_resume_to_subphase" == phase-8* ]] && [[ -z "$_phase8_cumulative_diff" && -z "$_phase8_changed_files" ]]; then
+            _phase8_cumulative_diff=$(git diff --stat "$_PIPELINE_PRE_SHA"..HEAD)
+            _phase8_changed_files=$(git diff --name-only "$_PIPELINE_PRE_SHA"..HEAD)
+        fi
+        if [[ "$_phase8_round" == "initial" ]] && [[ "$_resume_to_subphase" == "phase-8a" ]] && [[ -z "$_phase8_cumulative_diff" && -z "$_phase8_changed_files" ]]; then
+            set_task_status "$task_file" "needs verification"
+            log_execution "$task_file" "Phase 8: empty cumulative diff, skipping verification"
+            pipeline_finished=true
+            pipeline_success=true
+            fix_cycle=$((fix_cycle + 1))
+            break
+        fi
+
+        # -- Sub-phase: Phase 8a (final verify) --
+        if [[ -n "$_resume_to_subphase" ]] && [[ "$_resume_to_subphase" != "phase-8a" ]]; then
+            echo -e "${BLUE}Phase 8a: Skipped (resuming to ${_resume_to_subphase})${NC}"
+        else
+        _resume_to_subphase=""
+        local _phase8a_start=""
+        _phase8a_start=$(_iso_timestamp)
+        echo -e "${BLUE}=== Phase 8a: Final Verify (${_phase8_round}, cycle $((fix_cycle + 1))) ===${NC}"
+        _FAIL_PHASE_PHASE_ID="phase-8a"
+        _FAIL_PHASE_PHASE_NAME="final-verify-${_phase8_round}-cycle-$((fix_cycle + 1))"
+        _FAIL_PHASE_PHASE_STARTED_AT="$_phase8a_start"
+        _update_run_manifest_state "phase-8a" "$_diff_risk" "$_effective_reviewer_timeout" || true
+        cost_gate_result=0
+        _check_cost_ceiling "$task_file" "$comp_dir" "$fix_cycle" || cost_gate_result=$?
+        case "$cost_gate_result" in
+            0) ;;
+            1)
+                pipeline_finished=true
+                pipeline_human_review_halt=true
+                fix_cycle=$((fix_cycle + 1))
+                break
+                ;;
+            *)
+                set_task_status "$task_file" "blocked"
+                _print_cost_summary
+                return 1
+                ;;
+        esac
+        set_task_status "$task_file" "in progress"
+        log_execution "$task_file" "Phase 8a: Final verify started (${_phase8_round}, cycle $((fix_cycle + 1)))"
+
+        local _requested_final_verify_engine="$ENGINE_FINAL_VERIFY"
+        local _effective_final_verify_engine="$ENGINE_FINAL_VERIFY"
+        _resolve_effective_engine "$_requested_final_verify_engine"
+        _effective_final_verify_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_final_verify_engine" "$_effective_final_verify_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "phase-8a final-verify"
+            _v2_append_codex_circuit_breaker_skip "phase-8a" "final-verify-${_phase8_round}-cycle-$((fix_cycle+1))" "$_phase8a_start" "phase-8a-final-verify"
+        fi
+        local _phase8_verify_diff="${_phase8_cumulative_diff:-<empty cumulative diff>}"
+        local _phase8_verify_changed="${_phase8_changed_files:-<no changed files>}"
+        local phase8_verify_instruction="The task file is ${task_file}. Treat competitive/ as a sibling of that task file.
+Phase 8 round: ${_phase8_round}.
+Cumulative diff (${_PIPELINE_PRE_SHA}..HEAD):
+${_phase8_verify_diff}
+
+Changed files:
+${_phase8_verify_changed}
+
+Write the verification artifact to ${comp_dir}/final-verify.md and the contract sidecar to ${comp_dir}/final-verify.contract.json."
+        prepare_agent_request "$_effective_final_verify_engine" "$final_verify_prompt" "$phase8_verify_instruction" || {
+            _fail_phase "verifying-final" "Failed to assemble final-verifier prompt" "Check ${comp_dir}/final-verify.md and ${log_dir}/final-verify.log, then retry" \
+                "unknown" "role=final-verify; step=prepare_agent_request"
+            _print_cost_summary
+            return 1
+        }
+
+        local phase8_verify_role="final-verify${role_suffix}"
+        local exit_phase8a=0
+        rm -f "${comp_dir}/final-verify.contract.json"
+        run_agent "$phase8_verify_role" "$_effective_final_verify_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+            "${comp_dir}/final-verify.md" "${log_dir}/final-verify.log" \
+            "$_effective_reviewer_timeout" "100" || exit_phase8a=$?
+        if [[ "$_effective_final_verify_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_final_verify_engine" "$exit_phase8a"
+        fi
+
+        if [[ "$exit_phase8a" -ne 0 ]]; then
+            local phase8a_error_class=""
+            local phase8a_error_message=""
+            phase8a_error_class=$(_classify_agent_exit_error_class "$_effective_final_verify_engine" "$exit_phase8a" "${log_dir}/final-verify.log")
+            if [[ "$exit_phase8a" -eq 124 ]]; then
+                phase8a_error_message="Phase 8a: Final verifier timed out (${_effective_reviewer_timeout})"
+            else
+                phase8a_error_message="Phase 8a: Final verifier FAILED (exit $exit_phase8a)"
+            fi
+            _fail_phase \
+                "verifying-final" \
+                "$phase8a_error_message" \
+                "Check ${log_dir}/final-verify.log and retry the final verifier step" \
+                "$phase8a_error_class" \
+                "role=${phase8_verify_role}; engine=${_effective_final_verify_engine}; exit_code=${exit_phase8a}; log=${log_dir}/final-verify.log" || true
+            _print_cost_summary
+            return 1
+        fi
+        _require_valid_artifact \
+            "${comp_dir}/final-verify.md" \
+            "verifying-final" \
+            "Phase 8a final verifier produced an invalid verification artifact" \
+            "Check ${comp_dir}/final-verify.md and ${log_dir}/final-verify.log, then retry" || return 1
+
+        local _phase8_verdict=""
+        _phase8_verdict=$(_parse_contract "${comp_dir}/final-verify.md" "verdict")
+        if [[ "$_phase8_verdict" != "PASS" && "$_phase8_verdict" != "FAIL" && "$_phase8_verdict" != "BLOCKED" ]]; then
+            _fail_phase \
+                "verifying-final" \
+                "Phase 8a: final-verifier contract verdict must be PASS|FAIL|BLOCKED" \
+                "Check ${comp_dir}/final-verify.md and final-verify.contract.json, then retry" \
+                "invalid_artifact" \
+                "artifact=${comp_dir}/final-verify.contract.json; field=verdict; value=${_phase8_verdict:-empty}" || true
+            _print_cost_summary
+            return 1
+        fi
+
+        _append_manifest_phase "phase-8a" "final-verify-${_phase8_round}-cycle-$((fix_cycle+1))" "$_phase8a_start" "$(_iso_timestamp)" "completed" "$_phase8_verdict" || true
+        _write_cycle_state "$comp_dir" "$fix_cycle" "phase-8a" "" "$_phase8_round" "$_phase8_verdict" || true
+        if [[ "$_phase8_verdict" == "PASS" ]]; then
+            log_execution "$task_file" "Phase 8a: Final verify PASS (${_phase8_round})"
+        elif [[ "$_phase8_round" == "initial" && "$_phase8_verdict" == "FAIL" ]]; then
+            log_execution "$task_file" "Phase 8a: Final verify ${_phase8_verdict} (${_phase8_round}) — routing to final fix"
+            needs_phase8c=true
+            _resume_to_subphase="phase-8c"
+            _phase8c_source_phase="phase-8a"
+        else
+            set_task_status "$task_file" "needs verification"
+            if ! _write_phase8_human_review_handoff "phase-8a"; then
+                set_task_status "$task_file" "blocked"
+                log_execution "$task_file" "Pipeline FAILED while human-review-handoff: Failed to write Phase 8 handoff artifacts"
+                _print_cost_summary
+                return 1
+            fi
+            log_execution "$task_file" "Phase 8a: Final verify ${_phase8_verdict} (${_phase8_round}) — human review required"
+            pipeline_human_review_halt=true
+            pipeline_finished=true
+            fix_cycle=$((fix_cycle + 1))
+            break
+        fi
+        fi  # end Phase 8a skip guard
+
+        # -- Sub-phase: Phase 8b (final falsify) --
+        if [[ -n "$_resume_to_subphase" ]] && [[ "$_resume_to_subphase" != "phase-8b" ]]; then
+            echo -e "${BLUE}Phase 8b: Skipped (resuming to ${_resume_to_subphase})${NC}"
+        else
+        _resume_to_subphase=""
+        local _phase8b_start=""
+        _phase8b_start=$(_iso_timestamp)
+        echo -e "${BLUE}=== Phase 8b: Final Falsify (${_phase8_round}, cycle $((fix_cycle + 1))) ===${NC}"
+        _FAIL_PHASE_PHASE_ID="phase-8b"
+        _FAIL_PHASE_PHASE_NAME="final-falsify-${_phase8_round}-cycle-$((fix_cycle + 1))"
+        _FAIL_PHASE_PHASE_STARTED_AT="$_phase8b_start"
+        _update_run_manifest_state "phase-8b" "$_diff_risk" "$_effective_reviewer_timeout" || true
+        cost_gate_result=0
+        _check_cost_ceiling "$task_file" "$comp_dir" "$fix_cycle" || cost_gate_result=$?
+        case "$cost_gate_result" in
+            0) ;;
+            1)
+                pipeline_finished=true
+                pipeline_human_review_halt=true
+                fix_cycle=$((fix_cycle + 1))
+                break
+                ;;
+            *)
+                set_task_status "$task_file" "blocked"
+                _print_cost_summary
+                return 1
+                ;;
+        esac
+        set_task_status "$task_file" "in progress"
+        log_execution "$task_file" "Phase 8b: Final falsify started (${_phase8_round}, cycle $((fix_cycle + 1)))"
+
+        local _requested_final_falsify_engine="$ENGINE_FINAL_FALSIFY"
+        local _effective_final_falsify_engine="$ENGINE_FINAL_FALSIFY"
+        _resolve_effective_engine "$_requested_final_falsify_engine"
+        _effective_final_falsify_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_final_falsify_engine" "$_effective_final_falsify_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "phase-8b final-falsify"
+            _v2_append_codex_circuit_breaker_skip "phase-8b" "final-falsify-${_phase8_round}-cycle-$((fix_cycle+1))" "$_phase8b_start" "phase-8b-final-falsify"
+        fi
+        local _phase8_falsify_diff="${_phase8_cumulative_diff:-<empty cumulative diff>}"
+        local _phase8_falsify_changed="${_phase8_changed_files:-<no changed files>}"
+        local phase8_falsify_instruction="The task file is ${task_file}. Treat competitive/ as a sibling of that task file.
+Phase 8 round: ${_phase8_round}.
+Read competitive/final-verify.md and competitive/final-verify.contract.json before writing any tests.
+Cumulative diff (${_PIPELINE_PRE_SHA}..HEAD):
+${_phase8_falsify_diff}
+
+Changed files:
+${_phase8_falsify_changed}
+
+Write the falsification artifact to ${comp_dir}/final-falsify.md and the contract sidecar to ${comp_dir}/final-falsify.contract.json."
+        prepare_agent_request "$_effective_final_falsify_engine" "$final_falsify_prompt" "$phase8_falsify_instruction" || {
+            _fail_phase "falsifying-final" "Failed to assemble final-falsifier prompt" "Check ${comp_dir}/final-falsify.md and ${log_dir}/final-falsify.log, then retry" \
+                "unknown" "role=final-falsify; step=prepare_agent_request"
+            _print_cost_summary
+            return 1
+        }
+
+        local phase8_falsify_role="final-falsify${role_suffix}"
+        local exit_phase8b=0
+        rm -f "${comp_dir}/final-falsify.contract.json"
+        run_agent "$phase8_falsify_role" "$_effective_final_falsify_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+            "${comp_dir}/final-falsify.md" "${log_dir}/final-falsify.log" \
+            "$_effective_reviewer_timeout" "100" || exit_phase8b=$?
+        if [[ "$_effective_final_falsify_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_final_falsify_engine" "$exit_phase8b"
+        fi
+
+        if [[ "$exit_phase8b" -ne 0 ]]; then
+            local phase8b_error_class=""
+            local phase8b_error_message=""
+            phase8b_error_class=$(_classify_agent_exit_error_class "$_effective_final_falsify_engine" "$exit_phase8b" "${log_dir}/final-falsify.log")
+            if [[ "$exit_phase8b" -eq 124 ]]; then
+                phase8b_error_message="Phase 8b: Final falsifier timed out (${_effective_reviewer_timeout})"
+            else
+                phase8b_error_message="Phase 8b: Final falsifier FAILED (exit $exit_phase8b)"
+            fi
+            _fail_phase \
+                "falsifying-final" \
+                "$phase8b_error_message" \
+                "Check ${log_dir}/final-falsify.log and retry the final falsifier step" \
+                "$phase8b_error_class" \
+                "role=${phase8_falsify_role}; engine=${_effective_final_falsify_engine}; exit_code=${exit_phase8b}; log=${log_dir}/final-falsify.log" || true
+            _print_cost_summary
+            return 1
+        fi
+        _require_valid_artifact \
+            "${comp_dir}/final-falsify.md" \
+            "falsifying-final" \
+            "Phase 8b final falsifier produced an invalid falsification artifact" \
+            "Check ${comp_dir}/final-falsify.md and ${log_dir}/final-falsify.log, then retry" || return 1
+
+        local _phase8_falsify_verdict=""
+        _phase8_falsify_verdict=$(_parse_contract "${comp_dir}/final-falsify.md" "verdict")
+        if [[ "$_phase8_falsify_verdict" != "PASS" && "$_phase8_falsify_verdict" != "FAIL" && "$_phase8_falsify_verdict" != "BLOCKED" ]]; then
+            _fail_phase \
+                "falsifying-final" \
+                "Phase 8b: final-falsify contract verdict must be PASS|FAIL|BLOCKED" \
+                "Check ${comp_dir}/final-falsify.md and final-falsify.contract.json, then retry" \
+                "invalid_artifact" \
+                "artifact=${comp_dir}/final-falsify.contract.json; field=verdict; value=${_phase8_falsify_verdict:-empty}" || true
+            _print_cost_summary
+            return 1
+        fi
+
+        _append_manifest_phase "phase-8b" "final-falsify-${_phase8_round}-cycle-$((fix_cycle+1))" "$_phase8b_start" "$(_iso_timestamp)" "completed" "$_phase8_falsify_verdict" || true
+        _write_cycle_state "$comp_dir" "$fix_cycle" "phase-8b" "" "$_phase8_round" "$_phase8_falsify_verdict" || true
+        if [[ "$_phase8_falsify_verdict" == "PASS" ]]; then
+            set_task_status "$task_file" "needs verification"
+            log_execution "$task_file" "Phase 8b: Final falsify PASS (${_phase8_round}) — pipeline success"
+            pipeline_finished=true
+            pipeline_success=true
+            fix_cycle=$((fix_cycle + 1))
+            break
+        elif [[ "$_phase8_round" == "initial" && "$_phase8_falsify_verdict" == "FAIL" ]]; then
+            log_execution "$task_file" "Phase 8b: Final falsify ${_phase8_falsify_verdict} (${_phase8_round}) — routing to final fix"
+            needs_phase8c=true
+            _resume_to_subphase="phase-8c"
+            _phase8c_source_phase="phase-8b"
+        else
+            set_task_status "$task_file" "needs verification"
+            if ! _write_phase8_human_review_handoff "phase-8b"; then
+                set_task_status "$task_file" "blocked"
+                log_execution "$task_file" "Pipeline FAILED while human-review-handoff: Failed to write Phase 8 handoff artifacts"
+                _print_cost_summary
+                return 1
+            fi
+            log_execution "$task_file" "Phase 8b: Final falsify ${_phase8_falsify_verdict} (${_phase8_round}) — human review required"
+            pipeline_human_review_halt=true
+            pipeline_finished=true
+            fix_cycle=$((fix_cycle + 1))
+            break
+        fi
+        fi  # end Phase 8b skip guard
+
+        # -- Sub-phase: Phase 8c (final fix) --
+        if [[ "$needs_phase8c" == true ]]; then
+        _resume_to_subphase=""
+        local _phase8c_start=""
+        local _phase8c_predecessor="${_phase8c_source_phase:-${CYCLE_STATE_LAST_COMPLETED:-}}"
+        local _phase8c_route_label=""
+        local _phase8c_requires_falsify=false
+        local _phase8c_required_input=""
+        local _phase8c_stage_artifacts_detail=""
+        local -a _phase8c_required_inputs=()
+        _phase8c_start=$(_iso_timestamp)
+        echo -e "${BLUE}=== Phase 8c: Final Fix (cycle $((fix_cycle + 1))) ===${NC}"
+        _FAIL_PHASE_PHASE_ID="phase-8c"
+        _FAIL_PHASE_PHASE_NAME="final-fix-cycle-$((fix_cycle + 1))"
+        _FAIL_PHASE_PHASE_STARTED_AT="$_phase8c_start"
+        _update_run_manifest_state "phase-8c" "$_diff_risk" "$_effective_reviewer_timeout" || true
+        cost_gate_result=0
+        _check_cost_ceiling "$task_file" "$comp_dir" "$fix_cycle" || cost_gate_result=$?
+        case "$cost_gate_result" in
+            0) ;;
+            1)
+                pipeline_finished=true
+                pipeline_human_review_halt=true
+                fix_cycle=$((fix_cycle + 1))
+                break
+                ;;
+            *)
+                set_task_status "$task_file" "blocked"
+                _print_cost_summary
+                return 1
+                ;;
+        esac
+        _phase8c_route_label=$(_phase8c_route_label "$_phase8c_predecessor") || {
+            _fail_phase "executing-final-fix" \
+                "Unsupported Phase 8c predecessor: ${_phase8c_predecessor:-unknown}" \
+                "Check the Phase 8 checkpoint state and rerun the required predecessor phase before retrying" \
+                "invalid_artifact" \
+                "predecessor=${_phase8c_predecessor:-unknown}; step=phase8c_route_selection"
+            return 1
+        }
+        if _phase8c_route_requires_falsify "$_phase8c_predecessor"; then
+            _phase8c_requires_falsify=true
+        fi
+        while IFS= read -r _phase8c_required_input; do
+            [[ -n "$_phase8c_required_input" ]] || continue
+            _phase8c_required_inputs+=("$_phase8c_required_input")
+        done < <(_phase8c_route_required_inputs "$comp_dir" "$_phase8c_predecessor")
+        if [[ "${#_phase8c_required_inputs[@]}" -eq 0 ]]; then
+            _fail_phase "executing-final-fix" \
+                "Phase 8c could not resolve required route inputs" \
+                "Check the Phase 8 checkpoint state and rerun the required predecessor phase before retrying" \
+                "invalid_artifact" \
+                "predecessor=${_phase8c_predecessor:-unknown}; step=phase8c_route_required_inputs"
+            return 1
+        fi
+        set_task_status "$task_file" "in progress"
+        log_execution "$task_file" "Phase 8c: Final fix started (cycle $((fix_cycle + 1)))"
+        _phase8c_stage_artifacts_detail="artifacts=${task_file}"
+        for _phase8c_required_input in "${_phase8c_required_inputs[@]}"; do
+            _phase8c_stage_artifacts_detail="${_phase8c_stage_artifacts_detail},${_phase8c_required_input}"
+        done
+        _phase8c_required_input=$(_phase8c_route_first_missing_input "$comp_dir" "$_phase8c_predecessor" || true)
+        if [[ -n "$_phase8c_required_input" ]]; then
+            _fail_phase "executing-final-fix" \
+                "Phase 8c missing required input artifact: $(basename "$_phase8c_required_input")" \
+                "Re-run the required predecessor phase or restore the missing artifact, then retry" \
+                "invalid_artifact" \
+                "artifact=${_phase8c_required_input}; route=${_phase8c_predecessor}; step=phase8c_input_ready"
+            return 1
+        fi
+
+        if [[ -f "${comp_dir}/final-verify.md" ]] && [[ ! -f "${comp_dir}/final-verify.initial.md" ]]; then
+            cp "${comp_dir}/final-verify.md" "${comp_dir}/final-verify.initial.md" || {
+                _fail_phase "executing-final-fix" "Failed to snapshot final-verify.md" "Check competitive artifacts and retry" \
+                    "unknown" "artifact=${comp_dir}/final-verify.initial.md; step=snapshot_final_verify"
+                return 1
+            }
+        fi
+        if [[ -f "${comp_dir}/final-verify.contract.json" ]] && [[ ! -f "${comp_dir}/final-verify.initial.contract.json" ]]; then
+            cp "${comp_dir}/final-verify.contract.json" "${comp_dir}/final-verify.initial.contract.json" || {
+                _fail_phase "executing-final-fix" "Failed to snapshot final-verify.contract.json" "Check competitive artifacts and retry" \
+                    "unknown" "artifact=${comp_dir}/final-verify.initial.contract.json; step=snapshot_final_verify_contract"
+                return 1
+            }
+        fi
+        if [[ -f "${comp_dir}/final-falsify.md" ]] && [[ ! -f "${comp_dir}/final-falsify.initial.md" ]]; then
+            cp "${comp_dir}/final-falsify.md" "${comp_dir}/final-falsify.initial.md" || {
+                _fail_phase "executing-final-fix" "Failed to snapshot final-falsify.md" "Check competitive artifacts and retry" \
+                    "unknown" "artifact=${comp_dir}/final-falsify.initial.md; step=snapshot_final_falsify"
+                return 1
+            }
+        fi
+        if [[ -f "${comp_dir}/final-falsify.contract.json" ]] && [[ ! -f "${comp_dir}/final-falsify.initial.contract.json" ]]; then
+            cp "${comp_dir}/final-falsify.contract.json" "${comp_dir}/final-falsify.initial.contract.json" || {
+                _fail_phase "executing-final-fix" "Failed to snapshot final-falsify.contract.json" "Check competitive artifacts and retry" \
+                    "unknown" "artifact=${comp_dir}/final-falsify.initial.contract.json; step=snapshot_final_falsify_contract"
+                return 1
+            }
+        fi
+
+        _v2_create_execution_worktree || {
+            _fail_phase "executing-final-fix" "Failed to create final-fix execution worktree" "Check disk space and git state" \
+                "unknown" "step=_v2_create_execution_worktree"
+            return 1
+        }
+        _v2_stage_execution_runtime_task_file "$task_file" || {
+            _fail_phase "executing-final-fix" "Failed to stage runtime task file into worktree" "Check worktree path permissions and retry" \
+                "unknown" "artifact=${task_file}; step=_v2_stage_execution_runtime_task_file"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        _v2_stage_execution_worktree_files \
+            "$task_file" \
+            "${_phase8c_required_inputs[@]}" || {
+            _fail_phase "executing-final-fix" "Failed to stage final verification artifacts into worktree" "Check worktree path permissions and retry" \
+                "unknown" "${_phase8c_stage_artifacts_detail}; step=_v2_stage_execution_worktree_files"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+
+        local _requested_final_fix_engine="$ENGINE_FINAL_FIX"
+        local _effective_final_fix_engine="$ENGINE_FINAL_FIX"
+        _resolve_effective_engine "$_requested_final_fix_engine"
+        _effective_final_fix_engine="$_V2_EFFECTIVE_ENGINE"
+        if _v2_engine_resolution_skipped_codex "$_requested_final_fix_engine" "$_effective_final_fix_engine"; then
+            _v2_log_codex_circuit_breaker_trip "$task_file" "phase-8c final-fix"
+            _v2_append_codex_circuit_breaker_skip "phase-8c" "final-fix-cycle-$((fix_cycle+1))" "$_phase8c_start" "phase-8c-final-fix"
+        fi
+
+        local final_fix_task_rel=""
+        local final_fix_runtime_task_rel=""
+        local final_fix_verify_rel=""
+        local final_fix_verify_contract_rel=""
+        local final_fix_falsify_rel=""
+        local final_fix_falsify_contract_rel=""
+        local final_fix_artifact_rel=""
+        local final_fix_contract_rel=""
+        final_fix_task_rel=$(_v2_main_repo_relative_path "$task_file") || {
+            _fail_phase "executing-final-fix" "Failed to resolve worktree-local task path" "Check task artifact location and retry" \
+                "unknown" "artifact=${task_file}; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        final_fix_runtime_task_rel=$(_v2_execution_runtime_task_rel_path)
+        final_fix_verify_rel=$(_v2_main_repo_relative_path "${comp_dir}/final-verify.md") || {
+            _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-verify artifact path" "Check task artifact location and retry" \
+                "unknown" "artifact=${comp_dir}/final-verify.md; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        final_fix_verify_contract_rel=$(_v2_main_repo_relative_path "${comp_dir}/final-verify.contract.json") || {
+            _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-verify contract path" "Check task artifact location and retry" \
+                "unknown" "artifact=${comp_dir}/final-verify.contract.json; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        if [[ "$_phase8c_requires_falsify" == true ]]; then
+            final_fix_falsify_rel=$(_v2_main_repo_relative_path "${comp_dir}/final-falsify.md") || {
+                _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-falsify artifact path" "Check task artifact location and retry" \
+                    "unknown" "artifact=${comp_dir}/final-falsify.md; step=_v2_main_repo_relative_path"
+                _v2_save_worktree_diff || true
+                _v2_cleanup_execution_worktree || true
+                return 1
+            }
+            final_fix_falsify_contract_rel=$(_v2_main_repo_relative_path "${comp_dir}/final-falsify.contract.json") || {
+                _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-falsify contract path" "Check task artifact location and retry" \
+                    "unknown" "artifact=${comp_dir}/final-falsify.contract.json; step=_v2_main_repo_relative_path"
+                _v2_save_worktree_diff || true
+                _v2_cleanup_execution_worktree || true
+                return 1
+            }
+        fi
+        final_fix_artifact_rel=$(_v2_main_repo_relative_path "${comp_dir}/final-fix.md") || {
+            _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-fix artifact path" "Check task artifact location and retry" \
+                "unknown" "artifact=${comp_dir}/final-fix.md; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        final_fix_contract_rel=$(_v2_main_repo_relative_path "${comp_dir}/final-fix.contract.json") || {
+            _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-fix contract path" "Check task artifact location and retry" \
+                "unknown" "artifact=${comp_dir}/final-fix.contract.json; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+
+        local phase8_fix_input_instruction=""
+        phase8_fix_input_instruction=$(_phase8c_final_fix_input_instruction \
+            "$final_fix_verify_rel" \
+            "$final_fix_verify_contract_rel" \
+            "$_phase8c_predecessor" \
+            "$final_fix_falsify_rel" \
+            "$final_fix_falsify_contract_rel") || {
+            _fail_phase "executing-final-fix" "Failed to assemble final-fixer input instruction" "Check Phase 8 route metadata and retry" \
+                "invalid_artifact" "predecessor=${_phase8c_predecessor:-unknown}; step=phase8c_final_fix_input_instruction"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        local phase8_fix_instruction="The task file is ${final_fix_task_rel}. A runtime-staged copy is available at ${final_fix_runtime_task_rel}; use the canonical task path so competitive/ resolves as a sibling directory.
+This Phase 8c run entered from ${_phase8c_route_label}.
+Your project root is the current working directory (${_V2_EXEC_WORKTREE_PATH}).
+${phase8_fix_input_instruction}
+Write the final fix artifact to ${final_fix_artifact_rel} and the contract sidecar to ${final_fix_contract_rel}.
+All repo file reads and writes must stay inside the current working directory. Do not use absolute paths under ${SCRIPT_DIR}."
+        prepare_agent_request "$_effective_final_fix_engine" "$final_fix_prompt" "$phase8_fix_instruction" || {
+            _fail_phase "executing-final-fix" "Failed to assemble final-fixer prompt" "Check ${log_dir}/final-fix.log and retry the final-fix step" \
+                "unknown" "role=final-fix; step=prepare_agent_request"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+
+        cd "$_V2_EXEC_WORKTREE_PATH"
+
+        local phase8_fix_role="final-fix${role_suffix}"
+        local exit_phase8c=0
+        rm -f "$final_fix_artifact_rel" "$final_fix_contract_rel"
+        run_agent "$phase8_fix_role" "$_effective_final_fix_engine" "$AGENT_PROMPT_BODY" "$AGENT_SYSTEM_PROMPT" \
+            "/dev/null" "${log_dir}/final-fix.log" \
+            "$PHASE8C_TIMEOUT" "300" "WebFetch,WebSearch" || exit_phase8c=$?
+        if [[ "$_effective_final_fix_engine" == "codex" ]]; then
+            _v2_record_codex_outcome "$_effective_final_fix_engine" "$exit_phase8c"
+        fi
+
+        if [[ "$exit_phase8c" -ne 0 ]]; then
+            local phase8c_error_class=""
+            local phase8c_error_message=""
+            phase8c_error_class=$(_classify_agent_exit_error_class "$_effective_final_fix_engine" "$exit_phase8c" "${log_dir}/final-fix.log")
+            if [[ "$exit_phase8c" -eq 124 ]]; then
+                phase8c_error_message="Phase 8c: Final fix timed out (${PHASE8C_TIMEOUT})"
+            else
+                phase8c_error_message="Phase 8c: Final fix FAILED (exit $exit_phase8c)"
+            fi
+            _fail_phase \
+                "executing-final-fix" \
+                "$phase8c_error_message" \
+                "Check ${log_dir}/final-fix.log and retry the final-fix step" \
+                "$phase8c_error_class" \
+                "role=${phase8_fix_role}; engine=${_effective_final_fix_engine}; exit_code=${exit_phase8c}; log=${log_dir}/final-fix.log" || true
+            _print_cost_summary
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        fi
+
+        cd "$SCRIPT_DIR"
+        _v2_sync_execution_worktree_files "${comp_dir}/final-fix.md" "${comp_dir}/final-fix.contract.json" || {
+            _fail_phase "executing-final-fix" "Failed to sync final-fix artifacts from worktree" "Inspect worktree final-fix artifacts and retry" \
+                "unknown" "artifacts=${comp_dir}/final-fix.md,${comp_dir}/final-fix.contract.json; step=_v2_sync_execution_worktree_files"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        _require_valid_artifact \
+            "${comp_dir}/final-fix.md" \
+            "executing-final-fix" \
+            "Phase 8c final-fix produced an invalid final-fix artifact" \
+            "Check ${comp_dir}/final-fix.md and ${log_dir}/final-fix.log, then retry" || {
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+
+        local phase8_fix_status=""
+        local phase8_requires_reverification=""
+        phase8_fix_status=$(_parse_contract "${comp_dir}/final-fix.md" "status")
+        phase8_requires_reverification=$(_parse_contract "${comp_dir}/final-fix.md" "requires_reverification")
+        if [[ "$phase8_fix_status" != "COMPLETE" && "$phase8_fix_status" != "BLOCKED" ]]; then
+            _fail_phase \
+                "executing-final-fix" \
+                "Phase 8c: final-fix contract status must be COMPLETE|BLOCKED" \
+                "Check ${comp_dir}/final-fix.md and final-fix.contract.json, then retry" \
+                "invalid_artifact" \
+                "artifact=${comp_dir}/final-fix.contract.json; field=status; value=${phase8_fix_status:-empty}" || true
+            _print_cost_summary
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        fi
+        if [[ "$phase8_fix_status" == "COMPLETE" ]] && [[ "$phase8_requires_reverification" != "true" ]]; then
+            echo -e "${YELLOW}WARN: Phase 8c COMPLETE without requires_reverification=true${NC}"
+            log_execution "$task_file" "Phase 8c: WARNING final-fix reported COMPLETE without requires_reverification=true"
+        fi
+
+        if [[ "$phase8_fix_status" == "BLOCKED" ]]; then
+            local phase8c_blocked_completed_at=""
+            local phase8c_blocked_cost=""
+            local phase8c_blocked_recovery_json="null"
+            phase8c_blocked_completed_at=$(_iso_timestamp)
+            phase8c_blocked_cost=$(_manifest_phase_measured_cost)
+            _write_cycle_state "$comp_dir" "$fix_cycle" "phase-8c" "" "initial" "BLOCKED" || true
+            echo -e "${YELLOW}Phase 8c: Final fixer signaled BLOCKED — halting for human review${NC}"
+            cd "$SCRIPT_DIR"
+            _v2_save_worktree_diff || true
+            if ! _v2_merge_execution_worktree 2>/dev/null; then
+                if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then
+                    phase8c_blocked_recovery_json=$(_v2_recovery_manifest_json)
+                    _v2_log_recovery_details "$task_file"
+                else
+                    _v2_cleanup_after_failed_merge false
+                fi
+            fi
+            _append_manifest_phase \
+                "${_FAIL_PHASE_PHASE_ID:-phase-8c}" \
+                "${_FAIL_PHASE_PHASE_NAME:-final-fix-cycle-$((fix_cycle + 1))}" \
+                "${_FAIL_PHASE_PHASE_STARTED_AT:-$phase8c_blocked_completed_at}" \
+                "$phase8c_blocked_completed_at" \
+                "failed" \
+                "" \
+                "$phase8c_blocked_cost" \
+                "blocked" \
+                "status_signal=BLOCKED; requires_reverification=${phase8_requires_reverification:-empty}" \
+                "$phase8c_blocked_recovery_json" || true
+            set_task_status "$task_file" "needs verification"
+            if ! _write_phase8_human_review_handoff "phase-8c"; then
+                set_task_status "$task_file" "blocked"
+                log_execution "$task_file" "Pipeline FAILED while human-review-handoff: Failed to write Phase 8 handoff artifacts"
+                _print_cost_summary
+                return 1
+            fi
+            log_execution "$task_file" "Phase 8c: Final fix STATUS: BLOCKED — human review required"
+            pipeline_human_review_halt=true
+            pipeline_finished=true
+            fix_cycle=$((fix_cycle + 1))
+            break
+        fi
+
+        cd "$SCRIPT_DIR"
+        local phase8c_merge_branch=""
+        phase8c_merge_branch=$(_v2_execution_merge_branch_label)
+        _v2_merge_execution_worktree || {
+            _fail_phase "executing-final-fix" "Failed to merge final-fix execution worktree" "Check for merge conflicts; resolve manually then retry" \
+                "merge_failure" "phase=phase-8c; step=_v2_merge_execution_worktree; branch=${phase8c_merge_branch}"
+            _v2_cleanup_after_failed_merge true
+            return 1
+        }
+
+        _append_manifest_phase "phase-8c" "final-fix-cycle-$((fix_cycle+1))" "$_phase8c_start" "$(_iso_timestamp)" "completed" "COMPLETE" || true
+        _write_cycle_state "$comp_dir" "$fix_cycle" "phase-8c" "" "post-fix" "COMPLETE" || true
+        log_execution "$task_file" "Phase 8c: Final fix COMPLETE — starting post-fix re-verification"
+        _phase8_round="post-fix"
+        needs_phase8c=false
+        _phase8_cumulative_diff=$(git diff --stat "$_PIPELINE_PRE_SHA"..HEAD)
+        _phase8_changed_files=$(git diff --name-only "$_PIPELINE_PRE_SHA"..HEAD)
+        _resume_to_subphase="phase-8a"
+        continue
+        fi  # end Phase 8c guard
 
         _resume_to_subphase=""
         fix_cycle=$((fix_cycle + 1))
@@ -5069,10 +7755,10 @@ if [[ "${1:-}" == "verify" ]]; then
         esac
     done
 
-    TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
     VERIFY_PROMPT="$SCRIPT_DIR/prompts/verifier.md"
 
     TASK_FILE="$(_require_v2_task_file "$SLUG")" || exit 1
+    TASK_DIR=$(_v2_task_dir_for_task_file "$TASK_FILE") || TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
     _CURRENT_TASK_FILE="$TASK_FILE"
 
     if [[ ! -f "$VERIFY_PROMPT" ]]; then
@@ -5197,10 +7883,10 @@ if [[ "${1:-}" == "chaos" ]]; then
         esac
     done
 
-    TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
     CHAOS_PROMPT="$SCRIPT_DIR/prompts/chaos-critic.md"
 
     TASK_FILE="$(_require_v2_task_file "$SLUG")" || exit 1
+    TASK_DIR=$(_v2_task_dir_for_task_file "$TASK_FILE") || TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
     if [[ ! -f "$CHAOS_PROMPT" ]]; then
         echo -e "${RED}Chaos-critic prompt not found: $CHAOS_PROMPT${NC}"
         exit 1
@@ -5301,13 +7987,13 @@ if [[ "${1:-}" == "progress" ]]; then
     SLUG="$1"
     shift
 
-    TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
     STATE_FILE="$SCRIPT_DIR/.planning/${SLUG}.json"
 
     TASK_FILE="$(_require_v2_task_file "$SLUG")" || exit 1
+    TASK_DIR=$(_v2_task_dir_for_task_file "$TASK_FILE") || TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
 
     CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
-    GOAL_TEXT=$(grep '^## Goal:' "$TASK_FILE" | head -1 | sed 's/^## Goal: //')
+    GOAL_TEXT=$(_verify_extract_goal "$TASK_FILE")
 
     echo -e "${BLUE}Task: ${SLUG}${NC}"
     echo "  Status: $CURRENT_STATUS"
@@ -5354,9 +8040,8 @@ if [[ "${1:-}" == "pause" ]]; then
     SLUG="$1"
     shift
 
-    TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
-
     TASK_FILE="$(_require_v2_task_file "$SLUG")" || exit 1
+    TASK_DIR=$(_v2_task_dir_for_task_file "$TASK_FILE") || TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
 
     CURRENT_STATUS=$(grep '^## Status:' "$TASK_FILE" | head -1 | sed 's/^## Status: //')
 
@@ -5414,10 +8099,10 @@ if [[ "${1:-}" == "resume" ]]; then
     SLUG="$1"
     shift
 
-    TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
     STATE_FILE="$SCRIPT_DIR/.planning/${SLUG}.json"
 
     TASK_FILE="$(_require_v2_task_file "$SLUG")" || exit 1
+    TASK_DIR=$(_v2_task_dir_for_task_file "$TASK_FILE") || TASK_DIR="$(_v2_task_artifact_dir "$SLUG")"
 
     if [ ! -f "$STATE_FILE" ]; then
         echo -e "${RED}No saved state found for '$SLUG'${NC}"
@@ -5503,7 +8188,7 @@ if [[ "$LAUREN_LOOP_EFFECTIVE_STRICT" == "true" && "$DRY_RUN" != "true" ]]; then
     fi
 fi
 
-if [[ "$DRY_RUN" != "true" ]]; then
+if [[ "$DRY_RUN" != "true" ]] && { [[ -n "${CLAUDE_CODE_USE_FOUNDRY:-}" ]] || [[ -z "${ANTHROPIC_BASE_URL:-}" ]] || [[ -z "${ANTHROPIC_API_KEY:-}" ]]; }; then
     setup_azure_context 2>/dev/null || true
 fi
 
@@ -5533,7 +8218,7 @@ if [[ "$DRY_RUN" = true ]]; then
     echo "  Phase 5: Review (||)         | engine=${ENGINE_REVIEWER_A}+${ENGINE_REVIEWER_B} | timeout=$REVIEWER_TIMEOUT"
     echo "  Phase 6: Evaluate/Fix Plan   | engine=${ENGINE_EVALUATOR}+${ENGINE_CRITIC} | timeout=${SYNTHESIZE_TIMEOUT}/${CRITIC_TIMEOUT}"
     echo "  Phase 7: Execute Fixes       | engine=$ENGINE_FIX | timeout=$EXECUTOR_TIMEOUT"
-    echo "    Loopback: Phase 5 after Phase 7 until review PASS or 2 fix cycles are exhausted"
+    echo "    Success exit: stop after a successful Phase 7 merge; otherwise halt for human review or failure"
     echo ""
 
     # Validate prompt files
@@ -5552,7 +8237,10 @@ if [[ "$DRY_RUN" = true ]]; then
         "reviewer-b:$SCRIPT_DIR/prompts/reviewer-b.md" \
         "review-evaluator:$SCRIPT_DIR/prompts/review-evaluator.md" \
         "fix-plan-author:$SCRIPT_DIR/prompts/fix-plan-author.md" \
-        "fix-executor:$SCRIPT_DIR/prompts/fix-executor.md"; do
+        "fix-executor:$SCRIPT_DIR/prompts/fix-executor.md" \
+        "final-verify:$SCRIPT_DIR/prompts/final-verifier.md" \
+        "final-falsify:$SCRIPT_DIR/prompts/final-falsifier.md" \
+        "final-fix:$SCRIPT_DIR/prompts/final-fixer.md"; do
         local_label="${label_and_path%%:*}"
         local_path="${label_and_path##*:}"
         if [[ -f "$local_path" ]]; then

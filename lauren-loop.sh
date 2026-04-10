@@ -77,7 +77,7 @@ fi
 [[ -f "$SCRIPT_DIR/.lauren-loop.conf" ]] && source "$SCRIPT_DIR/.lauren-loop.conf"
 
 # Config-driven project values (fallback defaults if conf doesn't set them)
-PROJECT_NAME="${PROJECT_NAME:-AskGeorge}"
+PROJECT_NAME="${PROJECT_NAME:-MyProject}"
 TEST_CMD="${TEST_CMD:-.venv/bin/python -m pytest tests/ -x -q}"
 LINT_CMD="${LINT_CMD:-.venv/bin/python -m flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
 
@@ -1413,7 +1413,7 @@ ${NEXT_TASK_CONTENT}"
         --model "$MODEL" \
         --max-turns 15 \
         --dangerously-skip-permissions \
-        --disallowedTools "Bash,WebFetch,WebSearch" \
+        --disallowedTools "Bash,WebFetch,WebSearch,Agent" \
         --output-format text | tee "$NEXT_CACHE"
 
     NEXT_EXIT=${PIPESTATUS[0]}
@@ -1523,7 +1523,7 @@ ${NEXT_TASK_CONTENT}"
             --model "$MODEL" \
             --max-turns 15 \
             --dangerously-skip-permissions \
-            --disallowedTools "Bash,WebFetch,WebSearch" \
+            --disallowedTools "Bash,WebFetch,WebSearch,Agent" \
             --output-format text > "$PICK_TEMP" 2>"$LOG_DIR/pick-stderr.log"
 
         PICK_LLM_EXIT=$?
@@ -3348,10 +3348,18 @@ run_lead() {
     local task_file="$1"
     local slug="$2"
     local backup_file="$LOG_DIR/$(basename "$task_file").bak"
+    local task_snapshot_dir=""
+    local sibling_drift_file="$LOG_DIR/pilot-${slug}-sibling-task-drift.tsv"
 
     echo -e "${BLUE}Running lead agent (plan + execute)...${NC}"
     mkdir -p "$LOG_DIR"
     cp "$task_file" "$backup_file"
+    task_snapshot_dir=$(mktemp -d "$LOG_DIR/.v1-task-file-snapshot.${slug}.XXXXXX") || return 1
+    _v1_snapshot_canonical_open_task_files "$task_snapshot_dir" "$task_file" || {
+        rm -rf "$task_snapshot_dir"
+        rm -f "$backup_file"
+        return 1
+    }
 
     # Tag current git SHA for diff later
     local pre_exec_sha
@@ -3388,6 +3396,7 @@ ${prompt_content}"
 
     PHASE="lead"
     local exit_code=0
+    local lead_timed_out=0
     local _cost_start
     local pre_timeout_block_count
     local post_timeout_block_count
@@ -3405,12 +3414,10 @@ ${prompt_content}"
     post_timeout_block_count=$(_timeout_block_count_in_file "$task_file")
 
     if [[ "$exit_code" -eq 124 ]]; then
-        stop_lead_monitor
+        lead_timed_out=1
         echo -e "${RED}Lead timed out after $LEAD_TIMEOUT${NC}"
         log_execution "$task_file" "Lead timed out after $LEAD_TIMEOUT"
         _sed_i 's/^## Status: .*/## Status: timed-out/' "$task_file"
-        rm -f "$backup_file"
-        return 124
     fi
 
     stop_lead_monitor
@@ -3422,7 +3429,7 @@ ${prompt_content}"
     fi
 
     # Standard checks: exit code, max-turns exhaustion
-    if [ $exit_code -ne 0 ]; then
+    if [ $exit_code -ne 0 ] && [ "$lead_timed_out" -ne 1 ]; then
         echo -e "${RED}Lead exited with code $exit_code${NC}"
         if [ "$exit_code" -eq 130 ] || [ "$exit_code" -eq 143 ]; then
             log_execution "$task_file" "Lead ended by signal (exit code: $exit_code)"
@@ -3449,13 +3456,88 @@ ${prompt_content}"
         log_execution "$task_file" "Lead left unexpected status '$final_status', set needs-human-review"
     fi
 
+    local diff_file="$LOG_DIR/pilot-${slug}-diff.patch"
+    local has_sibling_task_drift=0
+    local has_created_sibling_task=0
+    local task_file_valid=1
+    local sibling_drift_summary=""
+    local rel_sibling_drift_file="${sibling_drift_file#"$SCRIPT_DIR"/}"
+
+    _v1_detect_canonical_open_task_file_drift "$task_snapshot_dir" "$task_file" "$sibling_drift_file" || {
+        echo -e "${RED}Failed to inspect sibling canonical task files after Lead run${NC}"
+        rm -rf "$task_snapshot_dir"
+        rm -f "$backup_file"
+        return 1
+    }
+    if [[ -s "$sibling_drift_file" ]]; then
+        has_sibling_task_drift=1
+        sibling_drift_summary=$(_v1_format_canonical_open_task_file_drift "$sibling_drift_file" | tr -d '\n')
+        if awk -F'\t' '$1 == "created" { found=1; exit } END { exit !found }' "$sibling_drift_file"; then
+            has_created_sibling_task=1
+        fi
+    fi
+
     # Validate task file structure wasn't mangled
     if ! validate_task_file "$task_file"; then
-        echo -e "${RED}Task file structure corrupted after Lead run${NC}"
-        echo -e "${YELLOW}Restoring backup...${NC}"
-        cp "$backup_file" "$task_file"
+        task_file_valid=0
+    fi
+
+    if [[ "$task_file_valid" -ne 1 || "$has_sibling_task_drift" -eq 1 ]]; then
+        local quarantine_dir="$LOG_DIR/quarantine"
+        local quarantine_file=""
+        local rel_diff_file="${diff_file#"$SCRIPT_DIR"/}"
+        local rel_quarantine_file=""
+        local sibling_quarantine_root="$quarantine_dir/sibling-task-files-${slug}-$(date +%Y%m%d-%H%M%S)"
+        local rel_sibling_quarantine_root=""
+        local log_message=""
+
+        _capture_repo_diff_since_ref "$pre_exec_sha" "$diff_file"
+        echo "  Captured execution diff: $diff_file"
+
+        if [[ "$has_sibling_task_drift" -eq 1 ]]; then
+            echo -e "${RED}Sibling canonical task-file mutation detected after Lead run${NC}"
+            echo "  ${sibling_drift_summary}"
+            _v1_restore_canonical_open_task_file_drift "$task_snapshot_dir" "$sibling_drift_file" "$sibling_quarantine_root" || {
+                rm -rf "$task_snapshot_dir"
+                rm -f "$backup_file"
+                return 1
+            }
+            if [[ "$has_created_sibling_task" -eq 1 ]]; then
+                rel_sibling_quarantine_root="${sibling_quarantine_root#"$SCRIPT_DIR"/}"
+                echo "  Quarantined created sibling task files under: $sibling_quarantine_root"
+            fi
+        fi
+
+        if [[ "$task_file_valid" -ne 1 ]]; then
+            echo -e "${RED}Task file structure corrupted after Lead run${NC}"
+            mkdir -p "$quarantine_dir"
+            quarantine_file="$quarantine_dir/${slug}-$(date +%Y%m%d-%H%M%S).md"
+            mv "$task_file" "$quarantine_file"
+            echo "  Quarantined corrupted task file: $quarantine_file"
+
+            echo -e "${YELLOW}Restoring backup...${NC}"
+            cp "$backup_file" "$task_file"
+            rel_quarantine_file="${quarantine_file#"$SCRIPT_DIR"/}"
+        fi
+
         _sed_i 's/^## Status: .*/## Status: needs-human-review/' "$task_file"
-        log_execution "$task_file" "Task file corrupted, restored backup, set needs-human-review"
+
+        if [[ "$task_file_valid" -ne 1 && "$has_sibling_task_drift" -eq 1 ]]; then
+            log_message="Task file corrupted after Lead run and sibling canonical task files mutated; restored backup, set needs-human-review, diff captured at ${rel_diff_file}, quarantined active snapshot at ${rel_quarantine_file}, sibling drift captured at ${rel_sibling_drift_file}"
+        elif [[ "$task_file_valid" -ne 1 ]]; then
+            log_message="Task file corrupted after Lead run; restored backup, set needs-human-review, diff captured at ${rel_diff_file}, quarantined snapshot at ${rel_quarantine_file}"
+        else
+            log_message="Sibling canonical task files mutated after Lead run; restored sibling task files from snapshot, set needs-human-review, diff captured at ${rel_diff_file}, sibling drift captured at ${rel_sibling_drift_file}"
+        fi
+        if [[ "$has_created_sibling_task" -eq 1 ]]; then
+            log_message="${log_message}, created sibling task files quarantined under ${rel_sibling_quarantine_root}"
+        fi
+        if [[ "$has_sibling_task_drift" -eq 1 ]]; then
+            log_message="${log_message}. Paths: ${sibling_drift_summary}"
+        fi
+        log_execution "$task_file" "$log_message"
+
+        rm -rf "$task_snapshot_dir"
         rm -f "$backup_file"
         return 1
     fi
@@ -3472,13 +3554,14 @@ ${prompt_content}"
     fi
 
     # Capture diff
-    local diff_file="$LOG_DIR/pilot-${slug}-diff.patch"
     git diff "$pre_exec_sha"..HEAD > "$diff_file" 2>/dev/null || true
     if [ ! -s "$diff_file" ]; then
         git diff > "$diff_file" 2>/dev/null || true
         git diff --cached >> "$diff_file" 2>/dev/null || true
     fi
 
+    rm -rf "$task_snapshot_dir"
+    rm -f "$sibling_drift_file"
     rm -f "$backup_file"
     echo "  Log: $log_file"
     return $exit_code
