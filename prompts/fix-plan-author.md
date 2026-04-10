@@ -119,6 +119,7 @@ Set `ready` to `true` when the markdown artifact says `READY: yes`, and `false` 
 - If a finding appears unsupported or contradictory, mark it `DISPUTED` with evidence in `## Dispute Candidates` instead of planning an invalid fix.
 - Reference `competitive/fix-execution.md` as the execution log target for every planned item.
 - CRITICAL: `<verify>` tags must be single-line. Both `<verify>` and `</verify>` must appear on the same line. If multiple verification commands are needed, join them with `&&`.
+- Allowed verify command prefixes: `pytest`, `python`, `bash`, `sh`, `npm`, `npx`, `node`, `make`, `cd`, `timeout`, `env`, `grep`, `diff`, `wc`, `.venv/bin/python`, `.venv/bin/pytest`. Any other command must be wrapped in `bash -c '...'`.
 - Example: `<verify>.venv/bin/python -m pytest tests/foo.py -xvs && .venv/bin/python -m pytest tests/bar.py -xvs</verify>`
 
 ## Session Summary

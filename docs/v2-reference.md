@@ -15,6 +15,9 @@ The pipeline is a seven-phase competitive shell pipeline:
 7. Fix execution
 
 Primary outputs live under `docs/tasks/open/<slug>/competitive/`. Runtime logs and cost shards live under `docs/tasks/open/<slug>/logs/`.
+When a slug resolves to an existing flat task file, V2 now keeps artifacts alongside that canonical
+task by using a sibling `<task-stem>/competitive/` and `<task-stem>/logs/` directory instead of
+creating a duplicate top-level `docs/tasks/open/<slug>/task.md`.
 
 ## CLI
 
@@ -56,7 +59,7 @@ Subcommands:
 | `LAUREN_LOOP_STRICT` | `false` | Explicit strict-mode switch; high-risk slug/goal text can also auto-enable effective strict mode |
 | `LAUREN_LOOP_MAX_COST` | `0` | Cost ceiling in USD; `<= 0` disables the ceiling |
 | `LAUREN_LOOP_NOTIFY` | `0` | If set to `1`, emit one macOS terminal-state notification for live runs |
-| `SINGLE_REVIEWER_POLICY` | `synthesis` | `synthesis` or `strict` |
+| `SINGLE_REVIEWER_POLICY` | `synthesis` | `synthesis` or `strict`; diff risk does not rewrite this setting |
 | `LAUREN_LOOP_CODEX_MODEL` | `gpt-5.4` | Codex model name for cost manifests and metadata |
 
 ### Engines
@@ -102,6 +105,12 @@ For Codex file-authoring roles (`planner-b`, `reviewer-b*`), each attempt now wr
 | `REVIEWER_TIMEOUT` | `15m` |
 | `SYNTHESIZE_TIMEOUT` | `10m` |
 
+Reviewer timeout behavior:
+
+- If `REVIEWER_TIMEOUT` is explicitly set, that value is used for reviewer launch, one-shot reviewer fallback, and the Reviewer B Codex backstop.
+- Otherwise Phase 4 diff risk scales the effective reviewer timeout to `15m`, `30m`, or `45m` for `LOW`, `MEDIUM`, and `HIGH`.
+- The resolved value is logged in the task execution log as part of Phase 4.
+
 ## Production Hardening Summary
 
 ### Phase A
@@ -133,15 +142,24 @@ For Codex file-authoring roles (`planner-b`, `reviewer-b*`), each attempt now wr
   - `_parse_contract()` prefers `.contract.json` sidecars, then falls back to markdown parsing when non-strict.
   - `_normalize_contract_token()` canonicalizes `verdict`, `ready`, and `status` values.
 - Confidence gating:
-  - `_classify_diff_risk()` uses conservative path-token matching for review-phase single-survivor halts.
+  - `_classify_diff_risk()` uses conservative path-token matching for reviewer-timeout scaling and reviewer-phase advisory logging.
   - deployment / production-cutover / security-sensitive slug-or-goal text auto-enables effective strict mode for the full runtime.
-  - single-reviewer or single-planner survival can halt based on effective strict mode or risk.
+  - single-planner survival can still halt based on effective strict mode or risk.
+  - single-reviewer survival now halts only when explicit strict mode is enabled; MEDIUM/HIGH diff risk is advisory-only for that path.
 - Resumability:
   - `_write_cycle_state()`, `_read_cycle_state()`, `_resume_target_ready()`, and `_phase7_resume_gate_reason()` support subphase resume.
+- Task resolution:
+  - top-level exact matches still win first
+  - exact nested `<slug>.md` and `<slug>/task.md` matches under `docs/tasks/open/` are resolved before creating a new task
+  - multiple exact nested matches halt as ambiguous instead of choosing a path silently
+  - flat task matches consolidate into a sibling directory layout near the canonical task rather than into a duplicate top-level slug directory
 - Corruption guards:
   - `_validate_agent_output()` and `_require_valid_artifact()` reject missing, empty, or corrupt artifacts.
+- Direct artifact diagnostics:
+  - Phase 1 missing or invalid `exploration-summary.md` failures now log the artifact path, output state, validation reason, and the last 20 lines of the explorer log when available.
 - Observability:
-  - `_init_run_manifest()`, `_append_manifest_phase()`, `_finalize_run_manifest()`, and `_print_phase_timing()` emit `run-manifest.json`.
+  - `_init_run_manifest()`, `_update_run_manifest_state()`, `_append_manifest_phase()`, `_finalize_run_manifest()`, and `_print_phase_timing()` emit `run-manifest.json`.
+  - manifest state is updated on phase entry, reviewer fallback engine swaps, and terminal finalization.
 - Failure semantics:
   - `_fail_phase()` includes actionable recovery hints.
 
@@ -157,7 +175,7 @@ For Codex file-authoring roles (`planner-b`, `reviewer-b*`), each attempt now wr
   - strict parsing disables regex fallback for routed artifacts
   - ambiguous routed signals halt
   - single-planner survival halts before evaluation/execution
-  - single-reviewer survival halts
+  - single-reviewer survival halts only when strict mode is explicitly enabled
   - raw dual-PASS fast path is disabled
   - empty fix diffs hard-block
   - cost ceiling is required only for effective-strict live runs, not strict dry runs
@@ -202,11 +220,12 @@ For Codex file-authoring roles (`planner-b`, `reviewer-b*`), each attempt now wr
 
 - At least one usable reviewer artifact is required.
 - `reviewer-a.raw.md`, `reviewer-b.raw.md`, `review-a.md`, and `review-b.md` are snapshotted per cycle as `*.cycleN.md`, and `.review-mapping` is snapshotted as `.review-mapping.cycleN`.
+- Reviewer timeout resolution is shared across reviewer launch, opposite-engine fallback, and the Reviewer B Codex backstop.
 - If both reviewer artifacts survive:
   - non-strict mode may fast-path only when both routed verdicts are `PASS` and no critical/major findings are detected
   - strict mode always disables this fast path and forces `review-synthesis.md`
 - If only one reviewer artifact survives:
-  - non-strict mode may continue to synthesis
+  - non-strict mode may continue to synthesis even when diff risk is `MEDIUM` or `HIGH`
   - strict mode always halts for human review
 
 ### Planning Phase
@@ -259,10 +278,19 @@ Tracks:
 
 - task slug
 - engine selections
-- per-phase start/end timestamps
-- per-phase status
+- `current_phase`
+- `active_engines`, including reviewer fallback swaps such as `claude (fallback)`
+- `diff_risk`
+- `effective_timeouts.reviewer`
+- per-phase start/end timestamps and status history in `phases`
 - final outcome
 - total merged cost
+
+Write points:
+
+- phase entry
+- reviewer fallback engine swap
+- terminal finalization
 
 ### `.cycle-state.json`
 
@@ -326,7 +354,10 @@ Phase A-C additions and major changes:
 - `_check_cost_ceiling`
 - `_phase7_resume_gate_reason`
 - `_resume_target_ready`
+- `_resolve_reviewer_timeout`
+- `_reviewer_timeout_resolution_source`
 - `_init_run_manifest`
+- `_update_run_manifest_state`
 - `_append_manifest_phase`
 - `_finalize_run_manifest`
 - `lauren_loop_competitive`

@@ -159,22 +159,248 @@ _trim_joined_text() {
     '
 }
 
-_task_goal_content() {
-    local task_file="$1"
-    local inline_goal=""
+_task_workflow_canonical_header() {
+    case "$1" in
+        left_off) printf '## Left Off At\n' ;;
+        attempts) printf '## Attempts\n' ;;
+        *)
+            echo "Unknown workflow section key: $1" >&2
+            return 1
+            ;;
+    esac
+}
 
-    inline_goal=$(grep '^## Goal:' "$task_file" | head -1 | sed 's/^## Goal:[[:space:]]*//')
-    if [[ -n "${inline_goal:-}" ]] || grep -q '^## Goal:' "$task_file"; then
-        printf '%s\n' "$inline_goal"
+_task_workflow_legacy_header() {
+    case "$1" in
+        left_off) printf '## Left Off At:\n' ;;
+        attempts) printf '## Attempts:\n' ;;
+        *)
+            echo "Unknown workflow section key: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+_task_workflow_variant_pattern() {
+    local key="$1"
+    local variant="$2"
+
+    case "$key:$variant" in
+        left_off:canonical) printf '^## Left Off At[[:space:]]*$\n' ;;
+        left_off:legacy) printf '^## Left Off At:[[:space:]]*$\n' ;;
+        attempts:canonical) printf '^## Attempts[[:space:]]*$\n' ;;
+        attempts:legacy) printf '^## Attempts:[[:space:]]*$\n' ;;
+        *)
+            echo "Unknown workflow section variant: ${key}:${variant}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_task_workflow_pattern() {
+    case "$1" in
+        left_off) printf '^## Left Off At:?[[:space:]]*$\n' ;;
+        attempts) printf '^## Attempts:?[[:space:]]*$\n' ;;
+        *)
+            echo "Unknown workflow section key: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+_task_workflow_default_body() {
+    case "$1" in
+        left_off) printf 'Not started.\n' ;;
+        attempts) printf '(none yet)\n' ;;
+        *)
+            echo "Unknown workflow section key: $1" >&2
+            return 1
+            ;;
+    esac
+}
+
+_task_workflow_count_matches() {
+    printf '%s\n' "$1" | sed '/^$/d' | wc -l | tr -d ' '
+}
+
+_task_workflow_variant_count() {
+    local task_file="$1"
+    local key="$2"
+    local variant="$3"
+    local pattern
+
+    pattern=$(_task_workflow_variant_pattern "$key" "$variant") || return 1
+    awk -v pattern="$pattern" '$0 ~ pattern { count++ } END { print count + 0 }' "$task_file"
+}
+
+_task_workflow_section_matches() {
+    local task_file="$1"
+    local key="$2"
+    local pattern
+
+    pattern=$(_task_workflow_pattern "$key") || return 1
+    awk -v pattern="$pattern" '$0 ~ pattern { print NR }' "$task_file"
+}
+
+_task_workflow_count() {
+    local task_file="$1"
+    local key="$2"
+    local matches
+
+    matches=$(_task_workflow_section_matches "$task_file" "$key") || return 1
+    _task_workflow_count_matches "$matches"
+}
+
+_task_workflow_first_line() {
+    local task_file="$1"
+    local key="$2"
+    local pattern
+
+    pattern=$(_task_workflow_pattern "$key") || return 1
+    awk -v pattern="$pattern" '$0 ~ pattern { print NR; exit }' "$task_file"
+}
+
+_task_workflow_first_line_for_variant() {
+    local task_file="$1"
+    local key="$2"
+    local variant="$3"
+    local pattern
+
+    pattern=$(_task_workflow_variant_pattern "$key" "$variant") || return 1
+    awk -v pattern="$pattern" '$0 ~ pattern { print NR; exit }' "$task_file"
+}
+
+_task_workflow_bounds_at_line() {
+    local task_file="$1"
+    local start="$2"
+    local end
+
+    end=$(awk -v start="$start" 'NR > start && /^## / { print NR; exit }' "$task_file")
+    if [ -z "$end" ]; then
+        end=$(( $(wc -l < "$task_file") + 1 ))
+    fi
+
+    printf '%s %s\n' "$start" "$end"
+}
+
+_task_workflow_bounds() {
+    local task_file="$1"
+    local key="$2"
+    local count start header
+
+    count=$(_task_workflow_count "$task_file" "$key") || return 1
+    header=$(_task_workflow_canonical_header "$key") || return 1
+    if [ "$count" -ne 1 ]; then
+        echo "Expected exactly one logical section: $header" >&2
+        return 1
+    fi
+
+    start=$(_task_workflow_first_line "$task_file" "$key")
+    [ -n "$start" ] || {
+        echo "Expected exactly one logical section: $header" >&2
+        return 1
+    }
+
+    _task_workflow_bounds_at_line "$task_file" "$start"
+}
+
+_task_workflow_body() {
+    local task_file="$1"
+    local key="$2"
+    local start end
+
+    read -r start end < <(_task_workflow_bounds "$task_file" "$key") || return 1
+    if [ $((end - start)) -le 1 ]; then
         return 0
     fi
 
-    if grep -q -E '^## Goal[[:space:]]*$' "$task_file"; then
-        section_body "$task_file" "## Goal" 2>/dev/null || true
+    sed -n "$((start + 1)),$((end - 1))p" "$task_file"
+}
+
+_task_workflow_attempt_line_is_placeholder() {
+    local line="$1"
+    local trimmed=""
+
+    trimmed=$(printf '%s\n' "$line" | _trim_nonblank_lines)
+    [[ -z "$trimmed" ]] && return 0
+
+    case "$trimmed" in
+        "(none yet)"|"(none)")
+            return 0
+            ;;
+    esac
+
+    if printf '%s\n' "$trimmed" | grep -Fq 'what was tried' && \
+        printf '%s\n' "$trimmed" | grep -Fq 'result (worked/failed/partial)'; then
         return 0
     fi
 
     return 1
+}
+
+_filter_task_workflow_attempt_lines() {
+    local line
+
+    while IFS= read -r line || [ -n "$line" ]; do
+        if _task_workflow_attempt_line_is_placeholder "$line"; then
+            continue
+        fi
+        printf '%s\n' "$line"
+    done
+}
+
+_task_workflow_body_is_placeholder() {
+    local key="$1"
+    local body="$2"
+    local trimmed=""
+    local normalized=""
+
+    trimmed=$(printf '%s\n' "$body" | _trim_nonblank_lines)
+    [[ -z "$trimmed" ]] && return 0
+    normalized=$(printf '%s\n' "$trimmed" | _trim_joined_text)
+
+    case "$key" in
+        left_off)
+            case "$normalized" in
+                "Not started.")
+                    return 0
+                    ;;
+            esac
+            if printf '%s\n' "$normalized" | grep -Eq '^\[exactly where work stopped'; then
+                return 0
+            fi
+            ;;
+        attempts)
+            case "$normalized" in
+                "(none yet)"|"(none)")
+                    return 0
+                    ;;
+            esac
+            if printf '%s\n' "$normalized" | grep -Fq 'what was tried' && \
+                printf '%s\n' "$normalized" | grep -Fq 'result (worked/failed/partial)'; then
+                return 0
+            fi
+            ;;
+    esac
+
+    return 1
+}
+
+_task_goal_content() {
+    local task_file="$1"
+    awk '
+        /^## Goal:[[:space:]]*[^[:space:]].*$/ {
+            line = $0
+            sub(/^## Goal:[[:space:]]*/, "", line)
+            print line
+            found = 1
+            exit 0
+        }
+        /^## Goal:?[[:space:]]*$/ { found = 1; capture = 1; next }
+        /^## [^#]/ && capture { exit 0 }
+        capture { print }
+        END { exit(found ? 0 : 1) }
+    ' "$task_file"
 }
 
 _goal_content_is_placeholder() {
@@ -215,8 +441,8 @@ _task_file_looks_like_v1_shell_skeleton() {
     current_plan=$(section_body "$task_file" "## Current Plan" 2>/dev/null | _trim_nonblank_lines || true)
     critique=$(section_body "$task_file" "## Critique" 2>/dev/null | _trim_nonblank_lines || true)
     plan_history=$(section_body "$task_file" "## Plan History" 2>/dev/null | _trim_nonblank_lines || true)
-    left_off=$(section_body "$task_file" "## Left Off At:" 2>/dev/null | _trim_nonblank_lines || true)
-    attempts=$(section_body "$task_file" "## Attempts:" 2>/dev/null | _trim_nonblank_lines || true)
+    left_off=$(_task_workflow_body "$task_file" "left_off" 2>/dev/null | _trim_nonblank_lines || true)
+    attempts=$(_task_workflow_body "$task_file" "attempts" 2>/dev/null | _trim_nonblank_lines || true)
 
     [[ "$current_plan" == "(Planner writes here)" ]] || return 1
     [[ "$critique" == "(Critic writes here)" ]] || return 1
@@ -242,8 +468,8 @@ _task_file_looks_like_v2_shell_skeleton() {
 
     context_body=$(section_body "$task_file" "## Context:" 2>/dev/null | _trim_nonblank_lines || true)
     done_body=$(section_body "$task_file" "## Done Criteria:" 2>/dev/null | _trim_nonblank_lines || true)
-    left_off=$(section_body "$task_file" "## Left Off At:" 2>/dev/null | _trim_nonblank_lines || true)
-    attempts=$(section_body "$task_file" "## Attempts:" 2>/dev/null | _trim_nonblank_lines || true)
+    left_off=$(_task_workflow_body "$task_file" "left_off" 2>/dev/null | _trim_nonblank_lines || true)
+    attempts=$(_task_workflow_body "$task_file" "attempts" 2>/dev/null | _trim_nonblank_lines || true)
     current_plan=$(section_body "$task_file" "## Current Plan" 2>/dev/null | _trim_nonblank_lines || true)
     execution_log=$(section_body "$task_file" "## Execution Log" 2>/dev/null | _trim_nonblank_lines || true)
     relevant_files=$(section_body "$task_file" "## Relevant Files:" 2>/dev/null | _trim_nonblank_lines || true)
@@ -645,7 +871,7 @@ _validate_single_verify_command() {
 
     # Allowed command prefixes
     case "$first_token" in
-        pytest|python|bash|sh|npm|npx|node|make|cd|timeout|env) return 0 ;;
+        pytest|python|bash|sh|npm|npx|node|make|cd|timeout|env|grep|diff|wc) return 0 ;;
         .venv/bin/python|.venv/bin/pytest) return 0 ;;
     esac
 
@@ -831,6 +1057,16 @@ same_dir_temp_file() {
     mktemp "$target_dir/.lauren-loop.tmp.XXXXXX"
 }
 
+_capture_repo_diff_since_ref() {
+    local before_sha="$1"
+    local diff_file="$2"
+
+    : > "$diff_file" || return 1
+    git diff "$before_sha"..HEAD > "$diff_file" 2>/dev/null || true
+    git diff >> "$diff_file" 2>/dev/null || true
+    git diff --cached >> "$diff_file" 2>/dev/null || true
+}
+
 # Atomic append: write content to temp file, cat >> target, rm temp.
 # Prevents 0-byte appends from shell crashes during printf.
 _atomic_append() {
@@ -861,6 +1097,40 @@ _atomic_promote_file() {
     [[ -f "$source_file" ]] || return 1
     tmp=$(same_dir_temp_file "$target_file") || return 1
     cp "$source_file" "$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$target_file"
+}
+
+_write_v2_task_file() {
+    local target_file="$1"
+    local slug="$2"
+    local goal="$3"
+    local tmp
+
+    mkdir -p "$(dirname "$target_file")" || return 1
+    tmp=$(same_dir_temp_file "$target_file") || return 1
+    {
+        printf '## Task: %s\n' "$slug"
+        printf '## Status: in progress\n'
+        printf '## Execution Mode: competitive\n'
+        printf '## Goal: %s\n' "$goal"
+        printf '## Relevant Files:\n'
+        printf '%s\n' '- `lauren-loop-v2.sh` — competitive Lauren Loop flow'
+        printf '%s\n' '- `lib/lauren-loop-utils.sh` — shared task-file logging and state helpers'
+        printf '## Context:\n'
+        printf '%s\n' 'Created by lauren-loop-v2 for a new competitive run.'
+        printf '## Done Criteria:\n'
+        printf '%s\n' '- [ ] Competitive run completes and leaves task in needs verification or blocked with artifacts preserved'
+        printf '## Left Off At\n'
+        printf '%s\n' 'Competitive run has started.'
+        printf '\n'
+        printf '## Execution Log\n'
+        printf '\n'
+        printf '## Attempts\n'
+        printf '%s\n' '(none yet)'
+        printf '\n'
+        printf '## Current Plan\n'
+        printf '\n'
+    } > "$tmp" || { rm -f "$tmp"; return 1; }
     mv "$tmp" "$target_file"
 }
 
@@ -900,7 +1170,7 @@ _agent_output_requires_semantic_validation() {
 
 _codex_role_uses_tool_written_artifact() {
     case "$1" in
-        planner-b|reviewer-b*|scope-triage)
+        planner-b|reviewer-b*|scope-triage|final-verify*|final-falsify*|final-fix*)
             return 0
             ;;
         *)
@@ -1231,9 +1501,10 @@ _watch_codex_artifact_for_static_invalid() {
 }
 
 # Write cycle state checkpoint for review/fix loop resumability.
-# Usage: _write_cycle_state <comp_dir> <fix_cycle> <last_completed> [<review_verdict>]
+# Usage: _write_cycle_state <comp_dir> <fix_cycle> <last_completed> [<review_verdict>] [<phase8_round>] [<phase8_result>]
 _write_cycle_state() {
     local comp_dir="$1" fix_cycle="$2" last_completed="$3" review_verdict="${4:-}"
+    local phase8_round="${5:-}" phase8_result="${6:-}"
     command -v jq >/dev/null 2>&1 || return 0
     local state_file="${comp_dir}/.cycle-state.json"
     local tmp
@@ -1242,17 +1513,22 @@ _write_cycle_state() {
         --argjson fix_cycle "$fix_cycle" \
         --arg last_completed "$last_completed" \
         --arg review_verdict "$review_verdict" \
+        --arg phase8_round "$phase8_round" \
+        --arg phase8_result "$phase8_result" \
         --arg timestamp "$(_iso_timestamp)" \
-        '{
+        '({
             fix_cycle: $fix_cycle,
             last_completed: $last_completed,
             review_verdict: (if $review_verdict == "" then null else $review_verdict end),
             timestamp: $timestamp
-        }' > "$tmp" && mv "$tmp" "$state_file" || { rm -f "$tmp"; return 1; }
+        } +
+        (if $phase8_round == "" then {} else { phase8_round: $phase8_round } end) +
+        (if $phase8_result == "" then {} else { phase8_result: $phase8_result } end))' > "$tmp" && mv "$tmp" "$state_file" || { rm -f "$tmp"; return 1; }
 }
 
 # Read cycle state checkpoint. Sets globals:
-#   CYCLE_STATE_FIX_CYCLE, CYCLE_STATE_LAST_COMPLETED, CYCLE_STATE_REVIEW_VERDICT
+#   CYCLE_STATE_FIX_CYCLE, CYCLE_STATE_LAST_COMPLETED, CYCLE_STATE_REVIEW_VERDICT,
+#   CYCLE_STATE_PHASE8_ROUND, CYCLE_STATE_PHASE8_RESULT
 # Returns 1 if no state file.
 _read_cycle_state() {
     local comp_dir="$1"
@@ -1263,6 +1539,8 @@ _read_cycle_state() {
     [[ "$CYCLE_STATE_FIX_CYCLE" =~ ^[0-9]+$ ]] || return 1
     CYCLE_STATE_LAST_COMPLETED=$(jq -r '.last_completed // empty' "$state_file" 2>/dev/null) || return 1
     CYCLE_STATE_REVIEW_VERDICT=$(jq -r '.review_verdict // empty' "$state_file" 2>/dev/null) || true
+    CYCLE_STATE_PHASE8_ROUND=$(jq -r '.phase8_round // empty' "$state_file" 2>/dev/null) || true
+    CYCLE_STATE_PHASE8_RESULT=$(jq -r '.phase8_result // empty' "$state_file" 2>/dev/null) || true
     [[ -n "$CYCLE_STATE_LAST_COMPLETED" ]] || return 1
     return 0
 }
@@ -1341,6 +1619,163 @@ section_has_nonblank_content() {
     section_body "$task_file" "$header" | grep -q '[^[:space:]]'
 }
 
+_rewrite_task_workflow_section() {
+    local task_file="$1"
+    local key="$2"
+    local replacement_file="$3"
+    local start end tmp_file header
+
+    read -r start end < <(_task_workflow_bounds "$task_file" "$key") || return 1
+    tmp_file=$(same_dir_temp_file "$task_file")
+    header=$(_task_workflow_canonical_header "$key") || return 1
+
+    awk -v start="$start" -v end="$end" -v replacement="$replacement_file" -v header="$header" '
+        NR == start {
+            print header
+            while ((getline line < replacement) > 0) {
+                print line
+            }
+            close(replacement)
+            next
+        }
+        NR > start && NR < end { next }
+        { print }
+    ' "$task_file" > "$tmp_file"
+
+    mv "$tmp_file" "$task_file"
+}
+
+_delete_task_section_range() {
+    local task_file="$1"
+    local start="$2"
+    local end="$3"
+    local tmp_file
+
+    tmp_file=$(same_dir_temp_file "$task_file") || return 1
+    awk -v start="$start" -v end="$end" '
+        NR >= start && NR < end { next }
+        { print }
+    ' "$task_file" > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+
+    mv "$tmp_file" "$task_file"
+}
+
+_normalize_task_workflow_section() {
+    local task_file="$1"
+    local key="$2"
+    local canonical_count legacy_count total
+    local canonical_header legacy_header canonical_start legacy_start
+    local first_header second_header first_start first_end second_start second_end
+    local first_body="" second_body="" first_trimmed="" second_trimmed=""
+    local replacement_file="" merged_input="" merged_output=""
+
+    canonical_count=$(_task_workflow_variant_count "$task_file" "$key" "canonical") || return 1
+    legacy_count=$(_task_workflow_variant_count "$task_file" "$key" "legacy") || return 1
+    total=$((canonical_count + legacy_count))
+    canonical_header=$(_task_workflow_canonical_header "$key") || return 1
+    legacy_header=$(_task_workflow_legacy_header "$key") || return 1
+
+    if [ "$canonical_count" -gt 1 ] || [ "$legacy_count" -gt 1 ]; then
+        echo "Expected at most one canonical and one legacy section for $canonical_header" >&2
+        return 1
+    fi
+
+    if [ "$total" -eq 0 ]; then
+        return 0
+    fi
+
+    if [ "$total" -eq 1 ]; then
+        if [ "$legacy_count" -eq 1 ]; then
+            replacement_file=$(mktemp)
+            _task_workflow_body "$task_file" "$key" > "$replacement_file" 2>/dev/null || true
+            _rewrite_task_workflow_section "$task_file" "$key" "$replacement_file" || {
+                rm -f "$replacement_file"
+                return 1
+            }
+            rm -f "$replacement_file"
+        fi
+        return 0
+    fi
+
+    canonical_start=$(_task_workflow_first_line_for_variant "$task_file" "$key" "canonical")
+    legacy_start=$(_task_workflow_first_line_for_variant "$task_file" "$key" "legacy")
+    if [ -z "$canonical_start" ] || [ -z "$legacy_start" ]; then
+        echo "Expected both canonical and legacy sections for $canonical_header" >&2
+        return 1
+    fi
+
+    if [ "$canonical_start" -lt "$legacy_start" ]; then
+        first_header="$canonical_header"
+        second_header="$legacy_header"
+    else
+        first_header="$legacy_header"
+        second_header="$canonical_header"
+    fi
+
+    read -r first_start first_end < <(section_bounds "$task_file" "$first_header") || return 1
+    read -r second_start second_end < <(section_bounds "$task_file" "$second_header") || return 1
+    first_body=$(section_body "$task_file" "$first_header" 2>/dev/null || true)
+    second_body=$(section_body "$task_file" "$second_header" 2>/dev/null || true)
+    first_trimmed=$(printf '%s\n' "$first_body" | _trim_nonblank_lines)
+    second_trimmed=$(printf '%s\n' "$second_body" | _trim_nonblank_lines)
+
+    case "$key" in
+        attempts)
+            merged_input=$(mktemp)
+            merged_output=$(mktemp)
+            {
+                printf '%s\n' "$first_body"
+                printf '%s\n' "$second_body"
+            } > "$merged_input"
+            _filter_task_workflow_attempt_lines < "$merged_input" | awk '!seen[$0]++' > "$merged_output"
+            rm -f "$merged_input"
+
+            _delete_task_section_range "$task_file" "$second_start" "$second_end" || {
+                rm -f "$merged_output"
+                return 1
+            }
+            _rewrite_task_workflow_section "$task_file" "$key" "$merged_output" || {
+                rm -f "$merged_output"
+                return 1
+            }
+            rm -f "$merged_output"
+            ;;
+        left_off)
+            if ! _task_workflow_body_is_placeholder "$key" "$first_body" && \
+                ! _task_workflow_body_is_placeholder "$key" "$second_body" && \
+                [ "$first_trimmed" != "$second_trimmed" ]; then
+                echo "Conflicting logical Left Off At sections found; manual cleanup required before rewriting." >&2
+                return 1
+            fi
+
+            replacement_file=$(mktemp)
+            if _task_workflow_body_is_placeholder "$key" "$first_body" && \
+                ! _task_workflow_body_is_placeholder "$key" "$second_body"; then
+                printf '%s\n' "$second_body" > "$replacement_file"
+            elif ! _task_workflow_body_is_placeholder "$key" "$first_body" && \
+                _task_workflow_body_is_placeholder "$key" "$second_body"; then
+                printf '%s\n' "$first_body" > "$replacement_file"
+            elif [ -n "$first_trimmed" ]; then
+                printf '%s\n' "$first_body" > "$replacement_file"
+            elif [ -n "$second_trimmed" ]; then
+                printf '%s\n' "$second_body" > "$replacement_file"
+            else
+                _task_workflow_default_body "$key" > "$replacement_file"
+            fi
+
+            _delete_task_section_range "$task_file" "$second_start" "$second_end" || {
+                rm -f "$replacement_file"
+                return 1
+            }
+            _rewrite_task_workflow_section "$task_file" "$key" "$replacement_file" || {
+                rm -f "$replacement_file"
+                return 1
+            }
+            rm -f "$replacement_file"
+            ;;
+    esac
+}
+
 rewrite_section() {
     local task_file="$1"
     local header="$2"
@@ -1382,7 +1817,7 @@ log_execution() {
     local log_start
     log_start=$(grep -n '^## Execution Log' "$task_file" | head -1 | cut -d: -f1)
     if [ -z "$log_start" ]; then
-        log_start=$(grep -n '^## Attempts:' "$task_file" | head -1 | cut -d: -f1)
+        log_start=$(_task_workflow_first_line "$task_file" "attempts")
     fi
     if [ -n "$log_start" ]; then
         local tmp_file
@@ -1424,7 +1859,7 @@ latest_execution_log_entry() {
     if grep -q '^## Execution Log' "$task_file"; then
         section_body "$task_file" "## Execution Log" 2>/dev/null | sed -n '/^- \[/ { p; q; }'
     else
-        section_body "$task_file" "## Attempts:" 2>/dev/null | sed -n '/^- \[/ { p; q; }'
+        _task_workflow_body "$task_file" "attempts" 2>/dev/null | sed -n '/^- \[/ { p; q; }'
     fi
 }
 
@@ -1767,38 +2202,37 @@ ensure_sections() {
 
 ensure_task_workflow_sections() {
     local task_file="$1"
-    local managed_sections=("## Left Off At:" "## Attempts:")
-    local missing_sections=()
-    local section count
+    local exec_count exec_start tmp_file missing_left_off missing_attempts
+    local left_off_count attempts_count
 
-    for section in "${managed_sections[@]}" "## Execution Log"; do
-        count=$(grep -n -F -x "$section" "$task_file" | wc -l | tr -d ' ')
-        if [ "$count" -gt 1 ]; then
-            echo "Expected exactly one section: $section" >&2
-            return 1
-        fi
-        if [ "$count" -eq 0 ] && [ "$section" = "## Execution Log" ]; then
-            printf '\n## Execution Log\n' >> "$task_file"
-        fi
-        if [ "$count" -eq 0 ] && [ "$section" != "## Execution Log" ]; then
-            missing_sections+=("$section")
-        fi
-    done
+    exec_count=$(grep -c '^## Execution Log[[:space:]]*$' "$task_file")
+    if [ "$exec_count" -gt 1 ]; then
+        echo "Expected exactly one section: ## Execution Log" >&2
+        return 1
+    fi
+    if [ "$exec_count" -eq 0 ]; then
+        printf '\n## Execution Log\n' >> "$task_file"
+    fi
 
-    if [ "${#missing_sections[@]}" -eq 0 ]; then
+    _normalize_task_workflow_section "$task_file" "left_off" || return 1
+    _normalize_task_workflow_section "$task_file" "attempts" || return 1
+
+    left_off_count=$(_task_workflow_count "$task_file" "left_off") || return 1
+    attempts_count=$(_task_workflow_count "$task_file" "attempts") || return 1
+    if [ "$left_off_count" -gt 1 ] || [ "$attempts_count" -gt 1 ]; then
+        echo "Expected at most one logical Left Off At section and one logical Attempts section" >&2
+        return 1
+    fi
+
+    missing_left_off=0
+    missing_attempts=0
+    [ "$left_off_count" -eq 0 ] && missing_left_off=1
+    [ "$attempts_count" -eq 0 ] && missing_attempts=1
+    if [ "$missing_left_off" -eq 0 ] && [ "$missing_attempts" -eq 0 ]; then
         return 0
     fi
 
-    local exec_start tmp_file missing_left_off missing_attempts
-    exec_start=$(grep -n -F -x '## Execution Log' "$task_file" | cut -d: -f1)
-    missing_left_off=0
-    missing_attempts=0
-    for section in "${missing_sections[@]}"; do
-        case "$section" in
-            "## Left Off At:") missing_left_off=1 ;;
-            "## Attempts:") missing_attempts=1 ;;
-        esac
-    done
+    exec_start=$(grep -n '^## Execution Log[[:space:]]*$' "$task_file" | head -1 | cut -d: -f1)
     tmp_file=$(same_dir_temp_file "$task_file")
 
     awk -v exec_start="$exec_start" \
@@ -1806,12 +2240,12 @@ ensure_task_workflow_sections() {
         -v missing_attempts="$missing_attempts" '
         NR == exec_start {
             if (missing_left_off == 1) {
-                print "## Left Off At:"
+                print "## Left Off At"
                 print "Not started."
                 print ""
             }
             if (missing_attempts == 1) {
-                print "## Attempts:"
+                print "## Attempts"
                 print "(none yet)"
                 print ""
             }
@@ -1831,7 +2265,7 @@ set_task_left_off_at() {
 
     replacement_file=$(mktemp)
     printf '%s\n' "$message" > "$replacement_file"
-    rewrite_section "$task_file" "## Left Off At:" "$replacement_file"
+    _rewrite_task_workflow_section "$task_file" "left_off" "$replacement_file"
     rm -f "$replacement_file"
 }
 
@@ -1841,22 +2275,11 @@ append_task_attempt() {
     local current_body="" replacement_file=""
 
     ensure_task_workflow_sections "$task_file" || return 1
-    current_body=$(section_body "$task_file" "## Attempts:" 2>/dev/null || true)
+    current_body=$(_task_workflow_body "$task_file" "attempts" 2>/dev/null || true)
 
     replacement_file=$(mktemp)
     if [ -n "$current_body" ]; then
-        printf '%s\n' "$current_body" \
-            | awk '
-                { lines[++count] = $0 }
-                END {
-                    while (count > 0 && (lines[count] == "" || lines[count] == "(none yet)" || lines[count] == "(none)")) {
-                        count--
-                    }
-                    for (i = 1; i <= count; i++) {
-                        print lines[i]
-                    }
-                }
-            ' > "$replacement_file"
+        printf '%s\n' "$current_body" | _filter_task_workflow_attempt_lines > "$replacement_file"
     fi
 
     if [ -s "$replacement_file" ]; then
@@ -1865,7 +2288,7 @@ append_task_attempt() {
         printf '%s\n' "$entry" > "$replacement_file"
     fi
 
-    rewrite_section "$task_file" "## Attempts:" "$replacement_file"
+    _rewrite_task_workflow_section "$task_file" "attempts" "$replacement_file"
     rm -f "$replacement_file"
 }
 
@@ -2090,6 +2513,7 @@ validate_task_file() {
     local task_file="$1"
     local required_sections=("## Task:" "## Status:" "## Goal:" "## Current Plan" "## Critique" "## Plan History" "## Execution Log")
     local valid=true
+    local left_off_count attempts_count
 
     for section in "${required_sections[@]}"; do
         if ! grep -q "^${section}" "$task_file"; then
@@ -2098,11 +2522,152 @@ validate_task_file() {
         fi
     done
 
+    left_off_count=$(_task_workflow_count "$task_file" "left_off") || left_off_count=0
+    attempts_count=$(_task_workflow_count "$task_file" "attempts") || attempts_count=0
+
+    if [ "$left_off_count" -gt 1 ]; then
+        echo -e "${RED}Duplicate logical section: ## Left Off At${NC}"
+        valid=false
+    fi
+    if [ "$attempts_count" -gt 1 ]; then
+        echo -e "${RED}Duplicate logical section: ## Attempts${NC}"
+        valid=false
+    fi
+
     if [ "$valid" = true ]; then
         return 0
     else
         return 1
     fi
+}
+
+_v1_list_canonical_open_task_markdown_files() {
+    local task_root="${SCRIPT_DIR}/docs/tasks/open"
+    [[ -d "$task_root" ]] || return 0
+
+    find "$task_root" -type f -name '*.md' \
+        ! -path '*/competitive/*' \
+        ! -path '*/logs/*' | LC_ALL=C sort
+}
+
+_v1_relpath_from_script_dir() {
+    local abs_path="$1"
+    case "$abs_path" in
+        "$SCRIPT_DIR"/*)
+            printf '%s\n' "${abs_path#"$SCRIPT_DIR"/}"
+            ;;
+        *)
+            printf '%s\n' "$abs_path"
+            ;;
+    esac
+}
+
+_v1_snapshot_canonical_open_task_files() {
+    local snapshot_dir="$1"
+    local active_task_file="${2:-}"
+    local abs_path rel_path
+
+    mkdir -p "$snapshot_dir" || return 1
+
+    while IFS= read -r abs_path; do
+        [[ -n "$active_task_file" && "$abs_path" == "$active_task_file" ]] && continue
+        rel_path=$(_v1_relpath_from_script_dir "$abs_path")
+        mkdir -p "$snapshot_dir/$(dirname "$rel_path")" || return 1
+        cp "$abs_path" "$snapshot_dir/$rel_path" || return 1
+    done < <(_v1_list_canonical_open_task_markdown_files)
+}
+
+_v1_detect_canonical_open_task_file_drift() {
+    local snapshot_dir="$1"
+    local active_task_file="$2"
+    local output_file="${3:-}"
+    local abs_path rel_path current_path
+
+    if [[ -n "$output_file" ]]; then
+        : > "$output_file" || return 1
+    fi
+
+    while IFS= read -r abs_path; do
+        rel_path="${abs_path#"$snapshot_dir"/}"
+        current_path="$SCRIPT_DIR/$rel_path"
+        if [[ ! -f "$current_path" ]]; then
+            printf 'deleted\t%s\n' "$rel_path"
+        elif ! cmp -s "$abs_path" "$current_path"; then
+            printf 'modified\t%s\n' "$rel_path"
+        fi
+    done < <(find "$snapshot_dir" -type f -name '*.md' | LC_ALL=C sort) \
+        | {
+            if [[ -n "$output_file" ]]; then
+                cat > "$output_file"
+            else
+                cat
+            fi
+        }
+
+    while IFS= read -r abs_path; do
+        [[ "$abs_path" == "$active_task_file" ]] && continue
+        rel_path=$(_v1_relpath_from_script_dir "$abs_path")
+        [[ -f "$snapshot_dir/$rel_path" ]] && continue
+        if [[ -n "$output_file" ]]; then
+            printf 'created\t%s\n' "$rel_path" >> "$output_file"
+        else
+            printf 'created\t%s\n' "$rel_path"
+        fi
+    done < <(_v1_list_canonical_open_task_markdown_files)
+}
+
+_v1_format_canonical_open_task_file_drift() {
+    local drift_file="$1"
+
+    awk -F'\t' '
+        NF >= 2 {
+            if (!seen[$1]++) {
+                order[++count] = $1
+            }
+            paths[$1] = paths[$1] (paths[$1] ? ", " : "") $2
+        }
+        END {
+            for (i = 1; i <= count; i++) {
+                kind = order[i]
+                printf "%s%s: %s", (i > 1 ? "; " : ""), kind, paths[kind]
+            }
+            if (count > 0) {
+                printf "\n"
+            }
+        }
+    ' "$drift_file"
+}
+
+_v1_restore_canonical_open_task_file_drift() {
+    local snapshot_dir="$1"
+    local drift_file="$2"
+    local quarantine_root="$3"
+    local status rel_path snapshot_path live_path quarantine_path
+
+    while IFS=$'\t' read -r status rel_path; do
+        [[ -n "$status" && -n "$rel_path" ]] || continue
+        case "$status" in
+            modified|deleted)
+                snapshot_path="$snapshot_dir/$rel_path"
+                live_path="$SCRIPT_DIR/$rel_path"
+                [[ -f "$snapshot_path" ]] || return 1
+                mkdir -p "$(dirname "$live_path")" || return 1
+                cp "$snapshot_path" "$live_path" || return 1
+                ;;
+            created)
+                live_path="$SCRIPT_DIR/$rel_path"
+                [[ -e "$live_path" ]] || continue
+                [[ -n "$quarantine_root" ]] || return 1
+                quarantine_path="$quarantine_root/$rel_path"
+                mkdir -p "$(dirname "$quarantine_path")" || return 1
+                mv "$live_path" "$quarantine_path" || return 1
+                ;;
+            *)
+                echo "Unknown V1 task drift status: $status" >&2
+                return 1
+                ;;
+        esac
+    done < "$drift_file"
 }
 
 inject_context() {
@@ -2116,7 +2681,7 @@ inject_context() {
     fi
 
     local goal_line
-    goal_line=$(grep '^## Goal:' "$task_file" | head -1 | sed 's/^## Goal: //')
+    goal_line="$(_verify_extract_goal "$task_file" 2>/dev/null || true)"
 
     # Extract keywords (words > 3 chars, skip common words)
     local keywords
@@ -2837,6 +3402,66 @@ _traditional_dev_proxy_unique_nonblank_lines() {
     awk 'NF { if (!seen[$0]++) print $0 }'
 }
 
+_normalize_xml_task_path_token() {
+    local raw="$1"
+    raw=$(printf '%s\n' "$raw" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//')
+    raw="${raw#./}"
+    raw="${raw#\`}"
+    raw="${raw%\`}"
+    case "$raw" in
+        ""|"N/A"|"n/a"|"None"|"none")
+            return 1
+            ;;
+    esac
+    [[ "$raw" == *"/"* || "$raw" == *"."* ]] || return 1
+    printf '%s\n' "$raw"
+}
+
+_extract_xml_task_paths() {
+    local source_file="$1"
+    {
+        awk '
+            {
+                line = $0
+                while (match(line, /<files>[^<]+<\/files>/)) {
+                    inner = substr(line, RSTART + 7, RLENGTH - 15)
+                    print inner
+                    line = substr(line, RSTART + RLENGTH)
+                }
+            }
+        ' "$source_file" 2>/dev/null || true
+    } | while IFS= read -r raw_content; do
+        if [[ "$raw_content" == *,* ]]; then
+            printf '%s\n' "$raw_content" | tr ',' '\n'
+        else
+            printf '%s\n' "$raw_content" | awk '{for(i=1;i<=NF;i++) print $i}'
+        fi
+    done \
+        | while IFS= read -r path; do
+            _normalize_xml_task_path_token "$path" || true
+        done \
+        | awk 'NF && !seen[$0]++'
+}
+
+_reject_slug_internal_paths() {
+    local slug="$1"
+    local path=""
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        case "$path" in
+            "docs/tasks/open/${slug}/task.md"|\
+            "docs/tasks/open/${slug}/competitive/"*|\
+            "docs/tasks/open/${slug}/logs/"*|\
+            competitive/*|\
+            logs/*)
+                ;;
+            *)
+                printf '%s\n' "$path"
+                ;;
+        esac
+    done
+}
+
 _traditional_dev_proxy_normalize_scope_path() {
     local raw="$1"
     raw=$(_traditional_dev_proxy_trim_line "$raw")
@@ -2873,26 +3498,6 @@ _traditional_dev_proxy_extract_files_to_modify_paths() {
             }
         }
     ' "$source_file" \
-        | while IFS= read -r path; do
-            _traditional_dev_proxy_normalize_scope_path "$path" || true
-        done \
-        | _traditional_dev_proxy_unique_nonblank_lines
-}
-
-_traditional_dev_proxy_extract_xml_task_paths() {
-    local source_file="$1"
-    [[ -f "$source_file" ]] || return 0
-    awk '
-        {
-            line = $0
-            while (match(line, /<files>[^<]+<\/files>/)) {
-                inner = substr(line, RSTART + 7, RLENGTH - 15)
-                print inner
-                line = substr(line, RSTART + RLENGTH)
-            }
-        }
-    ' "$source_file" \
-        | tr ',' '\n' \
         | while IFS= read -r path; do
             _traditional_dev_proxy_normalize_scope_path "$path" || true
         done \
@@ -3061,9 +3666,9 @@ _traditional_dev_proxy_resolve_scope_paths() {
                 scope_paths=$(
                     {
                         _traditional_dev_proxy_extract_files_to_modify_paths "$comp_dir/revised-plan.md"
-                        _traditional_dev_proxy_extract_xml_task_paths "$comp_dir/revised-plan.md"
+                        _extract_xml_task_paths "$comp_dir/revised-plan.md"
                         _traditional_dev_proxy_extract_files_to_modify_paths "$comp_dir/fix-plan.md"
-                        _traditional_dev_proxy_extract_xml_task_paths "$comp_dir/fix-plan.md"
+                        _extract_xml_task_paths "$comp_dir/fix-plan.md"
                     } | _traditional_dev_proxy_unique_nonblank_lines
                 )
                 if [[ -n "$scope_paths" ]]; then
@@ -3128,7 +3733,9 @@ _chaos_count_findings() {
 # Extract goal text from task file
 _verify_extract_goal() {
     local task_file="$1"
-    grep '^## Goal:' "$task_file" | head -1 | sed 's/^## Goal: //'
+    local goal_text=""
+    goal_text="$(_task_goal_content "$task_file")" || return 1
+    printf '%s\n' "$goal_text" | _trim_joined_text
 }
 
 # Extract done criteria from task file (lines between ## Done Criteria and next ## header)

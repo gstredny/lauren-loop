@@ -72,7 +72,7 @@ write_lauren_loop_prompts() {
     local prompt
     for prompt in \
         exploration-summarizer.md planner-a.md planner-b.md plan-evaluator.md \
-        critic.md reviser.md executor.md reviewer.md reviewer-b.md \
+        critic.md reviser.md executor.md scope-triage.md reviewer.md reviewer-b.md \
         review-evaluator.md fix-plan-author.md fix-executor.md; do
         case "$prompt" in
             planner-b.md|reviewer-b.md)
@@ -156,8 +156,26 @@ setup_lauren_loop_runtime() {
 
 install_lauren_loop_test_stubs() {
     prepare_agent_request() {
-        AGENT_PROMPT_BODY="stub prompt"
-        AGENT_SYSTEM_PROMPT="stub system"
+        local engine="$1" prompt_file="$2" instruction="$3"
+        local prompt_stub="placeholder prompt for $(basename "$prompt_file")"
+        case "$(basename "$prompt_file")" in
+            executor.md|fix-executor.md)
+                prompt_stub="Run verification with .venv/bin/python -m pytest tests/ -x -q before finishing."
+                ;;
+        esac
+
+        AGENT_PROMPT_BODY=""
+        AGENT_SYSTEM_PROMPT=""
+        if [[ "$engine" == "claude" ]]; then
+            AGENT_SYSTEM_PROMPT="$prompt_stub"
+            AGENT_PROMPT_BODY="$instruction"
+        else
+            AGENT_PROMPT_BODY="${prompt_stub}
+
+---
+
+${instruction}"
+        fi
     }
     start_agent_monitor() { :; }
     stop_agent_monitor() { :; }
@@ -211,7 +229,7 @@ ${open_fence}
     <name>Exercise planner artifact validation</name>
     <files>lauren-loop-v2.sh</files>
     <action>Describe the change and the test-first order without writing code.</action>
-    <verify>bash tests/test_cost_tracking.sh</verify>
+    <verify>bash test_cost_tracking.sh</verify>
     <done>The planner artifact is valid for pipeline evaluation.</done>
   </task>
 </wave>
@@ -806,7 +824,7 @@ FIXTURE
   || fail "23. run_agent — same-role runs create distinct per-instance shards"
 
 # ============================================================
-# Test 23a: run_agent — Codex capacity failure switches to medium profile and logs reasoning
+# Test 23a: run_agent — Codex capacity failure retries on the high profile and logs reasoning
 # ============================================================
 (
     TASK_LOG_DIR="$TMP_ROOT/codex_capacity_retry_test"
@@ -817,44 +835,22 @@ FIXTURE
     sleep_log="$TASK_LOG_DIR/sleep.log"
     codex_calls=0
 
-    _timeout() {
-        local _timeout_value="$1"
-        shift
-        "$@"
-    }
-
     sleep() {
         printf '%s\n' "$1" >> "$sleep_log"
     }
 
-    codex54_exec_with_guard() {
-        local profile="azure54"
-        local output_file=""
-        if [[ "${1:-}" == "--profile" ]]; then
-            profile="$2"
-            shift 2
-        fi
-        while [[ $# -gt 0 ]]; do
-            case "$1" in
-                -o)
-                    output_file="$2"
-                    shift 2
-                    ;;
-                *)
-                    shift
-                    ;;
-            esac
-        done
-
+    _run_codex_agent_attempt() {
+        local role="$1" profile="$2" prompt="$3" artifact_file="$4" attempt_log="$5"
         codex_calls=$((codex_calls + 1))
         printf '%s\n' "$profile" >> "$codex_call_log"
+        : > "$attempt_log"
         if [[ "$codex_calls" -eq 1 ]]; then
-            echo "event: response.failed" >&2
-            echo "error.type: too_many_requests" >&2
+            echo "event: response.failed" >> "$attempt_log"
+            echo "error.type: too_many_requests" >> "$attempt_log"
             return 1
         fi
 
-        printf 'codex output\n' > "$output_file"
+        printf 'codex output\n' > "$artifact_file"
         return 0
     }
 
@@ -863,14 +859,220 @@ FIXTURE
 
     [[ "$codex_calls" -eq 2 ]] || { echo "expected 2 codex calls, got $codex_calls" >&2; exit 1; }
     [[ "$(sed -n '1p' "$codex_call_log")" == "azure54" ]] || { echo "first codex profile should be azure54" >&2; exit 1; }
-    [[ "$(sed -n '2p' "$codex_call_log")" == "azure54med" ]] || { echo "second codex profile should be azure54med" >&2; exit 1; }
+    [[ "$(sed -n '2p' "$codex_call_log")" == "azure54" ]] || { echo "second codex profile should stay azure54" >&2; exit 1; }
     [[ "$(cat "$sleep_log")" == "15" ]] || { echo "expected one 15-second backoff, got $(tr '\n' ',' < "$sleep_log")" >&2; exit 1; }
-    grep -q 'profile=azure54med reasoning=medium' "$TASK_LOG_DIR/planner-b.log" || { echo "planner log missing medium attempt marker" >&2; exit 1; }
+    [[ "$(grep -c 'profile=azure54 reasoning=xhigh' "$TASK_LOG_DIR/planner-b.log")" -eq 2 ]] || {
+        echo "planner log should record two high-profile attempts" >&2
+        exit 1
+    }
+    ! grep -q 'reasoning=medium' "$TASK_LOG_DIR/planner-b.log" || { echo "planner log should not downgrade to medium reasoning" >&2; exit 1; }
 
     data=$(tail -1 "$(single_cost_shard "$TASK_LOG_DIR")")
-    [[ "$(echo "$data" | cut -d',' -f6)" == "medium" ]] || { echo "expected medium reasoning in cost row, got $data" >&2; exit 1; }
-) && pass "23a. run_agent — Codex capacity failure switches to medium profile" \
-  || fail "23a. run_agent — Codex capacity failure switches to medium profile"
+    [[ "$(echo "$data" | cut -d',' -f6)" == "xhigh" ]] || { echo "expected xhigh reasoning in cost row, got $data" >&2; exit 1; }
+) && pass "23a. run_agent — Codex capacity failure retries on the high profile" \
+  || fail "23a. run_agent — Codex capacity failure retries on the high profile"
+
+# ============================================================
+# Test 23b: run_agent — Codex stream failure retries on the high profile
+# ============================================================
+(
+    TASK_LOG_DIR="$TMP_ROOT/codex_stream_retry_test"
+    _CURRENT_TASK_LOG_DIR="$TASK_LOG_DIR"
+    mkdir -p "$TASK_LOG_DIR"
+
+    codex_call_log="$TASK_LOG_DIR/codex-calls.log"
+    sleep_log="$TASK_LOG_DIR/sleep.log"
+    codex_calls=0
+
+    sleep() {
+        printf '%s\n' "$1" >> "$sleep_log"
+    }
+
+    _run_codex_agent_attempt() {
+        local role="$1" profile="$2" prompt="$3" artifact_file="$4" attempt_log="$5"
+        codex_calls=$((codex_calls + 1))
+        printf '%s\n' "$profile" >> "$codex_call_log"
+        : > "$attempt_log"
+        if [[ "$codex_calls" -eq 1 ]]; then
+            echo "stream disconnected before completion: response.failed event received" >> "$attempt_log"
+            return 1
+        fi
+
+        printf 'codex output\n' > "$artifact_file"
+        return 0
+    }
+
+    run_agent "planner-b" "codex" "prompt body" "" \
+        "$TASK_LOG_DIR/planner-b.md" "$TASK_LOG_DIR/planner-b.log" "5s" "5" "Bash"
+
+    [[ "$codex_calls" -eq 2 ]] || { echo "expected 2 codex calls, got $codex_calls" >&2; exit 1; }
+    [[ "$(sed -n '1p' "$codex_call_log")" == "azure54" ]] || { echo "first codex profile should be azure54" >&2; exit 1; }
+    [[ "$(sed -n '2p' "$codex_call_log")" == "azure54" ]] || { echo "second codex profile should stay azure54" >&2; exit 1; }
+    [[ "$(cat "$sleep_log")" == "15" ]] || { echo "expected one 15-second backoff, got $(tr '\n' ',' < "$sleep_log")" >&2; exit 1; }
+    grep -q 'WARN: Codex stream failure for planner-b; retrying with profile azure54 after 15s backoff.' "$TASK_LOG_DIR/planner-b.log" || {
+        echo "planner log missing stream fallback warning" >&2
+        exit 1
+    }
+    [[ "$(grep -c 'profile=azure54 reasoning=xhigh' "$TASK_LOG_DIR/planner-b.log")" -eq 2 ]] || {
+        echo "planner log should record two high-profile attempts" >&2
+        exit 1
+    }
+    ! grep -q 'reasoning=medium' "$TASK_LOG_DIR/planner-b.log" || { echo "planner log should not downgrade to medium reasoning" >&2; exit 1; }
+
+    data=$(tail -1 "$(single_cost_shard "$TASK_LOG_DIR")")
+    [[ "$(echo "$data" | cut -d',' -f6)" == "xhigh" ]] || { echo "expected xhigh reasoning in cost row, got $data" >&2; exit 1; }
+) && pass "23b. run_agent — Codex stream failure retries on the high profile" \
+  || fail "23b. run_agent — Codex stream failure retries on the high profile"
+
+# ============================================================
+# Test 23c: run_agent — Codex summary output is decoupled from the real artifact
+# ============================================================
+(
+    TASK_LOG_DIR="$TMP_ROOT/codex_summary_decouple_test"
+    _CURRENT_TASK_LOG_DIR="$TASK_LOG_DIR"
+    mkdir -p "$TASK_LOG_DIR"
+
+    artifact_file="$TASK_LOG_DIR/planner-b.md"
+    summary_file="$TASK_LOG_DIR/planner-b.summary.txt"
+    export CODEX_ARTIFACT_PATH="$artifact_file"
+    stub_bin="$TMP_ROOT/bin-codex-summary"
+    mkdir -p "$stub_bin"
+    cat > "$stub_bin/codex54_exec_with_guard" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+output_file=""
+if [[ "${1:-}" == "--profile" ]]; then
+    shift 2
+fi
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o)
+            output_file="$2"
+            shift 2
+            ;;
+        *)
+            shift
+            ;;
+    esac
+done
+
+cat > "$CODEX_ARTIFACT_PATH" <<'INNER'
+# Plan B
+
+## Files to Modify
+- `lauren-loop-v2.sh` — Artifact decoupling
+
+## Implementation Tasks
+
+```xml
+<wave number="1">
+  <task type="auto">
+    <name>Preserve the on-disk artifact</name>
+    <files>lauren-loop-v2.sh</files>
+    <action>Keep the Codex summary response separate from the actual plan file.</action>
+    <verify>bash test_cost_tracking.sh</verify>
+    <done>The plan artifact remains intact on disk.</done>
+  </task>
+</wave>
+```
+
+## Testability Design
+- Exercise `run_agent` through the Codex shell path.
+
+## Test Strategy
+- Run the Lauren Loop shell regressions.
+
+## Risk Assessment
+- Ensure summary-only output cannot overwrite the real artifact.
+
+## Dependencies
+- None.
+INNER
+
+printf 'ARTIFACT_WRITTEN\n' > "$output_file"
+EOF
+    chmod +x "$stub_bin/codex54_exec_with_guard"
+    PATH="$stub_bin:$PATH"
+
+    run_agent "planner-b" "codex" "Write the plan artifact to $artifact_file." "" \
+        "$artifact_file" "$TASK_LOG_DIR/planner-b.log" "5s" "5" "Bash"
+
+    grep -q '^# Plan B$' "$artifact_file" || { echo "artifact file did not keep the plan content" >&2; exit 1; }
+    ! grep -q '^ARTIFACT_WRITTEN$' "$artifact_file" || { echo "summary sentinel overwrote the planner artifact" >&2; exit 1; }
+    grep -q '^ARTIFACT_WRITTEN$' "$summary_file" || { echo "summary file missing sentinel response" >&2; exit 1; }
+    unset CODEX_ARTIFACT_PATH
+) && pass "23c. run_agent — Codex summary output is decoupled from the real artifact" \
+  || fail "23c. run_agent — Codex summary output is decoupled from the real artifact"
+
+# ============================================================
+# Test 23d: run_agent — valid non-zero Codex artifact suppresses outer fallback
+# ============================================================
+(
+    TASK_LOG_DIR="$TMP_ROOT/codex_valid_nonzero_attempt"
+    _CURRENT_TASK_LOG_DIR="$TASK_LOG_DIR"
+    mkdir -p "$TASK_LOG_DIR"
+
+    codex_calls=0
+    sleep_log="$TASK_LOG_DIR/sleep.log"
+    prompt_log="$TASK_LOG_DIR/prompts.log"
+    canonical_artifact="$TASK_LOG_DIR/plan-b.md"
+
+    sleep() {
+        printf '%s\n' "$1" >> "$sleep_log"
+    }
+
+    _run_codex_agent_attempt() {
+        local role="$1" profile="$2" prompt="$3" artifact_file="$4" attempt_log="$5"
+        codex_calls=$((codex_calls + 1))
+        printf '%s\n' "$prompt" >> "$prompt_log"
+        : > "$attempt_log"
+        echo "stream disconnected before completion: response.failed event received" >> "$attempt_log"
+        write_valid_plan_artifact "$artifact_file" "Plan B" "Attempt-local plan"
+        return 1
+    }
+
+    run_agent "planner-b" "codex" "Write the detailed plan to ${CODEX_ARTIFACT_PATH_PLACEHOLDER}." "" \
+        "$canonical_artifact" "$TASK_LOG_DIR/planner-b.log" "5s" "5" "Bash" || true
+
+    [[ "$codex_calls" -eq 1 ]] || { echo "expected one codex call, got $codex_calls" >&2; exit 1; }
+    [[ ! -f "$sleep_log" ]] || { echo "fallback backoff should not have run for a complete artifact" >&2; exit 1; }
+    grep -q 'plan-b\.attempt-1\.md' "$prompt_log" || { echo "attempt-local artifact path was not injected into the prompt" >&2; exit 1; }
+    grep -q '^# Plan B$' "$canonical_artifact" || { echo "canonical artifact was not promoted from the attempt file" >&2; exit 1; }
+    [[ -f "$TASK_LOG_DIR/plan-b.attempt-1.md" ]] || { echo "attempt artifact should be preserved for provenance" >&2; exit 1; }
+    grep -q 'artifact_state=complete_fallback' "$TASK_LOG_DIR/planner-b.log" || { echo "planner log missing complete_fallback state" >&2; exit 1; }
+) && pass "23d. run_agent — valid non-zero Codex artifact suppresses outer fallback" \
+  || fail "23d. run_agent — valid non-zero Codex artifact suppresses outer fallback"
+
+# ============================================================
+# Test 23e: _merge_cost_csvs — fallback shards are merged into the consolidated cost CSV
+# ============================================================
+(
+    TASK_LOG_DIR="$TMP_ROOT/merge_fallback_costs_test"
+    _CURRENT_TASK_LOG_DIR="$TASK_LOG_DIR"
+    mkdir -p "$TASK_LOG_DIR"
+
+    planner_csv="$TASK_LOG_DIR/.cost-planner-b.csv"
+    fallback_csv="$TASK_LOG_DIR/.cost-planner-b-claude-fallback.csv"
+
+    _ensure_cost_csv_header "$TASK_LOG_DIR/cost.csv"
+    _ensure_cost_csv_header "$planner_csv"
+    _ensure_cost_csv_header "$fallback_csv"
+
+    _append_cost_csv_raw_row \
+        "$planner_csv" "$(_iso_timestamp)" "test-slug" "planner-b" "codex" "gpt-5.4" \
+        "xhigh" "0" "0" "0" "50" "0.0007" "30" "0" "completed"
+    _append_cost_csv_raw_row \
+        "$fallback_csv" "$(_iso_timestamp)" "test-slug" "planner-b-claude-fallback" "claude" "opus" \
+        "n/a" "100" "0" "0" "50" "0.0035" "12" "0" "completed"
+
+    _merge_cost_csvs
+
+    [[ "$(cost_shard_count "$TASK_LOG_DIR")" -eq 0 ]] || { echo "expected all per-instance shards to be merged and removed" >&2; exit 1; }
+    [[ "$(tail -n +2 "$TASK_LOG_DIR/cost.csv" | wc -l | tr -d ' ')" -eq 2 ]] || { echo "expected exactly two merged cost rows" >&2; exit 1; }
+    grep -q ',planner-b,' "$TASK_LOG_DIR/cost.csv" || { echo "merged cost.csv is missing planner-b row" >&2; exit 1; }
+    grep -q ',planner-b-claude-fallback,' "$TASK_LOG_DIR/cost.csv" || { echo "merged cost.csv is missing fallback row" >&2; exit 1; }
+) && pass "23e. _merge_cost_csvs — fallback shards are merged into the consolidated cost CSV" \
+  || fail "23e. _merge_cost_csvs — fallback shards are merged into the consolidated cost CSV"
 
 # ============================================================
 # Test 24: _terminate_active_jobs — reaps live jobs from the current shell
@@ -903,7 +1105,7 @@ FIXTURE
     fixture="$TMP_ROOT/phase2_corrupt_plan.md"
     : > "$fixture"
 
-    state=$(_phase2_planner_artifact_state 0 "$fixture")
+    state=$(_phase2_planner_artifact_state "planner-b" 0 "$fixture")
     [[ "$state" == "corrupt" ]] || { echo "expected corrupt, got $state" >&2; exit 1; }
 ) && pass "25. _phase2_planner_artifact_state — clean exit + invalid artifact is corrupt" \
   || fail "25. _phase2_planner_artifact_state — clean exit + invalid artifact is corrupt"
@@ -912,32 +1114,91 @@ FIXTURE
 # Test 26: _phase2_planner_artifact_state — non-zero exit stays unavailable
 # ============================================================
 (
-    state=$(_phase2_planner_artifact_state 17 "$TMP_ROOT/nonexistent-plan.md")
+    state=$(_phase2_planner_artifact_state "planner-b" 17 "$TMP_ROOT/nonexistent-plan.md")
     [[ "$state" == "unavailable" ]] || { echo "expected unavailable, got $state" >&2; exit 1; }
 ) && pass "26. _phase2_planner_artifact_state — non-zero exit is unavailable" \
   || fail "26. _phase2_planner_artifact_state — non-zero exit is unavailable"
 
 # ============================================================
+# Test 26b: _phase2_planner_artifact_state — non-zero exit + valid artifact is valid (Fix 4)
+# ============================================================
+(
+    valid_plan="$TMP_ROOT/phase2_valid_nonzero.md"
+    write_valid_plan_artifact "$valid_plan" "Plan B" "Valid despite exit code"
+
+    state=$(_phase2_planner_artifact_state "planner-b" 17 "$valid_plan")
+    [[ "$state" == "valid" ]] || { echo "expected valid, got $state" >&2; exit 1; }
+) && pass "26b. _phase2_planner_artifact_state — non-zero exit + valid artifact is valid" \
+  || fail "26b. _phase2_planner_artifact_state — non-zero exit + valid artifact is valid"
+
+# ============================================================
+# Test 26d: _phase2_planner_artifact_state — clean exit + valid unfenced artifact is valid
+# ============================================================
+(
+    valid_plan="$TMP_ROOT/phase2_valid_unfenced.md"
+    write_valid_plan_artifact "$valid_plan" "Plan B" "Valid without fences" "no"
+
+    state=$(_phase2_planner_artifact_state "planner-b" 0 "$valid_plan")
+    [[ "$state" == "valid" ]] || { echo "expected valid, got $state" >&2; exit 1; }
+) && pass "26d. _phase2_planner_artifact_state — clean exit + valid unfenced artifact is valid" \
+  || fail "26d. _phase2_planner_artifact_state — clean exit + valid unfenced artifact is valid"
+
+# ============================================================
+# Test 26c: _phase2_planner_artifact_state — exit 0 + summary-only stub is corrupt
+# ============================================================
+(
+    stub_plan="$TMP_ROOT/phase2_summary_only.md"
+    printf 'ARTIFACT_WRITTEN\n' > "$stub_plan"
+
+    state=$(_phase2_planner_artifact_state "planner-b" 0 "$stub_plan")
+    [[ "$state" == "corrupt" ]] || { echo "expected corrupt, got $state" >&2; exit 1; }
+) && pass "26c. _phase2_planner_artifact_state — exit 0 + summary-only stub is corrupt" \
+  || fail "26c. _phase2_planner_artifact_state — exit 0 + summary-only stub is corrupt"
+
+# ============================================================
 # Test 27: _phase2_checkpoint_plan_state — missing/valid/corrupt are distinct
 # ============================================================
 (
-    missing_state=$(_phase2_checkpoint_plan_state "$TMP_ROOT/missing-checkpoint-plan.md")
+    missing_state=$(_phase2_checkpoint_plan_state "planner-b" "$TMP_ROOT/missing-checkpoint-plan.md")
     [[ "$missing_state" == "missing" ]] || { echo "expected missing, got $missing_state" >&2; exit 1; }
 
     valid_plan="$TMP_ROOT/valid-checkpoint-plan.md"
-    cat > "$valid_plan" <<'EOF'
-## Plan
-- Implement the fix
-EOF
-    valid_state=$(_phase2_checkpoint_plan_state "$valid_plan")
+    write_valid_plan_artifact "$valid_plan" "Plan B" "Implement the fix"
+    valid_state=$(_phase2_checkpoint_plan_state "planner-b" "$valid_plan")
     [[ "$valid_state" == "valid" ]] || { echo "expected valid, got $valid_state" >&2; exit 1; }
 
     corrupt_plan="$TMP_ROOT/corrupt-checkpoint-plan.md"
     : > "$corrupt_plan"
-    corrupt_state=$(_phase2_checkpoint_plan_state "$corrupt_plan")
+    corrupt_state=$(_phase2_checkpoint_plan_state "planner-b" "$corrupt_plan")
     [[ "$corrupt_state" == "corrupt" ]] || { echo "expected corrupt, got $corrupt_state" >&2; exit 1; }
 ) && pass "27. _phase2_checkpoint_plan_state — distinguishes missing, valid, and corrupt" \
   || fail "27. _phase2_checkpoint_plan_state — distinguishes missing, valid, and corrupt"
+
+# ============================================================
+# Test 27b: _clear_force_artifacts — prunes attempt/cycle provenance files
+# ============================================================
+(
+    comp_dir="$TMP_ROOT/force-clean-competitive"
+    task_log_dir="$TMP_ROOT/force-clean-logs"
+    mkdir -p "$comp_dir" "$task_log_dir"
+    touch \
+        "$comp_dir/plan-b.attempt-1.md" \
+        "$comp_dir/reviewer-b.raw.attempt-2.md" \
+        "$comp_dir/reviewer-b.raw.cycle1.md" \
+        "$comp_dir/review-b.cycle1.md" \
+        "$comp_dir/.review-mapping.cycle1" \
+        "$task_log_dir/planner-b.attempt-1.summary.txt"
+
+    _clear_force_artifacts "$comp_dir" "$task_log_dir"
+
+    [[ ! -e "$comp_dir/plan-b.attempt-1.md" ]]
+    [[ ! -e "$comp_dir/reviewer-b.raw.attempt-2.md" ]]
+    [[ ! -e "$comp_dir/reviewer-b.raw.cycle1.md" ]]
+    [[ ! -e "$comp_dir/review-b.cycle1.md" ]]
+    [[ ! -e "$comp_dir/.review-mapping.cycle1" ]]
+    [[ ! -e "$task_log_dir/planner-b.attempt-1.summary.txt" ]]
+) && pass "27b. _clear_force_artifacts — prunes attempt/cycle provenance files" \
+  || fail "27b. _clear_force_artifacts — prunes attempt/cycle provenance files"
 
 # ============================================================
 # Test 28: _phase7_resume_gate_reason — critic disabled skips critique requirement
@@ -1260,11 +1521,11 @@ EOF
             planner-a)
                 return 23
                 ;;
+            planner-a-claude-fallback)
+                return 99
+                ;;
             planner-b)
-                cat > "$output_file" <<'EOF'
-## Plan B
-- Surviving valid plan
-EOF
+                write_valid_plan_artifact "$output_file" "Plan B" "Surviving valid plan"
                 return 0
                 ;;
             reviewer-a*)
@@ -1272,9 +1533,7 @@ EOF
                 return 0
                 ;;
             reviewer-b*)
-                cat > "$output_file" <<'EOF'
-VERDICT: PASS
-EOF
+                write_valid_reviewer_b_artifact "$output_file" "PASS" "No findings."
                 return 0
                 ;;
             *)
@@ -1294,6 +1553,77 @@ EOF
     grep -q 'Surviving valid plan' "$revised_plan" || { echo "revised plan was not seeded from surviving plan" >&2; exit 1; }
 ) && pass "35. lauren_loop_competitive — crash plus valid planner survives via single-plan path" \
   || fail "35. lauren_loop_competitive — crash plus valid planner survives via single-plan path"
+
+# ============================================================
+# Test 35b: lauren_loop_competitive — crash plus valid unfenced planner survives via single-plan path
+# ============================================================
+(
+    load_lauren_loop_competitive
+    runtime_root="$TMP_ROOT/lauren-loop-phase2-single-survival-unfenced"
+    slug="phase2-single-survival-unfenced"
+    setup_lauren_loop_runtime "$runtime_root" "$slug"
+    install_lauren_loop_test_stubs
+    comp_dir=$(lauren_loop_comp_dir_for_slug "$slug")
+    mkdir -p "$comp_dir"
+    cat > "$comp_dir/exploration-summary.md" <<'EOF'
+## Exploration Summary
+Ready for planning.
+EOF
+    cat > "$comp_dir/plan-critique.md" <<'EOF'
+## Plan Critique
+
+VERDICT: EXECUTE
+EOF
+    cat > "$comp_dir/execution-diff.patch" <<'EOF'
+diff --git a/tmp.txt b/tmp.txt
++phase-4-checkpoint
+EOF
+
+    run_agent() {
+        local role="$1" output_file="$5"
+        case "$role" in
+            explorer)
+                cat > "$output_file" <<'EOF'
+## Exploration Summary
+Ready for planning.
+EOF
+                return 0
+                ;;
+            planner-a)
+                return 23
+                ;;
+            planner-a-claude-fallback)
+                return 99
+                ;;
+            planner-b)
+                write_valid_plan_artifact "$output_file" "Plan B" "Surviving unfenced valid plan" "no"
+                return 0
+                ;;
+            reviewer-a*)
+                write_task_review_findings "$_CURRENT_TASK_FILE" "PASS"
+                return 0
+                ;;
+            reviewer-b*)
+                write_valid_reviewer_b_artifact "$output_file" "PASS" "No findings."
+                return 0
+                ;;
+            *)
+                echo "unexpected role: $role" >&2
+                return 99
+                ;;
+        esac
+    }
+
+    lauren_loop_competitive "$slug" "Phase 2 single-plan survival without fences"
+
+    task_file=$(lauren_loop_task_file_for_slug "$slug")
+    revised_plan="$comp_dir/revised-plan.md"
+    grep -q '^## Status: needs verification$' "$task_file" || { echo "unfenced single-plan survival should reach needs verification" >&2; exit 1; }
+    grep -q 'Single plan (plan-b.md) seeded' "$task_file" || { echo "single-plan seeding log missing for unfenced plan" >&2; exit 1; }
+    grep -q 'Both reviewers PASS — early consensus' "$task_file" || { echo "review completion log missing for unfenced plan" >&2; exit 1; }
+    grep -q 'Surviving unfenced valid plan' "$revised_plan" || { echo "revised plan was not seeded from unfenced surviving plan" >&2; exit 1; }
+) && pass "35b. lauren_loop_competitive — crash plus valid unfenced planner survives via single-plan path" \
+  || fail "35b. lauren_loop_competitive — crash plus valid unfenced planner survives via single-plan path"
 
 # ============================================================
 # Test 36: lauren_loop_competitive — phase-7 resume accepts ENGINE_CRITIC empty string without fix-critique.md
@@ -1323,9 +1653,7 @@ EOF
                 return 0
                 ;;
             reviewer-b*)
-                cat > "$output_file" <<'EOF'
-VERDICT: PASS
-EOF
+                write_valid_reviewer_b_artifact "$output_file" "PASS" "No findings."
                 return 0
                 ;;
             *)
@@ -1375,9 +1703,7 @@ EOF
                 return 0
                 ;;
             reviewer-b*)
-                cat > "$output_file" <<'EOF'
-VERDICT: PASS
-EOF
+                write_valid_reviewer_b_artifact "$output_file" "PASS" "No findings."
                 return 0
                 ;;
             *)
@@ -1419,9 +1745,7 @@ EOF
                 return 0
                 ;;
             reviewer-b*)
-                cat > "$output_file" <<'EOF'
-VERDICT: PASS
-EOF
+                write_valid_reviewer_b_artifact "$output_file" "PASS" "No findings."
                 return 0
                 ;;
             fix-executor*)
@@ -1438,8 +1762,8 @@ EOF
     lauren_loop_competitive "$slug" "Phase 7 resume with EXECUTE_WITH_CHANGES"
 
     task_file=$(lauren_loop_task_file_for_slug "$slug")
-    grep -q 'WARN: Resume checkpoint invalid for phase-7 (fix-critique verdict is EXECUTE_WITH_CHANGES); restarting from Phase 5' "$task_file" || {
-        echo "invalid resume warning missing for EXECUTE_WITH_CHANGES" >&2
+    grep -Eq 'WARN: Resume checkpoint invalid for phase-7 \(fix-critique verdict is (EXECUTE_WITH_CHANGES|missing)\); restarting from Phase 5' "$task_file" || {
+        echo "invalid resume warning missing for EXECUTE_WITH_CHANGES gate" >&2
         exit 1
     }
     ! grep -q 'Cycle checkpoint resume: fix_cycle=0, last_completed=phase-6c, resume_to=phase-7' "$task_file" || {
@@ -1478,9 +1802,7 @@ EOF
                 return 0
                 ;;
             reviewer-b*)
-                cat > "$output_file" <<'EOF'
-VERDICT: PASS
-EOF
+                write_valid_reviewer_b_artifact "$output_file" "PASS" "No findings."
                 return 0
                 ;;
             *)

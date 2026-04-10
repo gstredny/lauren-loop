@@ -61,7 +61,7 @@ write_prompt_fixtures() {
     local root="$1"
     mkdir -p "$root/prompts"
     local prompt
-    for prompt in exploration-summarizer planner-a planner-b plan-evaluator critic reviser executor scope-triage reviewer reviewer-b review-evaluator fix-plan-author fix-executor project-rules; do
+    for prompt in exploration-summarizer planner-a planner-b plan-evaluator critic reviser executor scope-triage reviewer reviewer-b review-evaluator fix-plan-author fix-executor final-verifier final-falsifier final-fixer project-rules; do
         case "$prompt" in
             planner-b|reviewer-b)
                 cp "$REPO_ROOT/prompts/${prompt}.md" "$root/prompts/${prompt}.md"
@@ -461,7 +461,7 @@ set_integration_stubs() {
 ${instruction}"
         fi
     }
-    capture_diff_artifact() { printf 'diff --git a/x b/x\n--- a/src/main.py\n+++ b/src/main.py\n@@ -1 +1 @@\n-baseline\n+modified\n' > "$2"; }
+    capture_diff_artifact() { printf 'diff --git a/x b/x\n--- a/src/main.py\n+++ b/src/main.py\n@@ -1 +1 @@\n-baseline\n+modified\n' > "$2"; printf '1\t1\tsrc/main.py\n' > "${2%.patch}.numstat.tsv"; }
     _classify_diff_risk() { printf 'LOW\n'; }
     _block_on_untracked_files() { return 0; }
     _check_cost_ceiling() { return 0; }
@@ -571,6 +571,8 @@ mock_run_agent() {
 
     # Assert: execution-diff.patch exists (from our capture_diff_artifact stub)
     [[ -s "${comp_dir}/execution-diff.patch" ]]
+    [[ -f "${comp_dir}/traditional-dev-proxy.json" ]]
+    grep -Fq '"summary_text"' "${comp_dir}/traditional-dev-proxy.json"
 
     # Assert: call log contains expected phases
     # Planners run in parallel so order may vary — check membership
@@ -1254,6 +1256,128 @@ EOF
   || fail "9b. MEDIUM reviewer diff risk scales timeout and persists manifest state"
 
 # ============================================================
+# Test 9c: Phase 4 recoverable merge failures preserve execution recovery state
+# ============================================================
+(
+    root="$(setup_integration_fixture "phase4-recoverable-merge")"
+    slug="integ-phase4-recoverable-merge"
+    git -C "$root" checkout -q -b target-recovery
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    log_dir="$task_dir/logs"
+    task_file="$task_dir/task.md"
+    detail_file="$TMP_ROOT/phase4-recoverable-merge.detail"
+    rm -f "$detail_file"
+
+    CALL_LOG="$TMP_ROOT/phase4-recoverable-merge.calls"
+    : > "$CALL_LOG"
+    _COMP_DIR="$comp_dir"
+    _FIXTURE_ROOT="$root"
+    _TASK_FILE="$task_file"
+
+    set_integration_stubs
+    restore_real_manifest_hooks
+    run_agent() {
+        local role="$1" _engine="$2" _prompt="$3" _system="$4" _output="$5" log_file="$6"
+        mkdir -p "$(dirname "$log_file")"
+        : > "$log_file"
+        printf '%s\n' "$role" >> "$CALL_LOG"
+        case "$role" in
+            explorer)
+                printf '# Exploration Summary\n\nExploration of test codebase.\n' > "${comp_dir}/exploration-summary.md"
+                ;;
+            planner-a)
+                write_valid_plan_artifact "${comp_dir}/plan-a.md" "Plan A" "Update"
+                ;;
+            planner-b)
+                write_valid_plan_artifact "${comp_dir}/plan-b.md" "Plan B" "Alternative"
+                ;;
+            evaluator)
+                write_plan_evaluation_artifact "${comp_dir}/plan-evaluation.md"
+                ;;
+            plan-critic-r*)
+                write_plan_critique_artifact "${comp_dir}/plan-critique.md" "EXECUTE"
+                ;;
+            executor)
+                printf 'worktree executor change\n' > "src/main.py"
+                printf '[2026-03-21T00:00:00] VERIFY: executor wrote code\n' >> "docs/tasks/open/${slug}/competitive/execution-log.md"
+                printf 'target branch conflict\n' > "${SCRIPT_DIR}/src/main.py"
+                git -C "$SCRIPT_DIR" add src/main.py
+                git -C "$SCRIPT_DIR" commit -q -m "target conflict commit"
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    set +e
+    (cd "$root" && lauren_loop_competitive "$slug" "Recoverable merge preservation") >/dev/null 2>&1
+    exit_code=$?
+    set -e
+
+    [[ "$exit_code" -ne 0 ]] || {
+        printf 'expected non-zero exit code for recoverable merge failure\n' > "$detail_file"
+        exit 1
+    }
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "blocked" ]] || {
+        printf 'status=%s\n' "$status" > "$detail_file"
+        sed -n '1,220p' "$task_file" >> "$detail_file"
+        exit 1
+    }
+
+    manifest="${comp_dir}/run-manifest.json"
+    [[ -f "$manifest" ]] || {
+        printf 'manifest missing\n' > "$detail_file"
+        exit 1
+    }
+    jq -e '
+        .final_status == "blocked" and
+        ([.phases[] | select(
+            .phase == "phase-4" and
+            .name == "execute" and
+            .status == "failed" and
+            .error_class == "merge_failure" and
+            .recovery.target_ref == "refs/heads/target-recovery"
+        )] | length) == 1
+    ' "$manifest" >/dev/null || {
+        printf 'manifest recovery metadata missing or invalid\n' > "$detail_file"
+        jq '.' "$manifest" >> "$detail_file"
+        exit 1
+    }
+
+    recovery_branch=$(jq -r '[.phases[] | select(.phase == "phase-4" and .status == "failed")][-1].recovery.branch' "$manifest")
+    recovery_worktree=$(jq -r '[.phases[] | select(.phase == "phase-4" and .status == "failed")][-1].recovery.worktree_path' "$manifest")
+    recovery_dir=$(jq -r '[.phases[] | select(.phase == "phase-4" and .status == "failed")][-1].recovery.recovery_dir' "$manifest")
+    combined_patch=$(jq -r '[.phases[] | select(.phase == "phase-4" and .status == "failed")][-1].recovery.combined_patch' "$manifest")
+    commit_log=$(jq -r '[.phases[] | select(.phase == "phase-4" and .status == "failed")][-1].recovery.commit_log' "$manifest")
+    format_patch_dir=$(jq -r '[.phases[] | select(.phase == "phase-4" and .status == "failed")][-1].recovery.format_patch_dir' "$manifest")
+    preserved_commit=$(jq -r '[.phases[] | select(.phase == "phase-4" and .status == "failed")][-1].recovery.preserved_commit' "$manifest")
+
+    [[ -n "$recovery_branch" && "$recovery_branch" != "null" ]] || { printf 'recovery branch missing\n' > "$detail_file"; exit 1; }
+    [[ -n "$recovery_worktree" && "$recovery_worktree" != "null" ]] || { printf 'recovery worktree missing\n' > "$detail_file"; exit 1; }
+    [[ -n "$preserved_commit" && "$preserved_commit" != "null" ]] || { printf 'preserved commit missing\n' > "$detail_file"; exit 1; }
+    [[ -d "$recovery_worktree" ]] || { printf 'recovery worktree path missing on disk\n' > "$detail_file"; exit 1; }
+    git -C "$root" branch --list "$recovery_branch" | grep -q . || { printf 'recovery branch missing in git refs\n' > "$detail_file"; exit 1; }
+    [[ -d "$recovery_dir" ]] || { printf 'recovery dir missing on disk\n' > "$detail_file"; exit 1; }
+    [[ -f "$combined_patch" ]] || { printf 'combined patch missing\n' > "$detail_file"; exit 1; }
+    [[ -f "$commit_log" ]] || { printf 'commit log missing\n' > "$detail_file"; exit 1; }
+    [[ -d "$format_patch_dir" ]] || { printf 'format-patch dir missing\n' > "$detail_file"; exit 1; }
+    ls "$format_patch_dir"/*.patch >/dev/null 2>&1 || { printf 'format-patch output missing\n' > "$detail_file"; exit 1; }
+    grep -Fq 'worktree executor change' "$combined_patch" || { printf 'combined patch missing worktree change\n' > "$detail_file"; exit 1; }
+    grep -Fq 'lauren-loop: persist execution worktree changes' "$commit_log" || { printf 'commit log missing persisted commit entry\n' > "$detail_file"; exit 1; }
+    grep -Fq 'recovery branch:' "$task_file" || { printf 'task log missing recovery branch details\n' > "$detail_file"; exit 1; }
+    ! git -C "$root" rev-parse -q --verify MERGE_HEAD >/dev/null 2>&1 || { printf 'main repo still in merge state\n' > "$detail_file"; exit 1; }
+
+    git -C "$root" worktree remove "$recovery_worktree" --force >/dev/null 2>&1 || { printf 'failed to remove preserved worktree\n' > "$detail_file"; exit 1; }
+    git -C "$root" branch -D "$recovery_branch" >/dev/null 2>&1 || { printf 'failed to remove preserved branch\n' > "$detail_file"; exit 1; }
+) && pass "9c. phase 4 recoverable merge failures preserve branch/worktree state and recovery artifacts" \
+  || fail "9c. phase 4 recoverable merge failures preserve branch/worktree state and recovery artifacts" "$(cat "$TMP_ROOT/phase4-recoverable-merge.detail" 2>/dev/null)"
+
+# ============================================================
 # Test 10: Claude planner fails — no backstop arms and fallback is attempted before single-plan seed
 # ============================================================
 (
@@ -1917,6 +2041,156 @@ EOF
     grep -q 'review-a=absent' "${comp_dir}/.review-mapping"
 ) && pass "10i. Reviewer A fallback invalid artifact — validation reason logged" \
   || fail "10i. Reviewer A fallback invalid artifact — validation reason logged"
+
+# ============================================================
+# Test 10j: Nested exact task match resumes without creating duplicate top-level task.md
+# ============================================================
+(
+    root="$(setup_integration_fixture "nested-task-resume")"
+    slug="integ-nested-task-resume"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    nested_task="$root/docs/tasks/open/security/$slug.md"
+    nested_task_dir="$root/docs/tasks/open/security/$slug"
+
+    mkdir -p "$(dirname "$nested_task")"
+    mv "$task_dir/task.md" "$nested_task"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1" log_file="$6"
+        case "$role" in
+            explorer)
+                printf 'Nested task resume stub failure.\n' > "$log_file"
+                return 1
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Nested task resume") >/dev/null 2>&1 || true
+
+    [[ ! -f "$task_dir/task.md" ]]
+    [[ -f "${nested_task_dir}/task.md" ]]
+    status=$(grep '^## Status:' "${nested_task_dir}/task.md" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "blocked" ]]
+    grep -q 'Phase 1: Explore started' "${nested_task_dir}/task.md"
+    grep -q 'Phase 1: Explore FAILED (exit 1)' "${nested_task_dir}/task.md"
+    [[ -d "${nested_task_dir}/competitive" ]]
+    [[ -d "${nested_task_dir}/logs" ]]
+) && pass "10j. nested exact task matches resume without recreating top-level task.md" \
+  || fail "10j. nested exact task matches resume without recreating top-level task.md"
+
+# ============================================================
+# Test 10k: Explorer exit 0 with missing summary logs explicit artifact diagnostics
+# ============================================================
+(
+    root="$(setup_integration_fixture "explore-missing-artifact")"
+    slug="integ-explore-missing-artifact"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+
+    set_integration_stubs
+    run_agent() {
+        local role="$1" output_file="$5" log_file="$6"
+        case "$role" in
+            explorer)
+                [[ "$output_file" == "${comp_dir}/exploration-summary.md" ]] || exit 1
+                printf 'Explorer reached the write step but produced no artifact.\nLast explorer log line.\n' > "$log_file"
+                ;;
+            *)
+                ;;
+        esac
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Explore missing artifact diagnostics") >/dev/null 2>&1 || true
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "blocked" ]]
+    grep -q 'Pipeline FAILED while exploring: Phase 1 produced an invalid exploration summary' "$task_file"
+    grep -Fq "Phase 1: Exploration summary path: ${comp_dir}/exploration-summary.md" "$task_file"
+    grep -Fq 'Phase 1: Exploration summary state: missing' "$task_file"
+    grep -Fq "Phase 1: Exploration summary validation failure: WARN: Agent output missing: ${comp_dir}/exploration-summary.md" "$task_file"
+    grep -q 'Phase 1: Agent log tail (last 20 lines):' "$task_file"
+    grep -q 'Explorer reached the write step but produced no artifact.' "$task_file"
+    [[ ! -e "${comp_dir}/plan-a.md" ]]
+) && pass "10k. explore exit 0 with missing summary logs direct artifact diagnostics" \
+  || fail "10k. explore exit 0 with missing summary logs direct artifact diagnostics"
+
+# ============================================================
+# Test 10l: Executor activity with a clean worktree logs path-resolution diagnostics
+# ============================================================
+(
+    root="$(setup_integration_fixture "executor-clean-worktree")"
+    slug="integ-executor-clean-worktree"
+    set_integration_globals "$root"
+    task_dir="$root/docs/tasks/open/$slug"
+    comp_dir="$task_dir/competitive"
+    task_file="$task_dir/task.md"
+    detail_file="$TMP_ROOT/executor-clean-worktree.detail"
+    rm -f "$detail_file"
+
+    CALL_LOG="$TMP_ROOT/executor-clean-worktree.calls"
+    : > "$CALL_LOG"
+    _COMP_DIR="$comp_dir"
+    _FIXTURE_ROOT="$root"
+    _TASK_FILE="$task_file"
+
+    set_integration_stubs
+    capture_diff_artifact() {
+        : > "$2"
+        : > "$(_v2_numstat_artifact_path "$2")"
+        _V2_LAST_CAPTURE_UNTRACKED_FILES=""
+    }
+    run_agent() {
+        local role="$1" prompt_body="$3"
+        if [[ "$role" != "executor" ]]; then
+            mock_run_agent "$@"
+            return $?
+        fi
+
+        printf '%s' "$prompt_body" | grep -Fq "Read the approved plan at docs/tasks/open/${slug}/competitive/revised-plan.md" || exit 1
+        printf '%s' "$prompt_body" | grep -Fq "and the task file at .lauren-loop-runtime/${slug}/task.md." || exit 1
+        printf '%s' "$prompt_body" | grep -Fq "Write execution progress to docs/tasks/open/${slug}/competitive/execution-log.md." || exit 1
+        ! printf '%s' "$prompt_body" | grep -Fq "${comp_dir}/revised-plan.md" || exit 1
+        ! printf '%s' "$prompt_body" | grep -Fq "${task_file}" || exit 1
+        [[ -f ".lauren-loop-runtime/${slug}/task.md" ]] || exit 1
+        [[ -f "docs/tasks/open/${slug}/competitive/revised-plan.md" ]] || exit 1
+        printf '[2026-03-21T00:00:00] VERIFY: executor activity recorded\n' >> "docs/tasks/open/${slug}/competitive/execution-log.md"
+        printf 'misdirected main repo write\n' >> "${SCRIPT_DIR}/src/main.py"
+        return 0
+    }
+
+    (cd "$root" && lauren_loop_competitive "$slug" "Executor path resolution diagnostics") >/dev/null 2>&1 || true
+
+    status=$(grep '^## Status:' "$task_file" | head -1 | sed 's/^## Status: //')
+    [[ "$status" == "blocked" ]] || {
+        printf 'status=%s\n' "$status" > "$detail_file"
+        sed -n '1,220p' "$task_file" >> "$detail_file"
+        exit 1
+    }
+    grep -Fq 'Phase 4: Execution activity detected but execution worktree is clean — suspected out-of-worktree write or non-persisted executor change' "$task_file" || {
+        printf 'missing main diagnostic\n' > "$detail_file"
+        sed -n '1,220p' "$task_file" >> "$detail_file"
+        exit 1
+    }
+    grep -Fq 'diagnostic: active worktree path:' "$task_file" || { printf 'missing active worktree path diagnostic\n' > "$detail_file"; exit 1; }
+    grep -Fq 'diagnostic: worktree repo root:' "$task_file" || { printf 'missing worktree repo root diagnostic\n' > "$detail_file"; exit 1; }
+    grep -Fq "diagnostic: execution log path: ${comp_dir}/execution-log.md" "$task_file" || { printf 'missing execution log path diagnostic\n' > "$detail_file"; exit 1; }
+    grep -Fq 'diagnostic: execution log activity detected: true' "$task_file" || { printf 'missing execution log activity diagnostic\n' > "$detail_file"; exit 1; }
+    grep -Fq "diagnostic: diff artifact state: ${comp_dir}/execution-diff.patch (empty)" "$task_file" || { printf 'missing diff artifact diagnostic\n' > "$detail_file"; exit 1; }
+    grep -Fq "diagnostic: numstat artifact state: ${comp_dir}/execution-diff.numstat.tsv (empty)" "$task_file" || { printf 'missing numstat artifact diagnostic\n' > "$detail_file"; exit 1; }
+    grep -Fq 'diagnostic: worktree status: clean' "$task_file" || { printf 'missing clean worktree diagnostic\n' > "$detail_file"; exit 1; }
+    grep -Fq 'misdirected main repo write' "$root/src/main.py" || { printf 'missing main repo write marker\n' > "$detail_file"; exit 1; }
+    [[ ! -s "${comp_dir}/execution-diff.patch" ]] || { printf 'execution diff unexpectedly non-empty\n' > "$detail_file"; exit 1; }
+    [[ ! -f "${comp_dir}/traditional-dev-proxy.json" ]] || { printf 'traditional-dev-proxy.json unexpectedly present\n' > "$detail_file"; exit 1; }
+) && pass "10l. executor activity with clean worktree logs path-resolution diagnostics and blocks" \
+  || fail "10l. executor activity with clean worktree logs path-resolution diagnostics and blocks" "$(cat "$TMP_ROOT/executor-clean-worktree.detail" 2>/dev/null)"
 
 # ============================================================
 # Summary

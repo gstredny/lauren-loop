@@ -449,6 +449,69 @@ EOF
   || fail "10. Phase 7 prefers fix-plan XML files over revised-plan scope"
 
 (
+    repo_root="$(setup_scope_repo phase7-fix-plan-whitespace)"
+    slug="scope-task"
+    SLUG="$slug"
+    task_file="$repo_root/docs/tasks/open/$slug/task.md"
+    comp_dir="$repo_root/docs/tasks/open/$slug/competitive"
+    diff_file="$comp_dir/fix-diff-cycle1.patch"
+    playbook_dir="$repo_root/scripts/nightshift/playbooks"
+    conversation_file="$playbook_dir/conversation-detective.md"
+    rcfa_file="$playbook_dir/rcfa-detective.md"
+
+    mkdir -p "$playbook_dir"
+    printf 'baseline\n' > "$conversation_file"
+    printf 'baseline\n' > "$rcfa_file"
+    git_commit_all "$repo_root" "add whitespace xml scope files"
+    cat > "$comp_dir/revised-plan.md" <<'EOF'
+# Revised Plan
+
+## Files to Modify
+
+| File | Change |
+|------|--------|
+| `src/in_scope.py` | Original plan scope |
+EOF
+    cat > "$comp_dir/fix-plan.md" <<'EOF'
+# Fix Plan
+
+## Implementation Tasks
+
+```xml
+<wave number="1">
+  <task type="auto">
+    <name>Use whitespace XML scope</name>
+    <files>scripts/nightshift/playbooks/conversation-detective.md scripts/nightshift/playbooks/rcfa-detective.md</files>
+    <action>Update both detective playbooks.</action>
+    <verify>bash tests/test_lauren_loop_v2_scope.sh</verify>
+    <done>Updated.</done>
+  </task>
+</wave>
+```
+EOF
+    git_commit_all "$repo_root" "add whitespace xml scope plans"
+    printf 'baseline\nconversation change\n' > "$conversation_file"
+    printf 'baseline\nrcfa change\n' > "$rcfa_file"
+
+    reset_test_log
+    cwd="$PWD"
+    cd "$repo_root"
+    selected_plan=$(_v2_select_phase7_scope_plan_file "$comp_dir")
+    capture_diff_artifact "HEAD" "$diff_file" "$task_file" "$selected_plan"
+    _v2_log_capture_scope_details "$task_file" "Phase 7"
+    _v2_log_out_of_scope_capture_warning "$task_file" "Phase 7" >/dev/null
+    cd "$cwd"
+
+    [[ "$selected_plan" == "$comp_dir/fix-plan.md" ]]
+    [[ "$_V2_LAST_CAPTURE_SCOPE_SOURCE" == "plan-xml-files" ]]
+    grep -q 'scripts/nightshift/playbooks/conversation-detective.md' "$diff_file"
+    grep -q 'scripts/nightshift/playbooks/rcfa-detective.md' "$diff_file"
+    [[ -z "${_V2_LAST_CAPTURE_OUT_OF_SCOPE_FILES:-}" ]]
+    ! grep -q "Phase 7: WARNING diff scope check reported out-of-scope changes" "$TEST_LOG_FILE"
+) && pass "10a. Phase 7 whitespace-separated XML scope includes both files" \
+  || fail "10a. Phase 7 whitespace-separated XML scope includes both files"
+
+(
     repo_root="$(setup_scope_repo empty-plan-fallback no)"
     slug="scope-task"
     SLUG="$slug"
