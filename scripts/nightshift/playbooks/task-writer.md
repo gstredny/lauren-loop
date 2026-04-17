@@ -41,6 +41,20 @@ If a referenced path is missing or unreadable, note it. Continue only if the rem
 repo-verified files are enough to confirm the bug. If the finding cannot be grounded after
 reading the code, reject it.
 
+### Step 1.5: Check for Duplicate Tasks
+
+Review the `## Existing Open Tasks` block from the finding context before deciding to create a new
+task.
+
+- Reject the finding as a duplicate only when an existing task covers the same code path, the same
+  class of defect, and the same fix would satisfy both findings.
+- Titles do NOT need to match. This is semantic duplicate detection, not slug matching.
+- When uncertain whether two findings share a fix, DO NOT reject as duplicate. Proceed with task
+  creation. Over-creation is recoverable; missed findings are not.
+- If you find a semantic duplicate, emit `### Task Writer Result: REJECTED — duplicate of
+  <existing-task-path>` and stop.
+- A duplicate rejection is a success outcome because it prevents backlog pollution.
+
 ### Step 2: Confirm or Reject
 
 After reading the code:

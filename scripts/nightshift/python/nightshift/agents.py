@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 import time
 from dataclasses import dataclass
@@ -18,6 +19,7 @@ from .timeout import TimeoutBudget
 
 TIMEOUT_EXIT_CODE = 124
 _CODEX_ENV_CACHE_TTL_SECONDS = 1800.0
+_ARTIFACT_SUFFIX_RE = re.compile(r"[^A-Za-z0-9._-]+")
 _CODEX_PREFLIGHT_CAPTURE_SCRIPT = """
 guard_script="$1"
 source "$guard_script"
@@ -71,14 +73,7 @@ class AgentRunResult:
 
 
 def extract_claude_result_text(output_text: str) -> str | None:
-    for line in output_text.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for payload in _iter_json_payloads(output_text):
         result = _payload_result_text(payload)
         if result:
             return result
@@ -95,14 +90,7 @@ def read_claude_result_text(output_path: Path) -> str | None:
 
 
 def extract_claude_cost(output_text: str) -> AgentCost:
-    for line in output_text.splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+    for payload in _iter_json_payloads(output_text):
         usage = payload.get("usage") or {}
         return AgentCost(
             input_tokens=int(usage.get("input_tokens", 0) or 0),
@@ -116,6 +104,14 @@ def extract_claude_cost(output_text: str) -> AgentCost:
         cache_read_tokens=0,
         output_tokens=0,
     )
+
+
+def extract_claude_subtype(output_text: str) -> str | None:
+    for payload in _iter_json_payloads(output_text):
+        subtype = payload.get("subtype")
+        if isinstance(subtype, str) and subtype:
+            return subtype
+    return None
 
 
 def estimate_codex_cost(prompt_text: str, output_text: str) -> AgentCost:
@@ -146,13 +142,21 @@ class AgentRunner:
         self._codex_env_cache: dict[str, str] | None = None
         self._codex_env_cache_time = 0.0
 
-    def run_claude(self, playbook_name: str, *, model: str | None = None, finding_text: str = "", task_file_path: str = "") -> AgentRunResult:
+    def run_claude(
+        self,
+        playbook_name: str,
+        *,
+        model: str | None = None,
+        finding_text: str = "",
+        task_file_path: str = "",
+        artifact_suffix: str | None = None,
+    ) -> AgentRunResult:
         if shutil.which("claude", path=self.config.subprocess_path) is None:
             raise AgentExecutionError("claude CLI is not available")
 
         rendered_path = self.playbook_renderer.render(playbook_name, finding_text=finding_text, task_file_path=task_file_path)
         prompt_text = rendered_path.read_text(encoding="utf-8")
-        output_path, stderr_log_path = self._artifact_paths("claude", playbook_name)
+        output_path, stderr_log_path = self._artifact_paths("claude", playbook_name, artifact_suffix=artifact_suffix)
         self._clear_canonical_findings(playbook_name)
         effective_model = model or self.config.claude_model
         command = [
@@ -249,6 +253,82 @@ class AgentRunner:
             )
             raise AgentExecutionError(
                 f"Claude {playbook_name} failed with exit {completed.returncode}: {(stderr_text or '').strip()}",
+                partial_result=partial_result,
+            )
+
+        semantic_error_subtype = extract_claude_subtype(output_text)
+        if _is_claude_error_subtype(semantic_error_subtype):
+            self.logger.error(
+                "Claude %s ended with semantic error subtype=%s",
+                playbook_name,
+                semantic_error_subtype,
+            )
+            partial_result = self._build_result(
+                engine="claude",
+                playbook_name=playbook_name,
+                output_path=output_path,
+                stderr_log_path=stderr_log_path,
+                archived_findings_path=self.archive_findings(
+                    "claude",
+                    playbook_name,
+                    exit_code=completed.returncode,
+                    semantic_success=False,
+                ),
+                findings_count=0,
+                duration_seconds=duration,
+                cost_usd=cost,
+                status="error",
+                return_code=completed.returncode,
+            )
+            raise AgentExecutionError(
+                _format_claude_semantic_error(
+                    playbook_name,
+                    semantic_error_subtype,
+                    extract_claude_result_text(output_text),
+                ),
+                partial_result=partial_result,
+            )
+
+        result_text = extract_claude_result_text(output_text)
+        has_parseable_payload = _has_parseable_claude_payload(output_text)
+        has_meaningful_result_text = bool(result_text and result_text.strip())
+        requires_findings_artifact = playbook_name in self.config.detective_playbooks
+        has_findings_artifact = self._canonical_findings_path(playbook_name).exists()
+        if (
+            not has_parseable_payload
+            or not has_meaningful_result_text
+            or (requires_findings_artifact and not has_findings_artifact)
+        ):
+            self.logger.warning(
+                "Claude %s exited 0 but no usable output; raw stdout=%s",
+                playbook_name,
+                _truncate_output_for_log(output_text),
+            )
+            partial_result = self._build_result(
+                engine="claude",
+                playbook_name=playbook_name,
+                output_path=output_path,
+                stderr_log_path=stderr_log_path,
+                archived_findings_path=self.archive_findings(
+                    "claude",
+                    playbook_name,
+                    exit_code=0,
+                    semantic_success=False,
+                ),
+                findings_count=0,
+                duration_seconds=duration,
+                cost_usd=cost,
+                status="error",
+                return_code=0,
+            )
+            raise AgentExecutionError(
+                _format_claude_zero_exit_no_usable_output(
+                    playbook_name,
+                    has_parseable_payload=has_parseable_payload,
+                    has_meaningful_result_text=has_meaningful_result_text,
+                    requires_findings_artifact=requires_findings_artifact,
+                    has_findings_artifact=has_findings_artifact,
+                ),
                 partial_result=partial_result,
             )
 
@@ -515,12 +595,19 @@ class AgentRunner:
         self._codex_env_cache_time = time.monotonic()
         return dict(updated_env), stderr_text
 
-    def _artifact_paths(self, engine: str, playbook_name: str) -> tuple[Path, Path]:
+    def _artifact_paths(
+        self,
+        engine: str,
+        playbook_name: str,
+        *,
+        artifact_suffix: str | None = None,
+    ) -> tuple[Path, Path]:
         self.context.agent_output_dir.mkdir(parents=True, exist_ok=True)
         self.config.log_dir.mkdir(parents=True, exist_ok=True)
+        stem = _artifact_stem(engine, playbook_name, artifact_suffix)
         return (
-            self.context.agent_output_dir / f"{engine}-{playbook_name}.json",
-            self.config.log_dir / f"{engine}-{playbook_name}-stderr.log",
+            self.context.agent_output_dir / f"{stem}.json",
+            self.config.log_dir / f"{stem}-stderr.log",
         )
 
     @staticmethod
@@ -600,6 +687,23 @@ def _codex_cost_model(model: str) -> str:
     return "azure54/gpt-5.4" if model == "azure54" else model
 
 
+def _iter_json_payloads(output_text: str):
+    for line in output_text.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            yield payload
+
+
+def _has_parseable_claude_payload(output_text: str) -> bool:
+    return next(_iter_json_payloads(output_text), None) is not None
+
+
 def _payload_result_text(payload: dict[str, object]) -> str | None:
     result_value = payload.get("result")
     if isinstance(result_value, str) and result_value:
@@ -644,3 +748,56 @@ def _join_text_content_blocks(blocks: list[object]) -> str | None:
 
 def _format_seconds(seconds: float) -> str:
     return str(int(seconds)) if float(seconds).is_integer() else f"{seconds:.1f}"
+
+
+def _artifact_stem(engine: str, playbook_name: str, artifact_suffix: str | None) -> str:
+    stem = f"{engine}-{playbook_name}"
+    if not artifact_suffix:
+        return stem
+    normalized = _ARTIFACT_SUFFIX_RE.sub("-", artifact_suffix.strip()).strip("-")
+    return stem if not normalized else f"{stem}-{normalized}"
+
+
+def _is_claude_error_subtype(subtype: str | None) -> bool:
+    return bool(subtype and subtype.startswith("error_"))
+
+
+def _format_claude_semantic_error(
+    playbook_name: str,
+    subtype: str | None,
+    result_text: str | None,
+) -> str:
+    message = f"Claude {playbook_name} reported semantic error subtype {subtype or 'unknown'}"
+    if not result_text:
+        return message
+    condensed = " ".join(result_text.split())
+    if len(condensed) > 200:
+        condensed = condensed[:197].rstrip() + "..."
+    return f"{message}: {condensed}"
+
+
+def _format_claude_zero_exit_no_usable_output(
+    playbook_name: str,
+    *,
+    has_parseable_payload: bool,
+    has_meaningful_result_text: bool,
+    requires_findings_artifact: bool,
+    has_findings_artifact: bool,
+) -> str:
+    reasons: list[str] = []
+    if not has_parseable_payload:
+        reasons.append("stdout contained no parseable JSON payload")
+    elif not has_meaningful_result_text:
+        reasons.append("parsed payload had no meaningful result text")
+    if requires_findings_artifact and not has_findings_artifact:
+        reasons.append("no findings artifact was produced")
+    detail = "; ".join(reasons) if reasons else "output failed validation"
+    return f"Claude {playbook_name} zero-exit but no usable output: {detail}"
+
+
+def _truncate_output_for_log(output_text: str, *, limit: int = 500) -> str:
+    if len(output_text) <= limit:
+        return output_text
+    if limit <= 3:
+        return output_text[:limit]
+    return output_text[: limit - 3] + "..."

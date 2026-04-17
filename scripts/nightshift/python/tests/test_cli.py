@@ -8,6 +8,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from nightshift.config import NightshiftConfig
 from nightshift.detective_status import VALID_DETECTIVE_STATUSES
 
 from .conftest import PYTHON_ROOT, PROJECT_ROOT, create_bare_remote_repo, run, write_executable
@@ -200,17 +201,23 @@ exit 0
         capture_output=True,
         check=False,
     )
+    config = NightshiftConfig.load(
+        conf_path=PROJECT_ROOT / "scripts/nightshift/nightshift.conf",
+        env=env,
+        env_file=home / ".nightshift-env",
+    )
+    expected_slots = len(config.detective_playbooks) * (2 if config.claude_detectives_enabled else 1)
 
     assert result.returncode == 0, result.stderr
     assert not gh_log.exists()
     combined_output = result.stdout + result.stderr
-    assert combined_output.count("DRY RUN: would run ") == 16
+    assert combined_output.count("DRY RUN: would run ") == expected_slots
     digest_match = re.search(r"Digest artifact: (?P<path>\S+dry-run-digest\.md)", combined_output)
     assert digest_match is not None
     digest_path = Path(digest_match.group("path"))
     assert digest_path.exists()
     status_files = sorted((digest_path.parent / "detective-status").glob("*.json"))
-    assert status_files
+    assert len(status_files) == expected_slots
     first_status = json.loads(status_files[0].read_text(encoding="utf-8"))
     assert first_status["status"] in VALID_DETECTIVE_STATUSES
 
@@ -287,7 +294,7 @@ def test_smoke_dry_run_cli_only_schedules_commit_detective(tmp_path: Path) -> No
 
     combined_output = result.stdout + result.stderr
     assert result.returncode == 0, result.stderr
-    assert combined_output.count("DRY RUN: would run ") == 2
-    assert "DRY RUN: would run claude/commit-detective" in combined_output
+    assert combined_output.count("DRY RUN: would run ") == 1
     assert "DRY RUN: would run codex/commit-detective" in combined_output
+    assert "DRY RUN: would run claude/commit-detective" not in combined_output
     assert "conversation-detective" not in combined_output

@@ -59,6 +59,8 @@ The manager-merge playbook parses this format to deduplicate and rank findings.
 ### Finding: <short_title>
 **Severity:** critical | major | minor | observation
 **Category:** regression | error-handling | data-quality | product-accuracy | missing-test | performance | security
+**Rule Key:** <stable rule id such as CWE-306, PERF-NPLUS1, or REGRESSION-MISSING-MIGRATION>
+**Primary File:** <repo-relative path, optional override when the first evidence bullet is not the correct primary file>
 **Evidence:**
 - <file:line or SQL result that proves the issue>
 **Root Cause:** <1-2 sentences>
@@ -68,6 +70,8 @@ The manager-merge playbook parses this format to deduplicate and rank findings.
 
 **Rules:**
 - Every finding must have concrete evidence (file:line, SQL result, or git diff)
+- `Rule Key` is required and must be a short stable identifier that survives title rewrites and evidence rewording
+- `Primary File` is optional only when the first evidence bullet already starts with the correct repo-relative file path; the orchestrator will use that first evidence-bullet path exactly as emitted
 - If a finding lacks evidence, discard it — do not guess
 - Max 10 findings per detective playbook per run
 - Max 15 task files from manager-merge per run

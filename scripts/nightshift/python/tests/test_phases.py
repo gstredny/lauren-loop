@@ -53,6 +53,25 @@ class ScriptedAgentRunner:
         return outcome or build_result(engine, playbook_name)
 
 
+class RecordingDelegatingAgentRunner:
+    def __init__(self, delegate: AgentRunner) -> None:
+        self.delegate = delegate
+        self.calls: list[str] = []
+        self.claude_execution_errors: list[tuple[str, AgentExecutionError]] = []
+
+    def run_claude(self, playbook_name: str, **kwargs) -> AgentRunResult:
+        self.calls.append(f"claude/{playbook_name}")
+        try:
+            return self.delegate.run_claude(playbook_name, **kwargs)
+        except AgentExecutionError as exc:
+            self.claude_execution_errors.append((playbook_name, exc))
+            raise
+
+    def run_codex(self, playbook_name: str) -> AgentRunResult:
+        self.calls.append(f"codex/{playbook_name}")
+        return self.delegate.run_codex(playbook_name)
+
+
 def build_result(
     engine: str,
     playbook_name: str,
@@ -80,6 +99,20 @@ def build_result(
 def write_claude_result(playbook_name: str, result_text: str) -> None:
     output_path = Path(f"/tmp/claude-{playbook_name}.json")
     output_path.write_text(json.dumps({"result": result_text}) + "\n", encoding="utf-8")
+
+
+def extract_existing_open_tasks_block(prompt_path: Path) -> str:
+    capture = False
+    lines: list[str] = []
+    for line in prompt_path.read_text(encoding="utf-8").splitlines():
+        if line == "## Existing Open Tasks":
+            capture = True
+        if not capture:
+            continue
+        if line == "```":
+            break
+        lines.append(line)
+    return "\n".join(lines)
 
 
 class ScriptedGit:
@@ -160,6 +193,23 @@ def test_full_dispatch_order(tmp_path: Path, config_factory) -> None:
 
     orchestrator.phase_detectives()
 
+    expected = [f"codex/{playbook}" for playbook in orchestrator.detective_playbooks]
+    assert runner.calls == expected
+    assert context.total_findings_available == len(expected)
+    assert len(list(context.detective_status_dir.glob("*.json"))) == len(expected)
+
+
+def test_full_dispatch_order_with_claude_enabled(tmp_path: Path, config_factory) -> None:
+    runner = ScriptedAgentRunner()
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        extra_env={"NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true"},
+    )
+
+    orchestrator.phase_detectives()
+
     expected = [
         f"{engine}/{playbook}"
         for playbook in orchestrator.detective_playbooks
@@ -176,10 +226,10 @@ def test_smoke_only_commit_detective(tmp_path: Path, config_factory) -> None:
 
     orchestrator.phase_detectives()
 
-    assert runner.calls == ["claude/commit-detective", "codex/commit-detective"]
+    assert runner.calls == ["codex/commit-detective"]
 
 
-def test_smoke_dry_run_logs_both_commit_detective_engines(tmp_path: Path, config_factory, caplog) -> None:
+def test_smoke_dry_run_logs_only_codex_commit_detective_by_default(tmp_path: Path, config_factory, caplog) -> None:
     runner = ScriptedAgentRunner()
     orchestrator, context = create_orchestrator(
         tmp_path,
@@ -187,6 +237,31 @@ def test_smoke_dry_run_logs_both_commit_detective_engines(tmp_path: Path, config
         runner=runner,
         dry_run=True,
         smoke=True,
+    )
+
+    with caplog.at_level(logging.INFO):
+        orchestrator.phase_detectives()
+
+    assert runner.calls == []
+    assert "DRY RUN: would run codex/commit-detective" in caplog.messages
+    assert "DRY RUN: would run claude/commit-detective" not in caplog.messages
+    store = DetectiveStatusStore(context.detective_status_dir)
+    assert store.read("commit-detective", "codex").status == "skipped"
+
+
+def test_smoke_dry_run_logs_both_commit_detective_engines_when_claude_enabled(
+    tmp_path: Path,
+    config_factory,
+    caplog,
+) -> None:
+    runner = ScriptedAgentRunner()
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        dry_run=True,
+        smoke=True,
+        extra_env={"NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true"},
     )
 
     with caplog.at_level(logging.INFO):
@@ -214,7 +289,12 @@ def test_detective_failure_continues_loop(tmp_path: Path, config_factory) -> Non
         ),
     )
     runner = ScriptedAgentRunner(scripted={("claude", "conversation-detective"): failure})
-    orchestrator, context = create_orchestrator(tmp_path, config_factory, runner=runner)
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        extra_env={"NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true"},
+    )
 
     orchestrator.phase_detectives()
 
@@ -222,6 +302,105 @@ def test_detective_failure_continues_loop(tmp_path: Path, config_factory) -> Non
     store = DetectiveStatusStore(context.detective_status_dir)
     assert store.read("conversation-detective", "claude").status == "timeout"
     assert any("conversation-detective exceeded 1s" in message for message in context.warnings)
+
+
+def test_detective_claude_error_max_turns_records_error_and_continues_later_slots(
+    tmp_path: Path,
+    config_factory,
+) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    claude_call_count_file = tmp_path / "claude-call-count.txt"
+    codex_call_count_file = tmp_path / "codex-call-count.txt"
+    write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -euo pipefail
+count_file="$FAKE_CLAUDE_CALL_COUNT_FILE"
+count=0
+if [ -f "$count_file" ]; then
+  count="$(cat "$count_file")"
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+if [ "$count" -eq 1 ]; then
+  printf '{"subtype":"error_max_turns","usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"result":"too many turns"}\n'
+  exit 0
+fi
+mkdir -p "$NIGHTSHIFT_FINDINGS_DIR"
+cat > "$NIGHTSHIFT_FINDINGS_DIR/coverage-detective-findings.md" <<'EOF'
+### Finding: Claude coverage finding
+EOF
+printf '{"subtype":"message_stop","usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"result":"coverage complete"}\n'
+""",
+    )
+    write_executable(
+        fake_bin / "codex",
+        """#!/usr/bin/env bash
+set -euo pipefail
+count_file="$FAKE_CODEX_CALL_COUNT_FILE"
+count=0
+if [ -f "$count_file" ]; then
+  count="$(cat "$count_file")"
+fi
+count=$((count + 1))
+printf '%s' "$count" > "$count_file"
+mkdir -p "$NIGHTSHIFT_FINDINGS_DIR"
+if [ "$count" -eq 1 ]; then
+  target="conversation-detective-findings.md"
+else
+  target="coverage-detective-findings.md"
+fi
+cat > "$NIGHTSHIFT_FINDINGS_DIR/$target" <<'EOF'
+### Finding: Codex finding
+EOF
+printf '{"ok":true}\n'
+""",
+    )
+    config = config_factory(
+        repo_dir=worktree,
+        path_prefix=fake_bin,
+        extra_env={
+            "AZURE_OPENAI_API_KEY": "test-key",
+            "NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true",
+            "FAKE_CLAUDE_CALL_COUNT_FILE": str(claude_call_count_file),
+            "FAKE_CODEX_CALL_COUNT_FILE": str(codex_call_count_file),
+        },
+    )
+    context = RunContext.create(config, dry_run=False, smoke=False)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    delegate = AgentRunner(config=config, context=context, cost_tracker=tracker)
+    runner = RecordingDelegatingAgentRunner(delegate)
+    orchestrator = NightshiftOrchestrator(
+        config=config,
+        context=context,
+        git=object(),  # type: ignore[arg-type]
+        agents=runner,  # type: ignore[arg-type]
+        shipper=object(),  # type: ignore[arg-type]
+        cost_tracker=tracker,
+        timeout_budget=TimeoutBudget(None),
+        logger=logging.getLogger("test-phases"),
+        detective_playbooks=("conversation-detective", "coverage-detective"),
+    )
+
+    orchestrator.phase_detectives()
+
+    assert [playbook for playbook, _exc in runner.claude_execution_errors] == ["conversation-detective"]
+    assert "error_max_turns" in str(runner.claude_execution_errors[0][1])
+    assert runner.calls == [
+        "claude/conversation-detective",
+        "codex/conversation-detective",
+        "claude/coverage-detective",
+        "codex/coverage-detective",
+    ]
+    store = DetectiveStatusStore(context.detective_status_dir)
+    assert store.read("conversation-detective", "claude").status == "error"
+    assert store.read("conversation-detective", "codex").status == "success"
+    assert store.read("coverage-detective", "claude").status == "success"
+    assert store.read("coverage-detective", "codex").status == "success"
+    assert any("error_max_turns" in message for message in context.warnings)
 
 
 def test_codex_gate_skips_after_failure(tmp_path: Path, config_factory) -> None:
@@ -253,6 +432,7 @@ def test_codex_gate_skips_after_failure(tmp_path: Path, config_factory) -> None:
         config_factory,
         runner=runner,
         detective_playbooks=playbooks,
+        extra_env={"NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true"},
     )
 
     orchestrator.phase_detectives()
@@ -301,7 +481,10 @@ printf '{"ok":true}\n'
     config = config_factory(
         repo_dir=worktree,
         path_prefix=fake_bin,
-        extra_env={"AZURE_OPENAI_API_KEY": ""},
+        extra_env={
+            "AZURE_OPENAI_API_KEY": "",
+            "NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true",
+        },
     )
     context = RunContext.create(config, dry_run=False, smoke=False)
     tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
@@ -338,7 +521,10 @@ def test_global_timeout_skips_remaining(tmp_path: Path, config_factory) -> None:
         config_factory,
         runner=runner,
         detective_playbooks=("commit-detective", "coverage-detective"),
-        extra_env={"NIGHTSHIFT_CODEX_MODEL": ""},
+        extra_env={
+            "NIGHTSHIFT_CODEX_MODEL": "",
+            "NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true",
+        },
         timeout_budget=budget,
     )
 
@@ -353,13 +539,14 @@ def test_global_timeout_skips_remaining(tmp_path: Path, config_factory) -> None:
 def test_dry_run_logs_without_executing(tmp_path: Path, config_factory, caplog) -> None:
     runner = ScriptedAgentRunner()
     orchestrator, context = create_orchestrator(tmp_path, config_factory, runner=runner, dry_run=True)
+    expected_slots = len(orchestrator._detective_schedule())
 
     with caplog.at_level(logging.INFO):
         orchestrator.phase_detectives()
 
     assert runner.calls == []
-    assert len([message for message in caplog.messages if message.startswith("DRY RUN: would run ")]) == 16
-    assert len(list(context.detective_status_dir.glob("*.json"))) == 16
+    assert len([message for message in caplog.messages if message.startswith("DRY RUN: would run ")]) == expected_slots
+    assert len(list(context.detective_status_dir.glob("*.json"))) == expected_slots
 
 
 # ── Manager Merge phase tests ──────────────────────────────────────────
@@ -467,6 +654,25 @@ def _write_backlog_task(
     return path
 
 
+def _completed_backlog_ranking(
+    repo_root: Path,
+    rows: list[tuple[int, str, str, str]],
+) -> subprocess.CompletedProcess[str]:
+    body = "\n".join(
+        f"{rank}|{task_path}|{goal}|{complexity}"
+        for rank, task_path, goal, complexity in rows
+    )
+    stdout = "## TASK_LIST\n"
+    if body:
+        stdout += f"{body}\n"
+    return subprocess.CompletedProcess(
+        ["bash", str(repo_root / "lauren-loop.sh"), "next"],
+        0,
+        stdout,
+        "",
+    )
+
+
 def _write_scope_triage(task_path: Path, captured_files: list[str]) -> Path:
     triage_path = autofix_helpers.lauren_scope_triage_path(task_path)
     triage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -491,6 +697,7 @@ def test_manager_merge_dry_run(tmp_path: Path, config_factory) -> None:
     assert context.digest_path is not None
     assert context.digest_path.exists()
     assert "dry-run-skipped" in context.digest_path.read_text(encoding="utf-8")
+    assert context.run_clean is True
 
 
 def test_manager_merge_no_findings(tmp_path: Path, config_factory) -> None:
@@ -504,6 +711,7 @@ def test_manager_merge_no_findings(tmp_path: Path, config_factory) -> None:
     assert "claude/manager-merge" not in runner.calls
     assert context.digest_path is not None
     assert "no-findings" in context.digest_path.read_text(encoding="utf-8")
+    assert context.run_clean is True
 
 
 def test_manager_merge_agent_failure(tmp_path: Path, config_factory) -> None:
@@ -724,7 +932,7 @@ def test_detective_cost_cap_halts_remaining_slots(tmp_path: Path, config_factory
 
     orchestrator.phase_detectives()
 
-    assert calls == ["claude/commit-detective"]
+    assert calls == ["codex/commit-detective"]
     assert context.total_findings_available == 1
 
 
@@ -794,7 +1002,38 @@ def test_task_writing_happy_path(tmp_path: Path, config_factory) -> None:
     assert git.staged_paths == manifest_paths
     assert runner.calls == ["claude/task-writer", "claude/task-writer"]
     assert runner.call_kwargs[0][2]["model"] == orchestrator.config.manager_model
+    assert runner.call_kwargs[0][2]["artifact_suffix"] == "rank-1"
+    assert runner.call_kwargs[1][2]["artifact_suffix"] == "rank-2"
     assert "Rank: 1" in runner.call_kwargs[0][2]["finding_text"]
+
+
+def test_task_writing_includes_existing_open_task_context(tmp_path: Path, config_factory) -> None:
+    runner = ScriptedAgentRunner()
+    git = ScriptedGit()
+    orchestrator, context = create_orchestrator(tmp_path, config_factory, runner=runner, git=git)
+    _seed_digest_and_findings(context)
+    _seed_findings_manifest(context, ("1", "critical", "regression", "Auth regression"))
+    existing_task = tmp_path / "docs" / "tasks" / "open" / "existing-auth.md"
+    existing_task.parent.mkdir(parents=True, exist_ok=True)
+    existing_task.write_text("## Task: Existing auth regression\n## Status: not started\n", encoding="utf-8")
+
+    runner.side_effects["task-writer"] = lambda: write_claude_result(
+        "task-writer",
+        (
+            "--- BEGIN TASK FILE ---\n"
+            "## Task: Auth regression\n"
+            "## Status: not started\n"
+            "--- END TASK FILE ---\n"
+            "### Task Writer Result: CREATED\n"
+        ),
+    )
+
+    orchestrator.phase_task_writing()
+
+    prompt_path = context.rendered_dir / "task-writer-rank-1.md"
+    block = extract_existing_open_tasks_block(prompt_path)
+    assert prompt_path.exists()
+    assert "docs/tasks/open/existing-auth.md: Existing auth regression [not started]" in block
 
 
 def test_task_writing_one_rejected(tmp_path: Path, config_factory) -> None:
@@ -826,6 +1065,86 @@ def test_task_writing_one_rejected(tmp_path: Path, config_factory) -> None:
     ]
     assert len(manifest_lines) == 1
     assert context.task_file_count == 1
+
+
+def test_task_writing_unrelated_existing_task_does_not_block_creation(tmp_path: Path, config_factory) -> None:
+    runner = ScriptedAgentRunner()
+    git = ScriptedGit()
+    orchestrator, context = create_orchestrator(tmp_path, config_factory, runner=runner, git=git)
+    _seed_digest_and_findings(context)
+    _seed_findings_manifest(context, ("1", "critical", "regression", "Auth regression"))
+    unrelated_task = tmp_path / "docs" / "tasks" / "open" / "unrelated-task.md"
+    unrelated_task.parent.mkdir(parents=True, exist_ok=True)
+    unrelated_task.write_text(
+        "## Task: Unrelated analytics cleanup\n## Status: not started\n",
+        encoding="utf-8",
+    )
+
+    runner.side_effects["task-writer"] = lambda: write_claude_result(
+        "task-writer",
+        (
+            "--- BEGIN TASK FILE ---\n"
+            "## Task: Auth regression\n"
+            "## Status: not started\n"
+            "--- END TASK FILE ---\n"
+            "### Task Writer Result: CREATED\n"
+        ),
+    )
+
+    orchestrator.phase_task_writing()
+
+    manifest_lines = [
+        line for line in context.manager_task_manifest_path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    prompt_path = context.rendered_dir / "task-writer-rank-1.md"
+    block = extract_existing_open_tasks_block(prompt_path)
+    assert len(manifest_lines) == 1
+    assert "docs/tasks/open/unrelated-task.md: Unrelated analytics cleanup [not started]" in block
+
+
+def test_task_writing_every_finding_snapshot_has_identical_existing_task_block(tmp_path: Path, config_factory) -> None:
+    runner = ScriptedAgentRunner()
+    git = ScriptedGit()
+    orchestrator, context = create_orchestrator(tmp_path, config_factory, runner=runner, git=git)
+    _seed_digest_and_findings(context)
+    _seed_findings_manifest(
+        context,
+        ("1", "critical", "regression", "Auth regression"),
+        ("2", "major", "missing-test", "Coverage gap"),
+    )
+    existing_task = tmp_path / "docs" / "tasks" / "open" / "existing-task.md"
+    existing_task.parent.mkdir(parents=True, exist_ok=True)
+    existing_task.write_text("## Task: Existing task\n## Status: not started\n", encoding="utf-8")
+
+    task_outputs = [
+        (
+            "--- BEGIN TASK FILE ---\n"
+            "## Task: Auth regression\n"
+            "## Status: not started\n"
+            "--- END TASK FILE ---\n"
+            "### Task Writer Result: CREATED\n"
+        ),
+        (
+            "--- BEGIN TASK FILE ---\n"
+            "## Task: Coverage gap\n"
+            "## Status: not started\n"
+            "--- END TASK FILE ---\n"
+            "### Task Writer Result: CREATED\n"
+        ),
+    ]
+    runner.side_effects["task-writer"] = lambda: write_claude_result("task-writer", task_outputs.pop(0))
+
+    orchestrator.phase_task_writing()
+
+    prompt_one = context.rendered_dir / "task-writer-rank-1.md"
+    prompt_two = context.rendered_dir / "task-writer-rank-2.md"
+    block_one = extract_existing_open_tasks_block(prompt_one)
+    block_two = extract_existing_open_tasks_block(prompt_two)
+    assert prompt_one.exists()
+    assert prompt_two.exists()
+    assert block_one
+    assert block_one == block_two
+    assert "docs/tasks/open/existing-task.md: Existing task [not started]" in block_one
 
 
 def test_task_writing_halts_after_cost_cap(tmp_path: Path, config_factory) -> None:
@@ -989,6 +1308,8 @@ def test_validation_happy_path(tmp_path: Path, config_factory) -> None:
     assert context.validated_tasks == [task_a, task_b]
     assert "## Validation: VALIDATED" in task_a.read_text(encoding="utf-8")
     assert git.staged_paths == [task_a, task_b]
+    assert runner.call_kwargs[0][2]["artifact_suffix"] == task_a.parent.name
+    assert runner.call_kwargs[1][2]["artifact_suffix"] == task_b.parent.name
 
 
 def test_validation_one_invalid(tmp_path: Path, config_factory) -> None:
@@ -1132,6 +1453,7 @@ def test_autofix_happy_path(tmp_path: Path, config_factory, monkeypatch) -> None
     (tmp_path / "lauren-loop-v2.sh").chmod(0o755)
 
     def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
+        assert timeout == orchestrator.config.lauren_timeout_seconds
         manifest_path = task_path.parent / "competitive" / "run-manifest.json"
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         manifest_path.write_text('{"final_status": "success", "total_cost_usd": 1.25}', encoding="utf-8")
@@ -1488,6 +1810,7 @@ def test_bridge_happy_path(tmp_path: Path, config_factory, monkeypatch) -> None:
     lauren_calls: list[str] = []
 
     def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
+        assert timeout == orchestrator.config.lauren_timeout_seconds
         lauren_calls.append(slug)
         hinted_task = Path(env["LAUREN_LOOP_TASK_FILE_HINT"])
         _write_scope_triage(hinted_task, ["src/bridge_fix.py"])
@@ -1634,6 +1957,7 @@ def test_backlog_happy_path(tmp_path: Path, config_factory, monkeypatch) -> None
     lauren_calls: list[tuple[str, str]] = []
 
     def fake_run_lauren_ranking(repo_root, tasks_dir, timeout, *, env):
+        assert timeout == orchestrator.config.lauren_timeout_seconds
         return subprocess.CompletedProcess(
             ["bash", str(repo_root / "lauren-loop.sh"), "next"],
             0,
@@ -1642,6 +1966,7 @@ def test_backlog_happy_path(tmp_path: Path, config_factory, monkeypatch) -> None
         )
 
     def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
+        assert timeout == orchestrator.config.lauren_timeout_seconds
         lauren_calls.append((slug, goal))
         _write_scope_triage(task_one, ["src/backlog_fix.py"])
         _write_lauren_manifest(task_one, {"final_status": "success", "total_cost_usd": 0.50})
@@ -1665,7 +1990,7 @@ def test_backlog_happy_path(tmp_path: Path, config_factory, monkeypatch) -> None
     assert context.failures == []
 
 
-def test_backlog_runs_despite_manager_contract_failure(tmp_path: Path, config_factory, monkeypatch) -> None:
+def test_backlog_skips_manager_contract_failure(tmp_path: Path, config_factory, monkeypatch) -> None:
     runner = ScriptedAgentRunner()
     git = ScriptedGit()
     orchestrator, context = create_orchestrator(
@@ -1677,15 +2002,10 @@ def test_backlog_runs_despite_manager_contract_failure(tmp_path: Path, config_fa
     )
     context.manager_contract_failed = True
     _write_ranked_digest(context, [("1", "critical", "regression", "Auth regression")])
-    task_one = _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-one" / "task.md")
     (tmp_path / "lauren-loop.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (tmp_path / "lauren-loop.sh").chmod(0o755)
     (tmp_path / "lauren-loop-v2.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
     (tmp_path / "lauren-loop-v2.sh").chmod(0o755)
-
-    git.snapshot_values = ["before", "after"]
-    git.changed_file_values = [["src/backlog_fix.py"]]
-    git.untracked_file_values = [[], []]
     ranking_calls: list[bool] = []
 
     def fake_run_lauren_ranking(repo_root, tasks_dir, timeout, *, env):
@@ -1697,22 +2017,12 @@ def test_backlog_runs_despite_manager_contract_failure(tmp_path: Path, config_fa
             "",
         )
 
-    def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
-        _write_scope_triage(task_one, ["src/backlog_fix.py"])
-        _write_lauren_manifest(task_one, {"final_status": "success", "total_cost_usd": 0.50})
-
-        class Result:
-            returncode = 0
-
-        return Result()
-
     monkeypatch.setattr(phases_module.backlog_helpers, "run_lauren_ranking", fake_run_lauren_ranking)
-    monkeypatch.setattr(phases_module.autofix_helpers, "run_lauren_loop", fake_run_lauren_loop)
 
     orchestrator.phase_backlog()
 
-    assert ranking_calls == [True]
-    assert len(context.backlog_results) == 1
+    assert ranking_calls == []
+    assert context.backlog_results == []
 
 
 def test_backlog_skips_smoke(tmp_path: Path, config_factory) -> None:
@@ -1733,12 +2043,216 @@ def test_backlog_skips_smoke(tmp_path: Path, config_factory) -> None:
 
 def test_backlog_skips_disabled(tmp_path: Path, config_factory) -> None:
     runner = ScriptedAgentRunner()
-    orchestrator, context = create_orchestrator(tmp_path, config_factory, runner=runner)
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        extra_env={"NIGHTSHIFT_BACKLOG_ENABLED": "false"},
+    )
     _write_ranked_digest(context, [("1", "critical", "regression", "Auth regression")])
 
     orchestrator.phase_backlog()
 
     assert context.backlog_results == []
+
+
+def test_backlog_inflates_to_meet_minimum_attempt_floor(tmp_path: Path, config_factory, monkeypatch) -> None:
+    runner = ScriptedAgentRunner()
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        git=ScriptedGit(),
+        extra_env={
+            "NIGHTSHIFT_BACKLOG_ENABLED": "true",
+            "NIGHTSHIFT_BACKLOG_MAX_TASKS": "1",
+            "NIGHTSHIFT_MIN_TASKS_PER_RUN": "3",
+        },
+    )
+    context.autofix_results = [{"status": "failed"}]
+    _write_ranked_digest(context, [("1", "critical", "regression", "Auth regression")])
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-one" / "task.md")
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-two" / "task.md")
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-three" / "task.md")
+    write_executable(tmp_path / "lauren-loop.sh", "#!/usr/bin/env bash\n")
+    write_executable(tmp_path / "lauren-loop-v2.sh", "#!/usr/bin/env bash\n")
+
+    def fake_run_lauren_ranking(repo_root, tasks_dir, timeout, *, env):
+        return _completed_backlog_ranking(
+            repo_root,
+            [
+                (1, "docs/tasks/open/backlog-one/task.md", "Fix backlog one", "medium"),
+                (2, "docs/tasks/open/backlog-two/task.md", "Fix backlog two", "medium"),
+                (3, "docs/tasks/open/backlog-three/task.md", "Fix backlog three", "medium"),
+            ],
+        )
+
+    def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
+        class Result:
+            returncode = 1
+
+        return Result()
+
+    monkeypatch.setattr(phases_module.backlog_helpers, "run_lauren_ranking", fake_run_lauren_ranking)
+    monkeypatch.setattr(phases_module.autofix_helpers, "run_lauren_loop", fake_run_lauren_loop)
+
+    orchestrator.phase_backlog()
+
+    assert [entry["slug"] for entry in context.backlog_results] == ["backlog-one", "backlog-two"]
+
+
+def test_backlog_honors_normal_cap_when_autofix_meets_minimum(tmp_path: Path, config_factory, monkeypatch) -> None:
+    runner = ScriptedAgentRunner()
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        git=ScriptedGit(),
+        extra_env={
+            "NIGHTSHIFT_BACKLOG_ENABLED": "true",
+            "NIGHTSHIFT_BACKLOG_MAX_TASKS": "2",
+            "NIGHTSHIFT_MIN_TASKS_PER_RUN": "3",
+        },
+    )
+    context.autofix_results = [{"status": "failed"} for _ in range(5)]
+    _write_ranked_digest(context, [("1", "critical", "regression", "Auth regression")])
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-one" / "task.md")
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-two" / "task.md")
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-three" / "task.md")
+    write_executable(tmp_path / "lauren-loop.sh", "#!/usr/bin/env bash\n")
+    write_executable(tmp_path / "lauren-loop-v2.sh", "#!/usr/bin/env bash\n")
+
+    def fake_run_lauren_ranking(repo_root, tasks_dir, timeout, *, env):
+        return _completed_backlog_ranking(
+            repo_root,
+            [
+                (1, "docs/tasks/open/backlog-one/task.md", "Fix backlog one", "medium"),
+                (2, "docs/tasks/open/backlog-two/task.md", "Fix backlog two", "medium"),
+                (3, "docs/tasks/open/backlog-three/task.md", "Fix backlog three", "medium"),
+            ],
+        )
+
+    def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
+        class Result:
+            returncode = 1
+
+        return Result()
+
+    monkeypatch.setattr(phases_module.backlog_helpers, "run_lauren_ranking", fake_run_lauren_ranking)
+    monkeypatch.setattr(phases_module.autofix_helpers, "run_lauren_loop", fake_run_lauren_loop)
+
+    orchestrator.phase_backlog()
+
+    assert [entry["slug"] for entry in context.backlog_results] == ["backlog-one", "backlog-two"]
+
+
+def test_backlog_runs_on_clean_run_when_autofix_is_below_minimum(tmp_path: Path, config_factory, monkeypatch) -> None:
+    runner = ScriptedAgentRunner()
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        git=ScriptedGit(),
+        extra_env={
+            "NIGHTSHIFT_BACKLOG_ENABLED": "true",
+            "NIGHTSHIFT_BACKLOG_MAX_TASKS": "1",
+            "NIGHTSHIFT_MIN_TASKS_PER_RUN": "3",
+        },
+    )
+    context.run_clean = True
+    context.autofix_results = [{"status": "blocked"}]
+    _write_ranked_digest(context, [("1", "critical", "regression", "Auth regression")])
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-one" / "task.md")
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-two" / "task.md")
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-three" / "task.md")
+    write_executable(tmp_path / "lauren-loop.sh", "#!/usr/bin/env bash\n")
+    write_executable(tmp_path / "lauren-loop-v2.sh", "#!/usr/bin/env bash\n")
+
+    def fake_run_lauren_ranking(repo_root, tasks_dir, timeout, *, env):
+        return _completed_backlog_ranking(
+            repo_root,
+            [
+                (1, "docs/tasks/open/backlog-one/task.md", "Fix backlog one", "medium"),
+                (2, "docs/tasks/open/backlog-two/task.md", "Fix backlog two", "medium"),
+                (3, "docs/tasks/open/backlog-three/task.md", "Fix backlog three", "medium"),
+            ],
+        )
+
+    def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
+        class Result:
+            returncode = 1
+
+        return Result()
+
+    monkeypatch.setattr(phases_module.backlog_helpers, "run_lauren_ranking", fake_run_lauren_ranking)
+    monkeypatch.setattr(phases_module.autofix_helpers, "run_lauren_loop", fake_run_lauren_loop)
+
+    orchestrator.phase_backlog()
+
+    assert [entry["slug"] for entry in context.backlog_results] == ["backlog-one", "backlog-two"]
+
+
+def test_backlog_skips_clean_run_when_autofix_already_meets_minimum(tmp_path: Path, config_factory) -> None:
+    runner = ScriptedAgentRunner()
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        extra_env={
+            "NIGHTSHIFT_BACKLOG_ENABLED": "true",
+            "NIGHTSHIFT_MIN_TASKS_PER_RUN": "3",
+        },
+    )
+    context.run_clean = True
+    context.autofix_results = [{"status": "failed"} for _ in range(3)]
+    _write_ranked_digest(context, [("1", "critical", "regression", "Auth regression")])
+
+    orchestrator.phase_backlog()
+
+    assert context.backlog_results == []
+
+
+def test_backlog_minimum_zero_disables_floor_inflation(tmp_path: Path, config_factory, monkeypatch) -> None:
+    runner = ScriptedAgentRunner()
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        git=ScriptedGit(),
+        extra_env={
+            "NIGHTSHIFT_BACKLOG_ENABLED": "true",
+            "NIGHTSHIFT_BACKLOG_MAX_TASKS": "1",
+            "NIGHTSHIFT_MIN_TASKS_PER_RUN": "0",
+        },
+    )
+    context.autofix_results = [{"status": "failed"}]
+    _write_ranked_digest(context, [("1", "critical", "regression", "Auth regression")])
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-one" / "task.md")
+    _write_backlog_task(tmp_path / "docs" / "tasks" / "open" / "backlog-two" / "task.md")
+    write_executable(tmp_path / "lauren-loop.sh", "#!/usr/bin/env bash\n")
+    write_executable(tmp_path / "lauren-loop-v2.sh", "#!/usr/bin/env bash\n")
+
+    def fake_run_lauren_ranking(repo_root, tasks_dir, timeout, *, env):
+        return _completed_backlog_ranking(
+            repo_root,
+            [
+                (1, "docs/tasks/open/backlog-one/task.md", "Fix backlog one", "medium"),
+                (2, "docs/tasks/open/backlog-two/task.md", "Fix backlog two", "medium"),
+            ],
+        )
+
+    def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
+        class Result:
+            returncode = 1
+
+        return Result()
+
+    monkeypatch.setattr(phases_module.backlog_helpers, "run_lauren_ranking", fake_run_lauren_ranking)
+    monkeypatch.setattr(phases_module.autofix_helpers, "run_lauren_loop", fake_run_lauren_loop)
+
+    orchestrator.phase_backlog()
+
+    assert [entry["slug"] for entry in context.backlog_results] == ["backlog-one"]
 
 
 def test_backlog_unpickable_filtered(tmp_path: Path, config_factory, monkeypatch) -> None:

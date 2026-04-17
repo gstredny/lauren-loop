@@ -5,16 +5,18 @@ import subprocess
 from pathlib import Path
 
 import nightshift.phases as phases_module
+from nightshift.task_context import build_existing_open_tasks_context
 from nightshift.cost import CostTracker
 from nightshift.git import GitStateMachine
 from nightshift.phases import NightshiftOrchestrator
 from nightshift.runtime import RunContext
 from nightshift.timeout import TimeoutBudget
 
-from .conftest import create_bare_remote_repo, run
+from .conftest import NIGHTSHIFT_DIR, create_bare_remote_repo, run, write_executable
 from .test_phases import (
     ScriptedAgentRunner,
     ScriptedGit,
+    _completed_backlog_ranking,
     _write_backlog_task,
     _write_lauren_manifest,
     _write_ranked_digest,
@@ -62,6 +64,155 @@ def _staged_repo_paths(worktree: Path) -> list[str]:
         for line in run(["git", "diff", "--cached", "--name-only"], cwd=worktree).stdout.splitlines()
         if line.strip()
     ]
+
+
+def _write_backlog_tasks(repo_root: Path, slugs: list[str]) -> None:
+    for slug in slugs:
+        _write_backlog_task(repo_root / "docs" / "tasks" / "open" / slug / "task.md")
+
+
+def _write_open_doc(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body.rstrip() + "\n", encoding="utf-8")
+    return path
+
+
+def _shell_existing_open_tasks_context(repo_root: Path) -> str:
+    script = write_executable(
+        repo_root / "print-shell-existing-open-tasks.sh",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+source "{NIGHTSHIFT_DIR / 'nightshift.conf'}"
+source "{NIGHTSHIFT_DIR / 'nightshift.sh'}"
+REPO_ROOT="{repo_root}"
+RUN_DATE="2026-03-31"
+DRY_RUN=1
+RUN_CLEAN=0
+SETUP_FAILED=0
+RUN_COST_CAP=0
+RUN_FAILED=0
+MANAGER_CONTRACT_FAILED=0
+COST_TRACKING_READY=0
+DIGEST_PATH=""
+ensure_task_context_helpers >/dev/null 2>&1
+context="$(task_context_existing_open_tasks_block)"
+printf '%s' "${{context}}"
+""",
+    )
+    return run(["bash", str(script)], cwd=repo_root).stdout
+
+
+def _assert_existing_open_tasks_context_parity(
+    repo_root: Path,
+    files: dict[str, str] | None = None,
+) -> str:
+    for relative_path, body in (files or {}).items():
+        _write_open_doc(repo_root / relative_path, body)
+
+    shell_context = _shell_existing_open_tasks_context(repo_root)
+    python_context = build_existing_open_tasks_context(repo_root / "docs" / "tasks" / "open")
+
+    assert shell_context == python_context
+    return python_context
+
+
+def _shell_backlog_selected_count(
+    repo_root: Path,
+    *,
+    attempted_count: int,
+    min_tasks_per_run: int,
+    run_clean: bool,
+    backlog_max: int,
+) -> int:
+    script = write_executable(
+        repo_root / "count-shell-backlog-selection.sh",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+source "{NIGHTSHIFT_DIR / 'nightshift.conf'}"
+source "{NIGHTSHIFT_DIR / 'nightshift.sh'}"
+REPO_ROOT="{repo_root}"
+RUN_DATE="2026-03-31"
+NIGHTSHIFT_BACKLOG_ENABLED="true"
+NIGHTSHIFT_BACKLOG_MAX_TASKS="{backlog_max}"
+NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+NIGHTSHIFT_MIN_TASKS_PER_RUN="{min_tasks_per_run}"
+NIGHTSHIFT_COST_CAP_USD="100"
+AUTOFIX_ATTEMPTED_COUNT="{attempted_count}"
+DRY_RUN=1
+RUN_CLEAN={1 if run_clean else 0}
+SETUP_FAILED=0
+RUN_COST_CAP=0
+RUN_FAILED=0
+MANAGER_CONTRACT_FAILED=0
+COST_TRACKING_READY=0
+DIGEST_PATH=""
+phase_backlog_burndown >/dev/null 2>&1
+printf '%s\\n' "${{#BACKLOG_RESULTS[@]}}"
+""",
+    )
+    result = run(["bash", str(script)], cwd=repo_root)
+    return int(result.stdout.strip())
+
+
+def _assert_backlog_selection_count_parity(
+    tmp_path: Path,
+    config_factory,
+    monkeypatch=None,
+    *,
+    attempted_count: int,
+    min_tasks_per_run: int,
+    run_clean: bool,
+    backlog_max: int,
+    task_slugs: list[str],
+) -> tuple[RunContext, int, int]:
+    _write_backlog_tasks(tmp_path, task_slugs)
+    shell_count = _shell_backlog_selected_count(
+        tmp_path,
+        attempted_count=attempted_count,
+        min_tasks_per_run=min_tasks_per_run,
+        run_clean=run_clean,
+        backlog_max=backlog_max,
+    )
+    runner = ScriptedAgentRunner()
+    orchestrator, context = create_orchestrator(
+        tmp_path,
+        config_factory,
+        runner=runner,
+        git=ScriptedGit(),
+        extra_env={
+            "NIGHTSHIFT_BACKLOG_ENABLED": "true",
+            "NIGHTSHIFT_BACKLOG_MAX_TASKS": str(backlog_max),
+            "NIGHTSHIFT_MIN_TASKS_PER_RUN": str(min_tasks_per_run),
+        },
+    )
+    context.autofix_results = [{"status": "failed"} for _ in range(attempted_count)]
+    if run_clean:
+        context.run_clean = True
+    _write_ranked_digest(context, [("1", "critical", "regression", "Auth regression")])
+    write_executable(tmp_path / "lauren-loop.sh", "#!/usr/bin/env bash\n")
+    write_executable(tmp_path / "lauren-loop-v2.sh", "#!/usr/bin/env bash\n")
+    rows = [
+        (index + 1, f"docs/tasks/open/{slug}/task.md", f"Fix {slug.replace('-', ' ')}", "medium")
+        for index, slug in enumerate(task_slugs)
+    ]
+
+    def fake_run_lauren_ranking(repo_root, tasks_dir, timeout, *, env):
+        return _completed_backlog_ranking(repo_root, rows)
+
+    def fake_run_lauren_loop(slug, goal, repo_root, timeout, *, env):
+        class Result:
+            returncode = 1
+
+        return Result()
+
+    if monkeypatch is not None:
+        monkeypatch.setattr(phases_module.backlog_helpers, "run_lauren_ranking", fake_run_lauren_ranking)
+        monkeypatch.setattr(phases_module.autofix_helpers, "run_lauren_loop", fake_run_lauren_loop)
+
+    orchestrator.phase_backlog()
+
+    python_count = len(context.backlog_results)
+    return context, shell_count, python_count
 
 
 def test_bridge_scope_violation_restores_worktree(tmp_path: Path, config_factory, monkeypatch) -> None:
@@ -478,3 +629,141 @@ def test_backlog_manifest_malformed_restores_and_halts(tmp_path: Path, config_fa
     assert tracked_path.read_text(encoding="utf-8") == "value = 'original'\n"
     assert [entry["status"] for entry in context.backlog_results] == ["failed"]
     assert any("manifest contract failure" in message for message in context.warnings)
+
+
+def test_backlog_floor_inflates_selected_count_for_parity(tmp_path: Path, config_factory, monkeypatch) -> None:
+    context, shell_count, python_count = _assert_backlog_selection_count_parity(
+        tmp_path,
+        config_factory,
+        monkeypatch,
+        attempted_count=1,
+        min_tasks_per_run=3,
+        run_clean=False,
+        backlog_max=1,
+        task_slugs=["backlog-one", "backlog-two", "backlog-three"],
+    )
+    assert shell_count == python_count
+    assert shell_count == 2
+    assert [entry["slug"] for entry in context.backlog_results] == ["backlog-one", "backlog-two"]
+
+
+def test_backlog_uses_normal_cap_after_floor_is_met_for_parity(tmp_path: Path, config_factory, monkeypatch) -> None:
+    context, shell_count, python_count = _assert_backlog_selection_count_parity(
+        tmp_path,
+        config_factory,
+        monkeypatch,
+        attempted_count=5,
+        min_tasks_per_run=3,
+        run_clean=False,
+        backlog_max=2,
+        task_slugs=["backlog-one", "backlog-two", "backlog-three"],
+    )
+    assert shell_count == python_count
+    assert shell_count == 2
+    assert [entry["slug"] for entry in context.backlog_results] == ["backlog-one", "backlog-two"]
+
+
+def test_backlog_runs_on_clean_run_when_floor_is_unmet_for_parity(tmp_path: Path, config_factory, monkeypatch) -> None:
+    context, shell_count, python_count = _assert_backlog_selection_count_parity(
+        tmp_path,
+        config_factory,
+        monkeypatch,
+        attempted_count=1,
+        min_tasks_per_run=3,
+        run_clean=True,
+        backlog_max=1,
+        task_slugs=["backlog-one", "backlog-two", "backlog-three"],
+    )
+    assert shell_count == python_count
+    assert shell_count == 2
+    assert [entry["slug"] for entry in context.backlog_results] == ["backlog-one", "backlog-two"]
+
+
+def test_backlog_skips_clean_run_after_floor_is_met_for_parity(tmp_path: Path, config_factory) -> None:
+    context, shell_count, python_count = _assert_backlog_selection_count_parity(
+        tmp_path,
+        config_factory,
+        monkeypatch=None,
+        attempted_count=3,
+        min_tasks_per_run=3,
+        run_clean=True,
+        backlog_max=3,
+        task_slugs=["backlog-one", "backlog-two"],
+    )
+    assert shell_count == python_count
+    assert shell_count == 0
+    assert context.backlog_results == []
+
+
+def test_backlog_minimum_zero_disables_floor_inflation_for_parity(tmp_path: Path, config_factory, monkeypatch) -> None:
+    context, shell_count, python_count = _assert_backlog_selection_count_parity(
+        tmp_path,
+        config_factory,
+        monkeypatch,
+        attempted_count=1,
+        min_tasks_per_run=0,
+        run_clean=False,
+        backlog_max=1,
+        task_slugs=["backlog-one", "backlog-two"],
+    )
+    assert shell_count == python_count
+    assert shell_count == 1
+    assert [entry["slug"] for entry in context.backlog_results] == ["backlog-one"]
+
+
+def test_existing_open_tasks_context_empty_backlog_parity(tmp_path: Path) -> None:
+    context = _assert_existing_open_tasks_context_parity(tmp_path)
+
+    assert context == "## Existing Open Tasks\n\n(none)"
+
+
+def test_existing_open_tasks_context_filters_mixed_files_for_parity(tmp_path: Path) -> None:
+    context = _assert_existing_open_tasks_context_parity(
+        tmp_path,
+        {
+            "docs/tasks/open/alpha.md": "## Task: Alpha\n## Status: not started\n",
+            "docs/tasks/open/beta.md": (
+                "# Beta backlog item\n## Status: in progress\n\n## Done Criteria\n- Included.\n"
+            ),
+            "docs/tasks/open/gamma-roadmap.md": "# Gamma Roadmap\n**Status:** active\n",
+            "docs/tasks/open/completed.md": (
+                "## Task: Completed task\n## Status: completed\n## Attempts\n- Done.\n"
+            ),
+        },
+    )
+
+    assert context == (
+        "## Existing Open Tasks\n\n"
+        "docs/tasks/open/alpha.md: Alpha [not started]\n"
+        "docs/tasks/open/beta.md: Beta backlog item [in progress]"
+    )
+
+
+def test_existing_open_tasks_context_uses_task_md_parent_title_for_parity(tmp_path: Path) -> None:
+    context = _assert_existing_open_tasks_context_parity(
+        tmp_path,
+        {
+            "docs/tasks/open/team-alpha/task.md": "## Status: blocked\n## Goal\nFallback title.\n",
+        },
+    )
+
+    assert context == (
+        "## Existing Open Tasks\n\n"
+        "docs/tasks/open/team-alpha/task.md: team-alpha [blocked]"
+    )
+
+
+def test_existing_open_tasks_context_normalizes_heading_whitespace_for_parity(tmp_path: Path) -> None:
+    context = _assert_existing_open_tasks_context_parity(
+        tmp_path,
+        {
+            "docs/tasks/open/whitespace.md": (
+                "# Alpha    beta\t\tgamma\n## Status: in progress\n\n## Done Criteria\n- Included.\n"
+            ),
+        },
+    )
+
+    assert context == (
+        "## Existing Open Tasks\n\n"
+        "docs/tasks/open/whitespace.md: Alpha beta gamma [in progress]"
+    )

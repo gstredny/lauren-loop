@@ -8,6 +8,7 @@ from pathlib import Path
 from . import autofix as autofix_helpers
 from . import backlog as backlog_helpers
 from . import bridge as bridge_helpers
+from . import task_context as task_context_helpers
 from . import task_writer as task_writer_helpers
 from . import validation as validation_helpers
 from .agents import (
@@ -24,19 +25,31 @@ from .detective_status import DetectiveStatus, DetectiveStatusStore
 from .digest import (
     MANAGER_REQUIRED_BODY_HEADINGS,
     append_orchestrator_summary,
+    count_digest_rows_in_section,
     count_total_findings,
     manager_top_findings_from_digest,
     rebuild_manager_inputs,
     rewrite_manager_digest,
     validate_digest_headings,
+    write_empty_manager_digest_body,
     write_fallback_digest,
     write_findings_manifest,
 )
 from .git import GitStateMachine
 from .notify import build_summary as build_notify_summary
 from .notify import send_webhook
+from .playbook import PlaybookRenderer
 from .runtime import RunContext
 from .ship import ShipError, ShipResult, Shipper
+from .suppression import (
+    annotate_digest_with_fingerprints,
+    apply_suppressions,
+    render_expired_suppressions_section,
+    render_expiring_soon_section,
+    render_findings_missing_rule_key_section,
+    render_suppressed_findings_section,
+    write_apply_artifacts,
+)
 from .subprocess_runner import CommandTimeoutError
 from .timeout import TimeoutBudget, TotalTimeoutExceeded
 
@@ -201,9 +214,11 @@ class NightshiftOrchestrator:
     def phase_manager_merge(self) -> None:
         self.context.current_phase = "Manager Merge"
         self.timeout_budget.checkpoint(self.context.current_phase)
+        self.context.run_clean = False
 
         if self.context.dry_run:
             self.logger.info("DRY RUN: skipping manager merge")
+            self.context.run_clean = True
             self._write_manager_fallback("dry-run-skipped", "Manager Merge")
             return
 
@@ -224,9 +239,23 @@ class NightshiftOrchestrator:
             self.detective_playbooks, self.context.run_date, self.detective_status_store,
         )
         self.context.total_findings_available = count_total_findings(self.config.findings_dir)
+        suppression_result = apply_suppressions(
+            self.config.findings_dir,
+            suppressions_path=self.config.repo_dir / "docs/nightshift/suppressions.yaml",
+            digests_dir=self.config.repo_dir / "docs/nightshift/digests",
+            run_date=self.context.run_date,
+        )
+        write_apply_artifacts(self.context.suppression_artifacts_dir, suppression_result)
+        self.context.findings_eligible_for_ranking = suppression_result.eligible_total
+        self.context.suppressed_finding_count = suppression_result.suppressed_count
+        for warning in suppression_result.warnings:
+            self.context.add_warning(warning)
+            self.logger.warning("%s", warning)
 
         if self.context.total_findings_available == 0:
             self.logger.info("No findings available, skipping manager merge")
+            if not self.context.failures:
+                self.context.run_clean = True
             self._write_manager_fallback("no-findings", "Manager Merge")
             return
 
@@ -235,13 +264,16 @@ class NightshiftOrchestrator:
         digest_path = self.context.writable_digest_path
         manager_failed = False
         manager_failure_detail = ""
-        try:
-            self.agents.run_claude("manager-merge", model=self.config.manager_model)
-        except Exception as exc:
-            manager_failed = True
-            manager_failure_detail = f"{type(exc).__name__}: {exc}"
-            self.context.add_failure(f"Manager agent failed: {manager_failure_detail}")
-            self.logger.error("Manager agent failed: %s", manager_failure_detail)
+        if self.context.findings_eligible_for_ranking == 0:
+            write_empty_manager_digest_body(digest_path)
+        else:
+            try:
+                self.agents.run_claude("manager-merge", model=self.config.manager_model)
+            except Exception as exc:
+                manager_failed = True
+                manager_failure_detail = f"{type(exc).__name__}: {exc}"
+                self.context.add_failure(f"Manager agent failed: {manager_failure_detail}")
+                self.logger.error("Manager agent failed: %s", manager_failure_detail)
 
         if self.context.cost_cap_hit:
             if digest_path.exists() and digest_path.stat().st_size > 0:
@@ -278,11 +310,12 @@ class NightshiftOrchestrator:
             return
 
         top_count = len(manager_top_findings_from_digest(digest_path))
-        if self.context.total_findings_available > 0 and top_count == 0:
+        minor_count = count_digest_rows_in_section(digest_path, "## Minor & Observation Findings")
+        if self.context.findings_eligible_for_ranking > 0 and top_count + minor_count == 0:
             self.context.manager_contract_failed = True
             self.context.digest_stageable = False
             self.context.digest_path = digest_path
-            self.context.add_failure("Manager digest has empty ranked findings table")
+            self.context.add_failure("Manager digest has empty ranked findings table after suppression filtering")
             self.context.add_warning("Manager output failed contract validation; raw output preserved")
             self.logger.warning("Manager output failed contract validation; raw output preserved")
             return
@@ -299,11 +332,20 @@ class NightshiftOrchestrator:
         rewrite_manager_digest(
             digest_path, run_date=self.context.run_date, run_id=self.context.run_id,
             total_findings=self.context.total_findings_available,
+            eligible_findings=self.context.findings_eligible_for_ranking,
+            suppressed_count=self.context.suppressed_finding_count,
             task_file_count=self.context.task_file_count,
             detective_playbooks=self.detective_playbooks,
             detective_status_store=self.detective_status_store,
             findings_dir=self.config.findings_dir,
+            suppression_sections=(
+                render_suppressed_findings_section(suppression_result),
+                render_expired_suppressions_section(suppression_result),
+                render_expiring_soon_section(suppression_result),
+                render_findings_missing_rule_key_section(suppression_result),
+            ),
         )
+        annotate_digest_with_fingerprints(digest_path, self.config.findings_dir)
 
         append_orchestrator_summary(
             digest_path, run_id=self.context.run_id,
@@ -316,7 +358,7 @@ class NightshiftOrchestrator:
         )
         self.context.digest_stageable = True
         self.context.digest_path = digest_path
-        self.logger.info("Manager merge complete: %s findings, digest at %s", top_count, digest_path)
+        self.logger.info("Manager merge complete: %s ranked findings, digest at %s", top_count, digest_path)
 
     def _write_manager_fallback(self, outcome: str, phase: str) -> None:
         digest_path = self.context.writable_digest_path
@@ -380,14 +422,15 @@ class NightshiftOrchestrator:
         budget_skipped = 0
         task_base_dir = self.config.repo_dir / "docs" / "tasks" / "open"
         digest_path = self.context.digest_path or self.context.writable_digest_path
+        task_writer_playbook = self.config.playbooks_dir / "task-writer.md"
+        if not task_writer_playbook.is_file():
+            self.context.add_failure(f"Task writer playbook missing or unreadable: {task_writer_playbook}")
+            self.logger.error("Task writer playbook missing or unreadable: %s", task_writer_playbook)
+            self._write_empty_task_manifest()
+            return
 
-        if not self.context.dry_run:
-            task_writer_playbook = self.config.playbooks_dir / "task-writer.md"
-            if not task_writer_playbook.is_file():
-                self.context.add_failure(f"Task writer playbook missing or unreadable: {task_writer_playbook}")
-                self.logger.error("Task writer playbook missing or unreadable: %s", task_writer_playbook)
-                self._write_empty_task_manifest()
-                return
+        playbook_renderer = PlaybookRenderer(config=self.config, context=self.context)
+        existing_open_tasks_context = task_context_helpers.build_existing_open_tasks_context(task_base_dir)
 
         for index, (rank, severity, category, title) in enumerate(eligible_findings):
             remaining_budget = self._remaining_budget()
@@ -400,6 +443,23 @@ class NightshiftOrchestrator:
                 )
                 break
 
+            self.timeout_budget.checkpoint(self.context.current_phase)
+            finding_text = task_writer_helpers.build_finding_text(
+                rank, severity, category, title,
+                digest_path=digest_path,
+                findings_dir=self.config.findings_dir,
+                repo_dir=self.config.repo_dir,
+                existing_open_tasks_context=existing_open_tasks_context,
+            )
+            try:
+                rendered_path = playbook_renderer.render("task-writer", finding_text=finding_text)
+                shutil.copyfile(rendered_path, self.context.rendered_dir / f"task-writer-rank-{rank}.md")
+            except (FileNotFoundError, OSError) as exc:
+                self.context.add_failure(f"Task writer prompt snapshot failed for {title}: {exc}")
+                self.logger.error("Task writer prompt snapshot failed for %s: %s", title, exc)
+                self._write_empty_task_manifest()
+                return
+
             if self.context.dry_run:
                 self.logger.info(
                     "DRY RUN: would write task for: %s (severity: %s, remaining: $%.4f, minimum reserve: $%.4f)",
@@ -410,18 +470,12 @@ class NightshiftOrchestrator:
                 )
                 continue
 
-            self.timeout_budget.checkpoint(self.context.current_phase)
-            finding_text = task_writer_helpers.build_finding_text(
-                rank, severity, category, title,
-                digest_path=digest_path,
-                findings_dir=self.config.findings_dir,
-                repo_dir=self.config.repo_dir,
-            )
             try:
                 result = self.agents.run_claude(
                     "task-writer",
                     model=self.config.manager_model,
                     finding_text=finding_text,
+                    artifact_suffix=f"rank-{rank}",
                 )
                 task_writer_text = read_claude_result_text(result.output_path) or ""
             except (AgentExecutionError, AgentTimeoutError) as exc:
@@ -537,7 +591,7 @@ class NightshiftOrchestrator:
         mutated_paths: list[Path] = []
         invalid_count = 0
 
-        for task_path in task_files:
+        for index, task_path in enumerate(task_files, start=1):
             self.timeout_budget.checkpoint(self.context.current_phase)
             task_rel = self._repo_relative_display(task_path)
             if not task_path.exists():
@@ -557,6 +611,7 @@ class NightshiftOrchestrator:
                     "validation-agent",
                     model=self.config.manager_model,
                     task_file_path=str(task_path),
+                    artifact_suffix=self._validation_artifact_suffix(task_path, index),
                 )
                 validation_text = read_claude_result_text(result.output_path) or ""
                 validation_status = validation_helpers.parse_validation_result(validation_text)
@@ -755,7 +810,7 @@ class NightshiftOrchestrator:
                     slug,
                     goal,
                     self.config.repo_dir,
-                    self.config.agent_timeout_seconds,
+                    self.config.lauren_timeout_seconds,
                     env=env,
                 )
                 invocation_exit = int(invocation.returncode)
@@ -1029,7 +1084,7 @@ class NightshiftOrchestrator:
                     slug,
                     goal,
                     self.config.repo_dir,
-                    self.config.agent_timeout_seconds,
+                    self.config.lauren_timeout_seconds,
                     env=env,
                 )
                 invocation_exit = int(invocation.returncode)
@@ -1189,11 +1244,26 @@ class NightshiftOrchestrator:
         if self.context.dry_run:
             self.logger.info("Dry-run enabled: skipping Backlog")
             return
+        if self.context.manager_contract_failed:
+            self.logger.info("Backlog skipped because manager contract failed")
+            return
         if not self.config.backlog_enabled:
             self.logger.info("Backlog disabled: skipping phase")
             return
         if self.context.cost_cap_hit:
             self.logger.info("Backlog skipped because the run is already cost-capped")
+            return
+
+        attempted_autofix, min_tasks_per_run, needed_tasks, effective_max_tasks = self._backlog_floor_state()
+        self.logger.info(
+            "Backlog target: attempted autofix=%s, min per run=%s, needed=%s, effective max=%s",
+            attempted_autofix,
+            min_tasks_per_run,
+            needed_tasks,
+            effective_max_tasks,
+        )
+        if self.context.run_clean and needed_tasks == 0:
+            self.logger.info("Backlog skipped for clean run because autofix already met the minimum task floor")
             return
 
         if self._remaining_budget() < self.config.backlog_min_budget:
@@ -1256,7 +1326,7 @@ class NightshiftOrchestrator:
             ranking = backlog_helpers.run_lauren_ranking(
                 self.config.repo_dir,
                 tasks_dir,
-                self.config.agent_timeout_seconds,
+                self.config.lauren_timeout_seconds,
                 env=self.config.subprocess_env({"LAUREN_LOOP_NONINTERACTIVE": "1"}),
             )
         except CommandTimeoutError:
@@ -1331,7 +1401,7 @@ class NightshiftOrchestrator:
             if not pickable:
                 continue
             selected_candidates.append((rank, task_path, task_goal, task_complexity))
-            if len(selected_candidates) >= self.config.backlog_max_tasks:
+            if len(selected_candidates) >= effective_max_tasks:
                 break
 
         if not selected_candidates:
@@ -1382,7 +1452,7 @@ class NightshiftOrchestrator:
                     slug,
                     task_goal,
                     self.config.repo_dir,
-                    self.config.agent_timeout_seconds,
+                    self.config.lauren_timeout_seconds,
                     env=env,
                 )
                 invocation_exit = int(invocation.returncode)
@@ -1531,6 +1601,16 @@ class NightshiftOrchestrator:
             len(self.context.backlog_results),
         )
 
+    def _autofix_attempted_count(self) -> int:
+        return len(self.context.autofix_results)
+
+    def _backlog_floor_state(self) -> tuple[int, int, int, int]:
+        attempted = self._autofix_attempted_count()
+        minimum = self.config.min_tasks_per_run
+        needed = 0 if minimum <= 0 or attempted >= minimum else minimum - attempted
+        effective_max = max(needed, self.config.backlog_max_tasks)
+        return attempted, minimum, needed, effective_max
+
     def write_digest(self, *, phase_reached: str | None = None) -> None:
         if phase_reached is None:
             self.context.current_phase = "Digest"
@@ -1565,6 +1645,9 @@ class NightshiftOrchestrator:
         self.context.ship_blocked_reason = None
         if self.context.digest_path is None or self.context.run_branch is None:
             self.context.add_failure("Cannot ship without a digest and run branch")
+            return
+        if self.context.run_clean:
+            self.logger.info("Clean run detected: no commit, push, or PR will be created")
             return
         shippable, reason = self.context.run_health_check()
         if not shippable:
@@ -1750,11 +1833,18 @@ class NightshiftOrchestrator:
 
     def _detective_schedule(self) -> list[tuple[str, str]]:
         schedule: list[tuple[str, str]] = []
-        engines = self.DETECTIVE_ENGINES
+        engines = self._detective_engines()
         for playbook_name in self._active_playbooks():
             for engine in engines:
                 schedule.append((playbook_name, engine))
         return schedule
+
+    def _detective_engines(self) -> tuple[str, ...]:
+        engines: list[str] = []
+        if self.config.claude_detectives_enabled:
+            engines.append("claude")
+        engines.append("codex")
+        return tuple(engines)
 
     def _active_playbooks(self) -> tuple[str, ...]:
         playbooks = ("commit-detective",) if self.context.smoke else self.detective_playbooks
@@ -1783,6 +1873,12 @@ class NightshiftOrchestrator:
             "observation": 1,
         }
         return ranks.get(severity.strip().lower(), 0) >= ranks.get(minimum.strip().lower(), 0) > 0
+
+    def _validation_artifact_suffix(self, task_path: Path, index: int) -> str:
+        candidate = task_path.parent.name or task_path.stem
+        if candidate:
+            return candidate
+        return f"task-{index:03d}"
 
     def _remaining_budget(self, extra_spend: float = 0.0) -> float:
         remaining = float(self.config.cost_cap_usd) - float(self.cost_tracker.total()) - extra_spend

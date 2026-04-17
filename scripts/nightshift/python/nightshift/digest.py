@@ -165,6 +165,10 @@ def manager_top_findings_from_digest(digest_path: Path) -> list[tuple[str, str, 
     return results
 
 
+def count_digest_rows_in_section(digest_path: Path, heading: str) -> int:
+    return _count_table_rows(digest_path, heading)
+
+
 def write_findings_manifest(manifest_path: Path, digest_path: Path) -> bool:
     findings = manager_top_findings_from_digest(digest_path)
     tmp_path = manifest_path.parent / f"{manifest_path.name}.tmp"
@@ -200,10 +204,13 @@ def rewrite_manager_digest(
     run_date: str,
     run_id: str,
     total_findings: int,
+    eligible_findings: int | None = None,
+    suppressed_count: int = 0,
     task_file_count: int,
     detective_playbooks: Sequence[str],
     detective_status_store: DetectiveStatusStore,
     findings_dir: Path,
+    suppression_sections: Sequence[str] = (),
 ) -> None:
     if not digest_path.exists():
         return
@@ -211,7 +218,8 @@ def rewrite_manager_digest(
     ranked = _count_table_rows(digest_path, RANKED_FINDINGS_HEADING)
     minor = _count_table_rows(digest_path, MINOR_FINDINGS_HEADING)
     after_dedup = ranked + minor
-    dupes = max(0, total_findings - after_dedup)
+    eligible_count = total_findings if eligible_findings is None else eligible_findings
+    dupes = max(0, eligible_count - after_dedup)
     ran_names = []
     for pb in detective_playbooks:
         for s in detective_status_store.read_all():
@@ -228,15 +236,21 @@ def rewrite_manager_digest(
         "",
         SUMMARY_HEADING,
         f"- **Total findings received:** {total_findings}",
+        f"- **Eligible after suppression:** {eligible_count}",
         f"- **After deduplication:** {after_dedup}",
         f"- **Duplicates merged:** {dupes}",
+        f"- **Ranked:** {ranked} ({suppressed_count} suppressed)",
         f"- **Task files created:** {task_file_count}",
         f"- **Minor/observation findings:** {minor} (see digest below)",
         "",
     ]
     coverage = _render_detective_coverage(detective_playbooks, detective_status_store, findings_dir)
     skipped = _render_skipped_detectives(detective_playbooks, detective_status_store)
-    full = "\n".join(header_lines) + "\n" + body.strip() + "\n\n" + coverage + "\n" + skipped
+    sections_block = "\n\n".join(section.strip() for section in suppression_sections if section.strip())
+    full = "\n".join(header_lines) + "\n" + body.strip()
+    if sections_block:
+        full += "\n\n" + sections_block
+    full += "\n\n" + coverage + "\n" + skipped
     digest_path.write_text(full.rstrip() + "\n", encoding="utf-8")
 
 
@@ -407,4 +421,22 @@ def write_fallback_digest(
             lines.append(findings_path.read_text(encoding="utf-8").rstrip())
             lines.append("")
 
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
+
+def write_empty_manager_digest_body(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "# Nightshift Detective Digest",
+        "",
+        RANKED_FINDINGS_HEADING,
+        "",
+        "| # | Severity | Category | Title |",
+        "|---|----------|----------|-------|",
+        "",
+        MINOR_FINDINGS_HEADING,
+        "",
+        "| # | Title | Severity | Category | Source Detective | Evidence Summary |",
+        "|---|-------|----------|----------|-----------------|-----------------|",
+    ]
     path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")

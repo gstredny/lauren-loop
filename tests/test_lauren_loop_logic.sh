@@ -68,8 +68,10 @@ write_prompt_fixtures() {
 }
 
 write_plan_evaluation_artifact() {
-    local path="$1"
-    cat <<'EOF' > "$path"
+    local path="$1" variant="${2:-standard}"
+    case "$variant" in
+        standard)
+            cat <<'EOF' > "$path"
 ## Evaluation
 
 ## Selected Plan
@@ -77,6 +79,73 @@ write_plan_evaluation_artifact() {
 ### Goal
 Checkpoint plan
 EOF
+            ;;
+        lowercase)
+            cat <<'EOF' > "$path"
+## Evaluation
+
+## selected plan
+
+### Goal
+Checkpoint plan
+EOF
+            ;;
+        uppercase)
+            cat <<'EOF' > "$path"
+## Evaluation
+
+## SELECTED PLAN
+
+### Goal
+Checkpoint plan
+EOF
+            ;;
+        level3)
+            cat <<'EOF' > "$path"
+## Evaluation
+
+### Selected Plan
+
+#### Goal
+Checkpoint plan
+EOF
+            ;;
+        level3-fenced)
+            cat <<'EOF' > "$path"
+## Evaluation
+
+### Selected Plan
+
+#### Goal
+Checkpoint plan
+
+```md
+### Fake Heading
+not a real section break
+```
+
+#### Next Step
+Still inside selected plan.
+
+# After Plan
+outside selected plan
+EOF
+            ;;
+        blank-level3)
+            cat <<'EOF' > "$path"
+## Evaluation
+
+### Selected Plan
+
+# After Plan
+outside selected plan
+EOF
+            ;;
+        *)
+            printf 'Unknown plan evaluation artifact variant: %s\n' "$variant" >&2
+            return 1
+            ;;
+    esac
     printf '{"selected_plan_present":true}\n' > "${path%.*}.contract.json"
 }
 
@@ -809,6 +878,83 @@ EOF
   || fail "5. _archive_round_artifact — duplicate naming"
 
 (
+    fixture_dir="$TMP_ROOT/selected-plan-lowercase"
+    file="$fixture_dir/plan-evaluation.md"
+    output="$fixture_dir/revised-plan.md"
+    mkdir -p "$fixture_dir"
+    write_plan_evaluation_artifact "$file" "lowercase"
+    _extract_selected_plan_to_file "$file" "$output"
+    grep -Fq '### Goal' "$output"
+    grep -Fq 'Checkpoint plan' "$output"
+) && pass "5a. _extract_selected_plan_to_file — lowercase level-2 heading" \
+  || fail "5a. _extract_selected_plan_to_file — lowercase level-2 heading"
+
+(
+    fixture_dir="$TMP_ROOT/selected-plan-uppercase"
+    file="$fixture_dir/plan-evaluation.md"
+    output="$fixture_dir/revised-plan.md"
+    mkdir -p "$fixture_dir"
+    write_plan_evaluation_artifact "$file" "uppercase"
+    _extract_selected_plan_to_file "$file" "$output"
+    grep -Fq '### Goal' "$output"
+    grep -Fq 'Checkpoint plan' "$output"
+) && pass "5b. _extract_selected_plan_to_file — uppercase level-2 heading" \
+  || fail "5b. _extract_selected_plan_to_file — uppercase level-2 heading"
+
+(
+    fixture_dir="$TMP_ROOT/selected-plan-level3-fenced"
+    file="$fixture_dir/plan-evaluation.md"
+    output="$fixture_dir/revised-plan.md"
+    mkdir -p "$fixture_dir"
+    write_plan_evaluation_artifact "$file" "level3-fenced"
+    _extract_selected_plan_to_file "$file" "$output"
+    grep -Fq '### Fake Heading' "$output"
+    grep -Fq 'Still inside selected plan.' "$output"
+    ! grep -Fq '# After Plan' "$output"
+) && pass "5c. _extract_selected_plan_to_file — fenced fake headings are preserved and level-3 stops on level-1" \
+  || fail "5c. _extract_selected_plan_to_file — fenced fake headings are preserved and level-3 stops on level-1"
+
+(
+    fixture_dir="$TMP_ROOT/selected-plan-level3-peer-stop"
+    file="$fixture_dir/plan-evaluation.md"
+    output="$fixture_dir/revised-plan.md"
+    mkdir -p "$fixture_dir"
+    cat > "$file" <<'EOF'
+## Evaluation
+
+### Selected Plan
+
+#### Goal
+Checkpoint plan
+
+### Peer Section
+outside selected plan
+EOF
+    _extract_selected_plan_to_file "$file" "$output"
+    grep -Fq 'Checkpoint plan' "$output"
+    ! grep -Fq 'Peer Section' "$output"
+) && pass "5d. _extract_selected_plan_to_file — level-3 stops on same-level headings" \
+  || fail "5d. _extract_selected_plan_to_file — level-3 stops on same-level headings"
+
+(
+    fixture_dir="$TMP_ROOT/selected-plan-diagnostics"
+    file="$fixture_dir/plan-evaluation.md"
+    output="$fixture_dir/revised-plan.md"
+    diag_log="$fixture_dir/diagnostics.log"
+    mkdir -p "$fixture_dir"
+    write_plan_evaluation_artifact "$file" "blank-level3"
+    ! _extract_selected_plan_to_file "$file" "$output"
+    : > "$diag_log"
+    log_execution() { printf '%s\n' "$2" >> "$diag_log"; }
+    _log_diagnostic_lines "$fixture_dir/task.md" "$(_selected_plan_extraction_diagnostics "$file")"
+    grep -Fq 'diagnostic: matched Selected Plan heading line: 3' "$diag_log"
+    grep -Fq 'diagnostic: heading: 1:## Evaluation' "$diag_log"
+    grep -Fq 'diagnostic: heading: 3:### Selected Plan' "$diag_log"
+    grep -Fq 'diagnostic: heading: 5:# After Plan' "$diag_log"
+) && pass "5e. Selected Plan failure diagnostics include matched line number and heading list" \
+  || fail "5e. Selected Plan failure diagnostics include matched line number and heading list"
+
+(
     lock_dir="$TMP_ROOT/lock-contention.d"
     child="$TMP_ROOT/lock-holder.sh"
     cat > "$child" <<EOF
@@ -1314,6 +1460,27 @@ EOF
     grep -q '^explorer$' "$force_log"
 ) && pass "11. checkpoint skip behavior — non-force skips and force reruns" \
   || fail "11. checkpoint skip behavior — non-force skips and force reruns"
+
+(
+    fixture_dir="$TMP_ROOT/phase3-selected-plan-level3"
+    task_file="$fixture_dir/task.md"
+    comp_dir="$fixture_dir/competitive"
+    plan_eval="$comp_dir/plan-evaluation.md"
+    revised_plan="$comp_dir/revised-plan.md"
+    mkdir -p "$comp_dir"
+    write_task_fixture "$task_file"
+    write_plan_evaluation_artifact "$plan_eval" "level3-fenced"
+    _extract_selected_plan_to_file "$plan_eval" "$revised_plan" || exit 1
+    mirror_plan_into_task_file "$task_file" "$revised_plan" || exit 1
+    [[ -f "$revised_plan" ]] || exit 1
+    grep -Fq '### Fake Heading' "$revised_plan" || exit 1
+    grep -Fq 'Still inside selected plan.' "$revised_plan" || exit 1
+    if grep -Fq '# After Plan' "$revised_plan"; then
+        exit 1
+    fi
+    grep -Fq '### Fake Heading' "$task_file" || exit 1
+) && pass "11a. Phase 3 seed path extracts level-3 Selected Plan without breaking on fenced headings" \
+  || fail "11a. Phase 3 seed path extracts level-3 Selected Plan without breaking on fenced headings"
 
 (
     slug="cycle-resume"
@@ -3654,11 +3821,11 @@ EOF
 (
     SCRIPT_DIR="$REPO_ROOT"
     wrapped=$(_timeout_wrapped_verification_command ".venv/bin/python -m pytest tests/ -x -q")
-    printf '%s\n' "$wrapped" | grep -Eq '_timeout(\\ | )20m'
+    printf '%s\n' "$wrapped" | grep -Fq '_run_timeout_wrapped_verification_command'
     printf '%s\n' "$wrapped" | grep -Fq 'lib/lauren-loop-utils.sh'
     printf '%s\n' "$wrapped" | grep -Fq 'pytest'
-) && pass "62. timeout helper builds a shell-level 20m verification wrapper" \
-  || fail "62. timeout helper builds a shell-level 20m verification wrapper"
+) && pass "62. timeout helper builds a helper-backed shell-level verification wrapper" \
+  || fail "62. timeout helper builds a helper-backed shell-level verification wrapper"
 
 (
     unset SCRIPT_DIR
@@ -3673,7 +3840,7 @@ EOF
     SCRIPT_DIR="$REPO_ROOT"
     output=$(printf '%s' 'Baseline: .venv/bin/python -m pytest tests/ -x -q before execution.' | _normalize_executor_prompt_timeout_content "test prompt")
     printf '%s\n' "$output" | grep -Fq 'Baseline: bash -lc'
-    printf '%s\n' "$output" | grep -Fq '_timeout'
+    printf '%s\n' "$output" | grep -Fq '_run_timeout_wrapped_verification_command'
     printf '%s\n' "$output" | grep -Fq 'lib/lauren-loop-utils.sh'
     printf '%s\n' "$output" | grep -Fq 'pytest'
 ) && pass "63. executor prompt timeout normalization wraps the repo-standard pytest literal" \
@@ -3722,7 +3889,7 @@ EOF
     set -e
     [[ "$rc" -eq 0 ]]
     grep -Fq '<verify>bash -lc ' "$plan_file"
-    grep -Fq '_timeout' "$plan_file"
+    grep -Fq '_run_timeout_wrapped_verification_command' "$plan_file"
     grep -Fq 'lib/lauren-loop-utils.sh' "$plan_file"
     ! grep -Fq '<verify>.venv/bin/python -m pytest tests/ -x -q</verify>' "$plan_file"
 ) && pass "65. verify-tag timeout normalization wraps repo-standard pytest commands" \
@@ -3759,7 +3926,7 @@ EOF
 EOF
     _normalize_verify_tags_with_timeout_in_file "$plan_file" "already wrapped normalization"
     [[ "$(grep -o 'lib/lauren-loop-utils.sh' "$plan_file" | wc -l | tr -d ' ')" -eq 1 ]]
-    grep -Fq '_timeout\ 20m' "$plan_file"
+    grep -Fq '_run_timeout_wrapped_verification_command' "$plan_file"
 ) && pass "65c. verify-tag timeout normalization does not double-wrap already wrapped commands" \
   || fail "65c. verify-tag timeout normalization does not double-wrap already wrapped commands"
 
@@ -3785,6 +3952,81 @@ EOF
     _command_uses_timeout_wrapper "$wrapped"
 ) && pass "65e. timeout wrapper detection recognizes escaped generated wrapper output" \
   || fail "65e. timeout wrapper detection recognizes escaped generated wrapper output"
+
+(
+    SCRIPT_DIR="$REPO_ROOT"
+
+    wrapped=$(_timeout_wrapped_verification_command "bash -lc 'for i in {1..30}; do echo line-\$i; done; (sleep 4) &' | tail -20")
+    start=$(date +%s)
+    output=$(eval "$wrapped")
+    rc=$?
+    elapsed=$(( $(date +%s) - start ))
+    [[ "$rc" -eq 0 ]]
+    [[ "$elapsed" -lt 3 ]]
+    printf '%s\n' "$output" | grep -Fxq 'line-11'
+    printf '%s\n' "$output" | grep -Fxq 'line-30'
+
+    wrapped=$(_timeout_wrapped_verification_command "bash -lc 'for i in {1..30}; do echo line-\$i; done; (sleep 4) &' | tail --lines=20")
+    start=$(date +%s)
+    output=$(eval "$wrapped")
+    rc=$?
+    elapsed=$(( $(date +%s) - start ))
+    [[ "$rc" -eq 0 ]]
+    [[ "$elapsed" -lt 3 ]]
+    printf '%s\n' "$output" | grep -Fxq 'line-11'
+    printf '%s\n' "$output" | grep -Fxq 'line-30'
+) && pass "65f. helper-backed verify wrappers replay tail output without waiting for descendant pipe EOF" \
+  || fail "65f. helper-backed verify wrappers replay tail output without waiting for descendant pipe EOF"
+
+(
+    original_timeout_def="$(declare -f _timeout)"
+    _timeout() {
+        shift
+        local i=1
+        while [[ "$i" -le 30 ]]; do
+            printf 'line-%s\n' "$i"
+            i=$((i + 1))
+        done
+        return 124
+    }
+
+    output=$(_run_timeout_wrapped_verification_command "bash -lc 'ignored' | tail --lines=20")
+    rc=$?
+    eval "$original_timeout_def"
+
+    [[ "$rc" -eq 124 ]]
+    printf '%s\n' "$output" | grep -Fxq 'line-11'
+    printf '%s\n' "$output" | grep -Fxq 'line-30'
+) && pass "65g. helper-backed verify wrappers replay partial tail output and preserve timeout exit 124" \
+  || fail "65g. helper-backed verify wrappers replay partial tail output and preserve timeout exit 124"
+
+(
+    plan_file="$TMP_ROOT/normalize-verify-tags-tail-follow/plan.md"
+    mkdir -p "$(dirname "$plan_file")"
+    cat > "$plan_file" <<'EOF'
+# Plan Artifact
+
+## Implementation Tasks
+
+<verify>.venv/bin/python -m pytest tests/ -x -q | tail -f</verify>
+EOF
+    before="$(cat "$plan_file")"
+    SCRIPT_DIR="$REPO_ROOT"
+    set +e
+    output="$(_normalize_verify_tags_with_timeout_in_file "$plan_file" "tail follow normalization" 2>&1)"
+    rc=$?
+    set -e
+    after="$(cat "$plan_file")"
+    [[ "$rc" -ne 0 ]]
+    printf '%s\n' "$output" | grep -Fq 'unsupported streaming verify tail consumer: tail -f'
+    [[ "$before" == "$after" ]]
+) && pass "65h. verify-tag timeout normalization fails closed on streaming tail follow consumers" \
+  || fail "65h. verify-tag timeout normalization fails closed on streaming tail follow consumers"
+
+(
+    bash "$REPO_ROOT/tests/test_lauren_loop_tail_spacing.sh"
+) && pass "65i. tail-spacing regression suite covers supported and rejected tail variants" \
+  || fail "65i. tail-spacing regression suite covers supported and rejected tail variants"
 
 (
     plan_file="$TMP_ROOT/normalize-verify-tags-multiline/plan.md"
@@ -4170,7 +4412,7 @@ EOF
     elapsed=$(( $(date +%s) - start_ts ))
     [[ "$elapsed" -lt 3 ]]
     grep -q '^## Status: needs verification$' "$fixture_root/docs/tasks/open/$slug/task.md"
-    grep -q 'Phase 7: Early handoff detected from synced fix-execution.contract.json (STATUS: COMPLETE)' \
+    grep -q 'Phase 7: Early handoff detected from worktree fix-execution.contract.json (STATUS: COMPLETE)' \
         "$fixture_root/docs/tasks/open/$slug/task.md"
     grep -q 'Pipeline complete: Phase 7 fix execution merged successfully' \
         "$fixture_root/docs/tasks/open/$slug/task.md"
@@ -4178,8 +4420,8 @@ EOF
     ! grep -q '^reviewer-a-fix1$' "$ROLE_LOG"
     ! grep -q '^reviewer-b-fix1$' "$ROLE_LOG"
     ! grep -q '^review-evaluator-fix1$' "$ROLE_LOG"
-) && pass "68a. phase 7 early handoff terminates a slow fix executor once COMPLETE artifacts are synced" \
-  || fail "68a. phase 7 early handoff terminates a slow fix executor once COMPLETE artifacts are synced"
+) && pass "68a. phase 7 early handoff terminates a slow fix executor once COMPLETE artifacts are observed in the worktree" \
+  || fail "68a. phase 7 early handoff terminates a slow fix executor once COMPLETE artifacts are observed in the worktree"
 
 (
     slug="phase7-natural-return-without-artifacts"
@@ -4246,7 +4488,7 @@ EOF
     elapsed=$(( $(date +%s) - start_ts ))
     [[ "$elapsed" -ge 2 ]]
     grep -q '^## Status: needs verification$' "$fixture_root/docs/tasks/open/$slug/task.md"
-    ! grep -q 'Phase 7: Early handoff detected from synced fix-execution.contract.json (STATUS: COMPLETE)' \
+    ! grep -q 'Phase 7: Early handoff detected from worktree fix-execution.contract.json (STATUS: COMPLETE)' \
         "$fixture_root/docs/tasks/open/$slug/task.md"
     ! grep -q 'Phase 5: Review started (cycle 2)' "$fixture_root/docs/tasks/open/$slug/task.md"
     ! grep -q '^reviewer-a-fix1$' "$ROLE_LOG"
@@ -4423,7 +4665,7 @@ EOF
     grep -Fq '.venv/bin/python -m pytest tests/test_agent_planning.py -k "revision" -xvs && .venv/bin/python -m pytest tests/test_agent_planning.py -xvs' "$plan_file"
     grep -Fq '.venv/bin/python -m pytest tests/test_agent_llm_refactor.py -xvs && .venv/bin/python -m pytest tests/test_agent_budget_tracking.py -xvs' "$plan_file"
     grep -Fq '<verify>bash -lc ' "$plan_file"
-    grep -Fq '_timeout' "$plan_file"
+    grep -Fq '_run_timeout_wrapped_verification_command' "$plan_file"
 ) && pass "74. verify-tag timeout normalization handles an inline fixture matching the broken fix-plan patterns" \
   || fail "74. verify-tag timeout normalization handles an inline fixture matching the broken fix-plan patterns"
 
@@ -5268,6 +5510,139 @@ EOF
 ) && pass "86h. grep verify command passes validation" \
   || fail "86h. grep verify command passes validation"
 
+(
+    tree_dir="$TMP_ROOT/terminate-pid-tree-deep"
+    script="$tree_dir/deep-tree.sh"
+    child_file="$tree_dir/child.pid"
+    grandchild_file="$tree_dir/grandchild.pid"
+    leaf_file="$tree_dir/leaf.pid"
+    mkdir -p "$tree_dir"
+    cat > "$script" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+child_file="$1"
+grandchild_file="$2"
+leaf_file="$3"
+
+bash -c '
+  child_file="$1"
+  grandchild_file="$2"
+  leaf_file="$3"
+  echo "$$" > "$child_file"
+  bash -c '"'"'
+    grandchild_file="$1"
+    leaf_file="$2"
+    echo "$$" > "$grandchild_file"
+    sleep 60 &
+    echo "$!" > "$leaf_file"
+    wait "$!"
+  '"'"' _ "$grandchild_file" "$leaf_file"
+' _ "$child_file" "$grandchild_file" "$leaf_file"
+EOF
+    chmod +x "$script"
+
+    "$script" "$child_file" "$grandchild_file" "$leaf_file" &
+    root_pid=$!
+
+    i=0
+    while [[ "$i" -lt 40 ]]; do
+        [[ -s "$child_file" && -s "$grandchild_file" && -s "$leaf_file" ]] && break
+        sleep 0.05
+        i=$((i + 1))
+    done
+
+    [[ -s "$child_file" && -s "$grandchild_file" && -s "$leaf_file" ]]
+    child_pid=$(cat "$child_file")
+    grandchild_pid=$(cat "$grandchild_file")
+    leaf_pid=$(cat "$leaf_file")
+
+    start=$(date +%s)
+    _terminate_pid_tree "$root_pid" 0
+    elapsed=$(( $(date +%s) - start ))
+
+    wait "$root_pid" 2>/dev/null || true
+
+    [[ "$elapsed" -lt 2 ]]
+    ! kill -0 "$root_pid" 2>/dev/null
+    ! kill -0 "$child_pid" 2>/dev/null
+    ! kill -0 "$grandchild_pid" 2>/dev/null
+    ! kill -0 "$leaf_pid" 2>/dev/null
+) && pass "86i. _terminate_pid_tree kills a 3+ level process tree without hanging at zero grace" \
+  || fail "86i. _terminate_pid_tree kills a 3+ level process tree without hanging at zero grace"
+
+(
+    stop_agent_monitor() { :; }
+    spawn_active_job_tree() {
+        local script_path="$1"
+        local child_file="$2"
+        local grandchild_file="$3"
+        local leaf_file="$4"
+        "$script_path" "$child_file" "$grandchild_file" "$leaf_file" &
+        LAST_SPAWNED_TREE_PID=$!
+    }
+
+    tree_dir="$TMP_ROOT/terminate-active-jobs-deep"
+    script="$tree_dir/deep-tree.sh"
+    mkdir -p "$tree_dir"
+    cat > "$script" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+child_file="$1"
+grandchild_file="$2"
+leaf_file="$3"
+
+bash -c '
+  child_file="$1"
+  grandchild_file="$2"
+  leaf_file="$3"
+  echo "$$" > "$child_file"
+  bash -c '"'"'
+    grandchild_file="$1"
+    leaf_file="$2"
+    echo "$$" > "$grandchild_file"
+    sleep 60 &
+    echo "$!" > "$leaf_file"
+    wait "$!"
+  '"'"' _ "$grandchild_file" "$leaf_file"
+' _ "$child_file" "$grandchild_file" "$leaf_file"
+EOF
+    chmod +x "$script"
+
+    spawn_active_job_tree "$script" "$tree_dir/one.child.pid" "$tree_dir/one.grandchild.pid" "$tree_dir/one.leaf.pid"
+    pid_one=$LAST_SPAWNED_TREE_PID
+    spawn_active_job_tree "$script" "$tree_dir/two.child.pid" "$tree_dir/two.grandchild.pid" "$tree_dir/two.leaf.pid"
+    pid_two=$LAST_SPAWNED_TREE_PID
+
+    i=0
+    while [[ "$i" -lt 40 ]]; do
+        [[ -s "$tree_dir/one.child.pid" && -s "$tree_dir/one.grandchild.pid" && -s "$tree_dir/one.leaf.pid" &&
+           -s "$tree_dir/two.child.pid" && -s "$tree_dir/two.grandchild.pid" && -s "$tree_dir/two.leaf.pid" ]] && break
+        sleep 0.05
+        i=$((i + 1))
+    done
+
+    [[ -s "$tree_dir/one.child.pid" && -s "$tree_dir/one.grandchild.pid" && -s "$tree_dir/one.leaf.pid" &&
+       -s "$tree_dir/two.child.pid" && -s "$tree_dir/two.grandchild.pid" && -s "$tree_dir/two.leaf.pid" ]]
+
+    one_leaf_pid=$(cat "$tree_dir/one.leaf.pid")
+    two_leaf_pid=$(cat "$tree_dir/two.leaf.pid")
+    LAUREN_LOOP_ACTIVE_JOB_KILL_GRACE_SEC=2
+
+    start=$(date +%s)
+    _terminate_active_jobs
+    elapsed=$(( $(date +%s) - start ))
+
+    wait "$pid_one" 2>/dev/null || true
+    wait "$pid_two" 2>/dev/null || true
+
+    [[ "$elapsed" -lt 4 ]]
+    ! kill -0 "$pid_one" 2>/dev/null
+    ! kill -0 "$pid_two" 2>/dev/null
+    ! kill -0 "$one_leaf_pid" 2>/dev/null
+    ! kill -0 "$two_leaf_pid" 2>/dev/null
+) && pass "86j. _terminate_active_jobs kills deep descendants for multiple job roots in one shared grace cycle" \
+  || fail "86j. _terminate_active_jobs kills deep descendants for multiple job roots in one shared grace cycle"
+
 # ============================================================
 # Tests 87–87f: finalize_v2_task_metadata
 # ============================================================
@@ -5419,6 +5794,10 @@ EOF
     SCRIPT_DIR="$wt_test_dir"
     cd "$wt_test_dir"
     SLUG="test-merge"
+    task_dir="$wt_test_dir/docs/tasks/open/test-merge"
+    mkdir -p "$task_dir/competitive"
+    printf '## Task: test-merge\n## Status: in progress\n' > "$task_dir/task.md"
+    _CURRENT_TASK_FILE="$task_dir/task.md"
     _V2_EXEC_WORKTREE_PATH=""
     _V2_EXEC_WORKTREE_BRANCH=""
 
@@ -5449,6 +5828,10 @@ EOF
     SCRIPT_DIR="$wt_test_dir"
     cd "$wt_test_dir"
     SLUG="test-merge-noop"
+    task_dir="$wt_test_dir/docs/tasks/open/test-merge-noop"
+    mkdir -p "$task_dir/competitive"
+    printf '## Task: test-merge-noop\n## Status: in progress\n' > "$task_dir/task.md"
+    _CURRENT_TASK_FILE="$task_dir/task.md"
     _V2_EXEC_WORKTREE_PATH=""
     _V2_EXEC_WORKTREE_BRANCH=""
 
@@ -5717,6 +6100,10 @@ EOF
     SCRIPT_DIR="$wt_test_dir"
     cd "$wt_test_dir"
     SLUG="test-reset-preserved"
+    task_dir="$wt_test_dir/docs/tasks/open/test-reset-preserved"
+    mkdir -p "$task_dir/competitive"
+    printf '## Task: test-reset-preserved\n## Status: in progress\n' > "$task_dir/task.md"
+    _CURRENT_TASK_FILE="$task_dir/task.md"
     _V2_EXEC_WORKTREE_PATH=""
     _V2_EXEC_WORKTREE_BRANCH=""
 
@@ -5757,6 +6144,11 @@ EOF
     rm -rf "$wt_test_dir"
 ) && pass "88l. successful merge-back resets preserved recovery globals and target refs" \
   || fail "88l. successful merge-back resets preserved recovery globals and target refs"
+
+(
+    bash "$REPO_ROOT/tests/test_lauren_loop_merge_guards.sh"
+) && pass "88m. merge guard regression suite covers preflight, lock, and post-merge artifact sync behavior" \
+  || fail "88m. merge guard regression suite covers preflight, lock, and post-merge artifact sync behavior"
 
 (
     task_file="$TMP_ROOT/v2-safe-task/task.md"

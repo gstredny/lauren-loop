@@ -25,7 +25,7 @@ main() {
 
     existing="$(crontab -l 2>/dev/null || true)"
     stripped="$(printf '%s\n' "$existing" | strip_existing_block)"
-    cron_line="0 23 * * 1-5 bash -l -c '{ cd ${NIGHTSHIFT_PYTHON_DIR} && ${NIGHTSHIFT_PYTHON_BIN} -m nightshift --smoke; } >> ${CRON_LOG_PATH} 2>&1'"
+    cron_line="0 22 * * * bash -l -c '{ cd ${REPO_ROOT} && bash scripts/nightshift/nightshift-bootstrap.sh; } >> ${CRON_LOG_PATH} 2>&1'"
 
     {
         if [[ -n "$stripped" ]]; then
@@ -36,7 +36,7 @@ main() {
         printf '%s\n' "$END_MARKER"
     } | crontab -
 
-    printf 'Installed weeknight Nightshift cron block for %s\n' "$NIGHTSHIFT_PYTHON_DIR"
+    printf 'Installed nightly Nightshift cron block (via bootstrap) for %s\n' "$REPO_ROOT"
 }
 
 main "$@"

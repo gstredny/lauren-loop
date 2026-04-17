@@ -21,19 +21,25 @@ fail() { FAIL=$((FAIL + 1)); printf '  \033[31mFAIL\033[0m %s — %s\n' "$1" "$2
 setup_wrapper_fixture() {
     local repo_dir="$1"
     local ns_dir="$repo_dir/scripts/nightshift"
+    local python_dir="$ns_dir/python"
+    local venv_bin="$repo_dir/.venv/bin"
 
-    mkdir -p "$ns_dir"
+    mkdir -p "$ns_dir" "$python_dir" "$venv_bin"
     cp "$NS_DIR/nightshift-bootstrap.sh" "$ns_dir/nightshift-bootstrap.sh"
     chmod +x "$ns_dir/nightshift-bootstrap.sh"
 
-    cat > "$ns_dir/nightshift.sh" <<'EOF'
+    cat > "$venv_bin/python" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
 capture_file="${RUNNER_CAPTURE_FILE:?}"
 {
+    printf 'cwd=%s\n' "$(pwd)"
     printf 'status=%s\n' "${NIGHTSHIFT_BOOTSTRAP_STATUS:-}"
     printf 'warning=%s\n' "${NIGHTSHIFT_BOOTSTRAP_WARNING:-}"
+    printf 'repair_status=%s\n' "${NIGHTSHIFT_BOOTSTRAP_REPAIR_STATUS:-}"
+    printf 'repair_note=%s\n' "${NIGHTSHIFT_BOOTSTRAP_REPAIR_NOTE:-}"
+    printf 'repair_log=%s\n' "${NIGHTSHIFT_BOOTSTRAP_REPAIR_LOG:-}"
     printf 'argc=%s\n' "$#"
     index=1
     for arg in "$@"; do
@@ -42,7 +48,7 @@ capture_file="${RUNNER_CAPTURE_FILE:?}"
     done
 } > "$capture_file"
 EOF
-    chmod +x "$ns_dir/nightshift.sh"
+    chmod +x "$venv_bin/python"
 }
 
 setup_git_stub() {
@@ -187,10 +193,14 @@ echo ""
     RUNNER_CAPTURE_FILE="$capture_file" \
     bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh" --smoke --dry-run
 
+    grep -Fxq "cwd=$repo_dir/scripts/nightshift/python" "$capture_file" &&
     grep -Fxq 'status=fresh' "$capture_file" &&
     grep -Fxq 'warning=' "$capture_file" &&
-    grep -Fxq 'arg1=--smoke' "$capture_file" &&
-    grep -Fxq 'arg2=--dry-run' "$capture_file" &&
+    grep -Fxq 'repair_status=not-needed' "$capture_file" &&
+    grep -Fxq 'arg1=-m' "$capture_file" &&
+    grep -Fxq 'arg2=nightshift' "$capture_file" &&
+    grep -Fxq 'arg3=--smoke' "$capture_file" &&
+    grep -Fxq 'arg4=--dry-run' "$capture_file" &&
     grep -Fxq 'fetch origin main' "$git_log" &&
     grep -Fxq 'checkout --detach origin/main' "$git_log" &&
     grep -Fxq 'for-each-ref --format=%(refname:short) refs/heads/nightshift/*' "$git_log" &&
@@ -224,6 +234,7 @@ echo ""
     bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh"
 
     grep -Fxq 'status=fresh' "$capture_file" &&
+    grep -Fxq 'repair_status=not-needed' "$capture_file" &&
     [[ "$(grep -c '^fetch origin main$' "$git_log")" == "3" ]] &&
     grep -Fxq '30' "$sleep_log" &&
     grep -Fxq '120' "$sleep_log"
@@ -254,10 +265,16 @@ echo ""
     RUNNER_CAPTURE_FILE="$capture_file" \
     bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh"
 
+    repair_log="$(sed -n 's/^repair_log=//p' "$capture_file")"
+
     grep -Fxq 'status=fresh' "$capture_file" &&
+    grep -Fxq 'repair_status=force-clean-succeeded' "$capture_file" &&
+    grep -Fxq 'repair_note=detach-retry-succeeded-after-reset-clean' "$capture_file" &&
     [[ "$(grep -c '^checkout --detach origin/main$' "$git_log")" == "2" ]] &&
     grep -Fxq 'reset --hard HEAD' "$git_log" &&
-    grep -Fxq 'clean -fd' "$git_log"
+    grep -Fxq 'clean -fd' "$git_log" &&
+    [[ -n "$repair_log" ]] &&
+    grep -Fq 'force-clean-succeeded' "$repair_log"
 ) && pass "3. wrapper repairs with reset/clean once before retrying detach" \
   || fail "3. wrapper repairs with reset/clean once before retrying detach" "detach repair path was wrong"
 
@@ -272,26 +289,38 @@ echo ""
     mkdir -p "$state_dir"
     : > "$git_log"
     : > "$sleep_log"
-    printf '1\n' > "$state_dir/detach_failures_remaining"
-    printf ' M tracked.txt\n' > "$state_dir/tracked_status_output"
+    printf '999\n' > "$state_dir/detach_failures_remaining"
 
     setup_wrapper_fixture "$repo_dir"
     setup_git_stub "$stub_dir"
     setup_sleep_stub "$stub_dir"
 
+    set +e
     PATH="$stub_dir:$PATH" \
     GIT_STUB_STATE_DIR="$state_dir" \
     GIT_STUB_LOG_FILE="$git_log" \
     SLEEP_LOG_FILE="$sleep_log" \
     RUNNER_CAPTURE_FILE="$capture_file" \
-    bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh"
+    bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh" 2>&1
+    rc=$?
+    set -e
 
-    grep -Fxq 'status=stale-fallback' "$capture_file" &&
-    grep -Fq 'skipped reset/clean because tracked files were modified' "$capture_file" &&
-    ! grep -Fxq 'reset --hard HEAD' "$git_log" &&
-    ! grep -Fxq 'clean -fd' "$git_log"
-) && pass "4. wrapper falls back stale without destructive repair when tracked files are dirty" \
-  || fail "4. wrapper falls back stale without destructive repair when tracked files are dirty" "dirty tracked-files fallback was wrong"
+    logs_dir="$repo_dir/scripts/nightshift/logs"
+    repair_log="$logs_dir/bootstrap-repair.log"
+
+    [[ "$rc" -ne 0 ]] &&
+    [[ ! -e "$capture_file" ]] &&
+    ls "$logs_dir"/bootstrap-failure-*.json >/dev/null 2>&1 &&
+    artifact="$(ls "$logs_dir"/bootstrap-failure-*.json | head -n 1)" &&
+    grep -Fq '"reason"' "$artifact" &&
+    grep -Fq 'Could not detach' "$artifact" &&
+    grep -Fq 'force-clean-fallback' "$artifact" &&
+    grep -Fxq 'reset --hard HEAD' "$git_log" &&
+    grep -Fxq 'clean -fd' "$git_log" &&
+    [[ -f "$repair_log" ]] &&
+    grep -Fq 'force-clean-fallback' "$repair_log"
+) && pass "4. wrapper exits non-zero when detach still fails after the reset/clean repair" \
+  || fail "4. wrapper exits non-zero when detach still fails after the reset/clean repair" "post-repair fail-hard was wrong"
 
 (
     test_dir="$TMP_DIR/w5"
@@ -306,7 +335,7 @@ echo ""
     : > "$sleep_log"
 
     setup_wrapper_fixture "$repo_dir"
-    rm -f "$repo_dir/scripts/nightshift/nightshift.sh"
+    rm -f "$repo_dir/.venv/bin/python"
     setup_git_stub "$stub_dir"
     setup_sleep_stub "$stub_dir"
 
@@ -323,10 +352,10 @@ echo ""
     set -e
 
     [[ "$rc" -ne 0 ]] &&
-    grep -Fq 'Core runner missing or unreadable' <<< "$output" &&
+    grep -Fq 'Python binary missing or not executable' <<< "$output" &&
     [[ ! -e "$capture_file" ]]
-) && pass "5. wrapper fails closed when the core runner is missing" \
-  || fail "5. wrapper fails closed when the core runner is missing" "missing core runner was not treated as fatal"
+) && pass "5. wrapper fails closed when the Python orchestrator entrypoint is missing" \
+  || fail "5. wrapper fails closed when the Python orchestrator entrypoint is missing" "missing Python entrypoint was not treated as fatal"
 
 (
     test_dir="$TMP_DIR/w6"
@@ -345,19 +374,27 @@ echo ""
     setup_git_stub "$stub_dir"
     setup_sleep_stub "$stub_dir"
 
+    set +e
     PATH="$stub_dir:$PATH" \
     GIT_STUB_STATE_DIR="$state_dir" \
     GIT_STUB_LOG_FILE="$git_log" \
     SLEEP_LOG_FILE="$sleep_log" \
     RUNNER_CAPTURE_FILE="$capture_file" \
-    bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh"
+    bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh" 2>&1
+    rc=$?
+    set -e
 
-    grep -Fxq 'status=stale-fallback' "$capture_file" &&
-    grep -Fq 'could not fetch origin/main after 3 attempts' "$capture_file" &&
+    logs_dir="$repo_dir/scripts/nightshift/logs"
+
+    [[ "$rc" -ne 0 ]] &&
+    [[ ! -e "$capture_file" ]] &&
+    ls "$logs_dir"/bootstrap-failure-*.json >/dev/null 2>&1 &&
+    artifact="$(ls "$logs_dir"/bootstrap-failure-*.json | head -n 1)" &&
+    grep -Fq 'Could not fetch' "$artifact" &&
     [[ "$(grep -c '^fetch origin main$' "$git_log")" == "3" ]] &&
     ! grep -Fxq 'checkout --detach origin/main' "$git_log"
-) && pass "6. wrapper falls back stale when all three fetch attempts fail" \
-  || fail "6. wrapper falls back stale when all three fetch attempts fail" "fetch exhaustion fallback was wrong"
+) && pass "6. wrapper exits non-zero when all three fetch attempts fail" \
+  || fail "6. wrapper exits non-zero when all three fetch attempts fail" "fetch exhaustion fail-hard was wrong"
 
 (
     test_dir="$TMP_DIR/w7"
@@ -377,19 +414,70 @@ echo ""
     setup_git_stub "$stub_dir"
     setup_sleep_stub "$stub_dir"
 
+    set +e
     PATH="$stub_dir:$PATH" \
     GIT_STUB_STATE_DIR="$state_dir" \
     GIT_STUB_LOG_FILE="$git_log" \
     SLEEP_LOG_FILE="$sleep_log" \
     RUNNER_CAPTURE_FILE="$capture_file" \
-    bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh"
+    bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh" 2>&1
+    rc=$?
+    set -e
 
-    grep -Fxq 'status=stale-fallback' "$capture_file" &&
-    grep -Fq 'bootstrap repair failed before detach retry' "$capture_file" &&
+    logs_dir="$repo_dir/scripts/nightshift/logs"
+    repair_log="$logs_dir/bootstrap-repair.log"
+
+    [[ "$rc" -ne 0 ]] &&
+    [[ ! -e "$capture_file" ]] &&
+    ls "$logs_dir"/bootstrap-failure-*.json >/dev/null 2>&1 &&
+    artifact="$(ls "$logs_dir"/bootstrap-failure-*.json | head -n 1)" &&
+    grep -Fq 'Reset/clean repair failed' "$artifact" &&
+    grep -Fq 'force-clean-failed' "$artifact" &&
     grep -Fxq 'reset --hard HEAD' "$git_log" &&
-    ! grep -Fq 'skipped reset/clean because tracked files were modified' "$capture_file"
-) && pass "7. wrapper falls back stale when repair fails before the detach retry" \
-  || fail "7. wrapper falls back stale when repair fails before the detach retry" "repair-failure fallback was wrong"
+    [[ -f "$repair_log" ]] &&
+    grep -Fq 'force-clean-failed' "$repair_log"
+) && pass "7. wrapper exits non-zero when repair fails before the detach retry" \
+  || fail "7. wrapper exits non-zero when repair fails before the detach retry" "repair-failure fail-hard was wrong"
+
+(
+    test_dir="$TMP_DIR/w8"
+    repo_dir="$test_dir/repo"
+    stub_dir="$test_dir/bin"
+    state_dir="$test_dir/state"
+    git_log="$test_dir/git.log"
+    sleep_log="$test_dir/sleep.log"
+    capture_file="$test_dir/runner.out"
+    mkdir -p "$state_dir"
+    : > "$git_log"
+    : > "$sleep_log"
+    printf '999\n' > "$state_dir/detach_failures_remaining"
+
+    setup_wrapper_fixture "$repo_dir"
+    setup_git_stub "$stub_dir"
+    setup_sleep_stub "$stub_dir"
+
+    set +e
+    NIGHTSHIFT_BASE_BRANCH='branch"with"quotes' \
+    PATH="$stub_dir:$PATH" \
+    GIT_STUB_STATE_DIR="$state_dir" \
+    GIT_STUB_LOG_FILE="$git_log" \
+    SLEEP_LOG_FILE="$sleep_log" \
+    RUNNER_CAPTURE_FILE="$capture_file" \
+    bash "$repo_dir/scripts/nightshift/nightshift-bootstrap.sh" 2>&1
+    rc=$?
+    set -e
+
+    logs_dir="$repo_dir/scripts/nightshift/logs"
+
+    [[ "$rc" -ne 0 ]] &&
+    [[ ! -e "$capture_file" ]] &&
+    artifact="$(ls "$logs_dir"/bootstrap-failure-*.json | head -n 1)" &&
+    jq . "$artifact" >/dev/null 2>&1 &&
+    grep -Fq '"base_branch": "branch\"with\"quotes"' "$artifact" &&
+    grep -Fq 'Could not detach' "$artifact" &&
+    grep -Fq 'force-clean-fallback' "$artifact"
+) && pass "8. wrapper writes valid JSON artifacts when the base branch contains quotes" \
+  || fail "8. wrapper writes valid JSON artifacts when the base branch contains quotes" "failure artifact JSON escaping was wrong"
 
 echo ""
 echo "=== Results: $PASS passed, $FAIL failed ==="

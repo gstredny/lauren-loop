@@ -373,19 +373,20 @@ setup_integration_fixture() {
     write_prompt_fixtures "$root"
     write_task_fixture "$task_dir/task.md"
     printf 'baseline content\n' > "$root/src/main.py"
-    git -C "$root" init -q
-    git -C "$root" config user.name "Integration Tests"
-    git -C "$root" config user.email "integ-tests@example.com"
-    git -C "$root" add .
-    git -C "$root" commit -q -m "Initial fixture"
 
-    # Fail-fast mock claude binary — catches any leaked real agent calls
+    # Fail-fast mock claude binary — catches any leaked real agent calls without dirtying the repo.
     cat > "$root/bin/claude" <<'MOCKEOF'
 #!/bin/bash
 echo "ERROR: mock claude binary invoked — real agent call leaked" >&2
 exit 99
 MOCKEOF
     chmod +x "$root/bin/claude"
+
+    git -C "$root" init -q
+    git -C "$root" config user.name "Integration Tests"
+    git -C "$root" config user.email "integ-tests@example.com"
+    git -C "$root" add .
+    git -C "$root" commit -q -m "Initial fixture"
 
     printf '%s\n' "$root"
 }
@@ -1185,7 +1186,6 @@ EOF
     ENGINE_REVIEWER_B="codex"
     REVIEWER_TIMEOUT="15m"
     REVIEWER_TIMEOUT_EXPLICIT="false"
-    seed_medium_risk_diff "$root"
     task_dir="$root/docs/tasks/open/$slug"
     comp_dir="$task_dir/competitive"
     log_dir="$task_dir/logs"
@@ -1194,6 +1194,11 @@ EOF
     backstop_timeout_log="$TMP_ROOT/reviewer-timeout-manifest.backstop"
     : > "$timeout_log"
     : > "$backstop_timeout_log"
+    i=1
+    while [[ "$i" -le 520 ]]; do
+        printf 'medium reviewer timeout fixture line %04d\n' "$i" >> "$task_file"
+        i=$((i + 1))
+    done
 
     set_integration_stubs
     restore_real_manifest_hooks
@@ -2181,7 +2186,10 @@ EOF
     }
     grep -Fq 'diagnostic: active worktree path:' "$task_file" || { printf 'missing active worktree path diagnostic\n' > "$detail_file"; exit 1; }
     grep -Fq 'diagnostic: worktree repo root:' "$task_file" || { printf 'missing worktree repo root diagnostic\n' > "$detail_file"; exit 1; }
-    grep -Fq "diagnostic: execution log path: ${comp_dir}/execution-log.md" "$task_file" || { printf 'missing execution log path diagnostic\n' > "$detail_file"; exit 1; }
+    grep -Eq "diagnostic: execution log path: /tmp/lauren-loop-wt-${slug}-[0-9]+/docs/tasks/open/${slug}/competitive/execution-log\\.md" "$task_file" || {
+        printf 'missing execution log path diagnostic\n' > "$detail_file"
+        exit 1
+    }
     grep -Fq 'diagnostic: execution log activity detected: true' "$task_file" || { printf 'missing execution log activity diagnostic\n' > "$detail_file"; exit 1; }
     grep -Fq "diagnostic: diff artifact state: ${comp_dir}/execution-diff.patch (empty)" "$task_file" || { printf 'missing diff artifact diagnostic\n' > "$detail_file"; exit 1; }
     grep -Fq "diagnostic: numstat artifact state: ${comp_dir}/execution-diff.numstat.tsv (empty)" "$task_file" || { printf 'missing numstat artifact diagnostic\n' > "$detail_file"; exit 1; }

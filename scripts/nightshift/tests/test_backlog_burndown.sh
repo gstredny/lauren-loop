@@ -73,6 +73,46 @@ source "${NS_DIR}/nightshift.sh"
     NIGHTSHIFT_BACKLOG_MIN_BUDGET="0"
     ! validate_nightshift_configuration
     [[ "${FAILURE_NOTES}" == *"NIGHTSHIFT_BACKLOG_MIN_BUDGET"* ]]
+
+    FAILURE_NOTES=""
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="3"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="16"
+    ! validate_nightshift_configuration
+    [[ "${FAILURE_NOTES}" == *"NIGHTSHIFT_MIN_TASKS_PER_RUN"* ]]
+
+    FAILURE_NOTES=""
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="3"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="-1"
+    ! validate_nightshift_configuration
+    [[ "${FAILURE_NOTES}" == *"NIGHTSHIFT_MIN_TASKS_PER_RUN"* ]]
+
+    FAILURE_NOTES=""
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="3"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="abc"
+    ! validate_nightshift_configuration
+    [[ "${FAILURE_NOTES}" == *"NIGHTSHIFT_MIN_TASKS_PER_RUN"* ]]
+
+    FAILURE_NOTES=""
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="3"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="15"
+    validate_nightshift_configuration
+    [[ "${FAILURE_NOTES}" == "" ]]
+
+    FAILURE_NOTES=""
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="3"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="0"
+    validate_nightshift_configuration
+    [[ "${FAILURE_NOTES}" == "" ]]
 ) && pass "1. validate_nightshift_configuration rejects invalid backlog settings" \
   || fail "1. validate_nightshift_configuration rejects invalid backlog settings" "one or more backlog settings were accepted"
 
@@ -171,7 +211,9 @@ EOF
     NIGHTSHIFT_BACKLOG_ENABLED="true"
     NIGHTSHIFT_BACKLOG_MAX_TASKS="2"
     NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="0"
     NIGHTSHIFT_COST_CAP_USD="100"
+    AUTOFIX_ATTEMPTED_COUNT=0
     DRY_RUN=0
     SETUP_FAILED=0
     RUN_COST_CAP=0
@@ -219,6 +261,142 @@ EOF
     [[ "${#BACKLOG_RESULTS[@]}" -eq 2 ]]
 ) && pass "5. live backlog execution stops at NIGHTSHIFT_BACKLOG_MAX_TASKS" \
   || fail "5. live backlog execution stops at NIGHTSHIFT_BACKLOG_MAX_TASKS" "too many candidates were executed"
+
+(
+    REPO_ROOT="${TMP_DIR}/floor-inflation-repo"
+    RUN_DATE="2026-03-31"
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="1"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="3"
+    NIGHTSHIFT_COST_CAP_USD="100"
+    AUTOFIX_ATTEMPTED_COUNT=1
+    DRY_RUN=1
+    RUN_CLEAN=0
+    SETUP_FAILED=0
+    RUN_COST_CAP=0
+    BACKLOG_RESULTS=()
+
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/alpha.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/beta.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/gamma.md"
+
+    dry_run_log="${TMP_DIR}/backlog-floor-inflation.log"
+    phase_backlog_burndown > "${dry_run_log}" 2>&1
+
+    grep -q "Backlog target: attempted autofix=1, min per run=3, needed=2, effective max=2" "${dry_run_log}"
+    [[ "${#BACKLOG_RESULTS[@]}" -eq 2 ]]
+) && pass "6. backlog inflates effective max when autofix attempts are below the minimum" \
+  || fail "6. backlog inflates effective max when autofix attempts are below the minimum" "effective max did not inflate to the needed floor"
+
+(
+    REPO_ROOT="${TMP_DIR}/floor-normal-cap-repo"
+    RUN_DATE="2026-03-31"
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="2"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="3"
+    NIGHTSHIFT_COST_CAP_USD="100"
+    AUTOFIX_ATTEMPTED_COUNT=5
+    DRY_RUN=1
+    RUN_CLEAN=0
+    SETUP_FAILED=0
+    RUN_COST_CAP=0
+    BACKLOG_RESULTS=()
+
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/alpha.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/beta.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/gamma.md"
+
+    dry_run_log="${TMP_DIR}/backlog-floor-normal-cap.log"
+    phase_backlog_burndown > "${dry_run_log}" 2>&1
+
+    grep -q "Backlog target: attempted autofix=5, min per run=3, needed=0, effective max=2" "${dry_run_log}"
+    [[ "${#BACKLOG_RESULTS[@]}" -eq 2 ]]
+) && pass "7. backlog honors NIGHTSHIFT_BACKLOG_MAX_TASKS once autofix meets the floor" \
+  || fail "7. backlog honors NIGHTSHIFT_BACKLOG_MAX_TASKS once autofix meets the floor" "backlog cap inflated when it should have stayed at the configured max"
+
+(
+    REPO_ROOT="${TMP_DIR}/floor-clean-run-runs-repo"
+    RUN_DATE="2026-03-31"
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="1"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="3"
+    NIGHTSHIFT_COST_CAP_USD="100"
+    AUTOFIX_ATTEMPTED_COUNT=1
+    DRY_RUN=1
+    RUN_CLEAN=1
+    SETUP_FAILED=0
+    RUN_COST_CAP=0
+    BACKLOG_RESULTS=()
+
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/alpha.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/beta.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/gamma.md"
+
+    dry_run_log="${TMP_DIR}/backlog-floor-clean-run-runs.log"
+    phase_backlog_burndown > "${dry_run_log}" 2>&1
+
+    grep -q "Backlog target: attempted autofix=1, min per run=3, needed=2, effective max=2" "${dry_run_log}"
+    grep -q "DRY RUN: would pick" "${dry_run_log}"
+    [[ "${#BACKLOG_RESULTS[@]}" -eq 2 ]]
+) && pass "8. clean runs still execute backlog when autofix has not met the minimum" \
+  || fail "8. clean runs still execute backlog when autofix has not met the minimum" "clean-run backlog did not execute despite missing the task floor"
+
+(
+    REPO_ROOT="${TMP_DIR}/floor-clean-run-skips-repo"
+    RUN_DATE="2026-03-31"
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="2"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="3"
+    NIGHTSHIFT_COST_CAP_USD="100"
+    AUTOFIX_ATTEMPTED_COUNT=3
+    DRY_RUN=1
+    RUN_CLEAN=1
+    SETUP_FAILED=0
+    RUN_COST_CAP=0
+    BACKLOG_RESULTS=()
+
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/alpha.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/beta.md"
+
+    dry_run_log="${TMP_DIR}/backlog-floor-clean-run-skips.log"
+    phase_backlog_burndown > "${dry_run_log}" 2>&1
+
+    grep -q "Backlog target: attempted autofix=3, min per run=3, needed=0, effective max=2" "${dry_run_log}"
+    grep -q "backlog skipped — clean run" "${dry_run_log}"
+    [[ "${#BACKLOG_RESULTS[@]}" -eq 0 ]]
+) && pass "9. clean runs skip backlog once autofix already meets the minimum" \
+  || fail "9. clean runs skip backlog once autofix already meets the minimum" "clean-run backlog failed to skip after the minimum was met"
+
+(
+    REPO_ROOT="${TMP_DIR}/floor-disabled-repo"
+    RUN_DATE="2026-03-31"
+    NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_BACKLOG_MAX_TASKS="1"
+    NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="0"
+    NIGHTSHIFT_COST_CAP_USD="100"
+    AUTOFIX_ATTEMPTED_COUNT=1
+    DRY_RUN=1
+    RUN_CLEAN=0
+    SETUP_FAILED=0
+    RUN_COST_CAP=0
+    BACKLOG_RESULTS=()
+
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/alpha.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/beta.md"
+    write_hash_task "${REPO_ROOT}/docs/tasks/open/gamma.md"
+
+    dry_run_log="${TMP_DIR}/backlog-floor-disabled.log"
+    phase_backlog_burndown > "${dry_run_log}" 2>&1
+
+    grep -q "Backlog target: attempted autofix=1, min per run=0, needed=0, effective max=1" "${dry_run_log}"
+    [[ "${#BACKLOG_RESULTS[@]}" -eq 1 ]]
+) && pass "10. NIGHTSHIFT_MIN_TASKS_PER_RUN=0 disables floor inflation and preserves the baseline cap" \
+  || fail "10. NIGHTSHIFT_MIN_TASKS_PER_RUN=0 disables floor inflation and preserves the baseline cap" "floor-disable behavior did not match the baseline cap"
 
 (
     REPO_ROOT="${TMP_DIR}/same-run-repo"
