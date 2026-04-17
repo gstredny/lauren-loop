@@ -327,6 +327,38 @@ def test_phase_ship_skips_when_digest_not_stageable(tmp_path: Path, config_facto
     assert any("Ship blocked: digest not stageable" in warning for warning in context.warnings)
 
 
+def test_phase_ship_skips_clean_run_without_shipping(tmp_path: Path, config_factory) -> None:
+    config = config_factory(repo_dir=tmp_path)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = _create_tracker(context, config)
+    context.digest_path = context.repo_digest_path
+    context.digest_path.parent.mkdir(parents=True, exist_ok=True)
+    context.digest_path.write_text("# Clean digest\n", encoding="utf-8")
+    context.branch_created = True
+    context.run_branch = "nightshift/2026-04-07"
+    context.run_clean = True
+    context.digest_stageable = False
+    shipper = RecordingShipper()
+    rewrite_git = RecordingRewriteGit()
+    orchestrator = NightshiftOrchestrator(
+        config=config,
+        context=context,
+        git=rewrite_git,  # type: ignore[arg-type]
+        agents=DummyAgentRunner(),  # type: ignore[arg-type]
+        shipper=shipper,  # type: ignore[arg-type]
+        cost_tracker=tracker,
+        timeout_budget=TimeoutBudget(10),
+        logger=logging.getLogger("test-ship"),
+    )
+
+    orchestrator.phase_ship()
+
+    assert shipper.calls == []
+    assert rewrite_git.staged_paths == []
+    assert context.ship_blocked_reason is None
+    assert context.failures == []
+
+
 def test_phase_ship_rewrite_push_uses_explicit_lease(tmp_path: Path, config_factory) -> None:
     config = config_factory(repo_dir=tmp_path)
     context = RunContext.create(config, dry_run=False, smoke=True)

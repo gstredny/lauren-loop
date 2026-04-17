@@ -561,7 +561,7 @@ EOF
     $ok
 ) && pass "10. exported toggles survive config load (env wins)" \
   || fail "10. exported toggles survive config load (env wins)" "toggle was overridden by conf"
-# ── Test 11: unset toggles default to false from conf ────────────────────────
+# ── Test 11: unset toggles load conf defaults ────────────────────────────────
 (
     tmp_home="$TMP_DIR/home-toggle-defaults"
     mkdir -p "$tmp_home"
@@ -571,11 +571,11 @@ EOF
     load_nightshift_configuration "$NS_DIR/nightshift.conf" "$HOME/.nightshift-env" >/dev/null 2>&1
     ok=true
     [[ "$NIGHTSHIFT_BRIDGE_ENABLED" == "false" ]] || ok=false
-    [[ "$NIGHTSHIFT_AUTOFIX_ENABLED" == "false" ]] || ok=false
-    [[ "$NIGHTSHIFT_BACKLOG_ENABLED" == "false" ]] || ok=false
+    [[ "$NIGHTSHIFT_AUTOFIX_ENABLED" == "true" ]] || ok=false
+    [[ "$NIGHTSHIFT_BACKLOG_ENABLED" == "true" ]] || ok=false
     $ok
-) && pass "11. unset toggles default to false from conf" \
-  || fail "11. unset toggles default to false from conf" "toggle defaults were not false when unset"
+) && pass "11. unset toggles load conf defaults" \
+  || fail "11. unset toggles load conf defaults" "toggle defaults did not match the conf"
 # ── Test 12: Phase 1 prunes leftover nightshift/* branches ───────────────────
 (
     repo_dir="$TMP_DIR/t12/repo"

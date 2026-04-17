@@ -252,7 +252,7 @@ EOF
         state_file="$test_dir/crontab.state"
         capture_file="$test_dir/crontab.capture"
         cron_line=""
-        vm_repo_root="/home/user/project"
+        vm_repo_root="/home/gstredny/AskGeorgeProject"
         expected_doc_line=""
         mkdir -p "$test_dir"
         setup_crontab_stub "$bin_dir" "$state_file" "$capture_file"
@@ -577,6 +577,8 @@ if should_run_group "runtime"; then
         export NIGHTSHIFT_REPO_DIR="$repo_dir"
         export REPO_ROOT="$repo_dir"
         export NIGHTSHIFT_RUN_ID="r7"
+        # Defensive coverage: phase_setup should tolerate arbitrary wrapper
+        # status values, including stale-fallback from older wrappers.
         export NIGHTSHIFT_BOOTSTRAP_STATUS="stale-fallback"
         export NIGHTSHIFT_BOOTSTRAP_WARNING="Nightshift bootstrap could not fetch origin/main after 3 attempts; running the current checkout as-is"
         DRY_RUN=1
@@ -594,8 +596,8 @@ if should_run_group "runtime"; then
         grep -Fq "Nightshift bootstrap could not fetch origin/main after 3 attempts" <<< "$WARNING_NOTES" &&
         ! grep -Fq "started without nightshift-bootstrap.sh freshness bootstrap" <<< "$WARNING_NOTES" &&
         [[ "${SETUP_READY}" -eq 1 ]]
-    ) && pass "R7. phase_setup ingests wrapper bootstrap warnings without adding the direct-run warning in dry-run mode" \
-      || fail "R7. phase_setup ingests wrapper bootstrap warnings without adding the direct-run warning in dry-run mode" "bootstrap warning ingestion was wrong"
+    ) && pass "R7. phase_setup defensively handles arbitrary wrapper status values without adding the direct-run warning in dry-run mode" \
+      || fail "R7. phase_setup defensively handles arbitrary wrapper status values without adding the direct-run warning in dry-run mode" "defensive bootstrap warning ingestion was wrong"
 
     (
         test_dir="$TMP_DIR/r8"

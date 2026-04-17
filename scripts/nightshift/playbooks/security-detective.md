@@ -248,6 +248,8 @@ Each finding must follow this format exactly:
 ### Finding: <short_title>
 **Severity:** critical | major | minor | observation
 **Category:** security
+**Rule Key:** <stable rule id such as CWE-306, CWE-639, or AUTH-ADMIN-BYPASS>
+**Primary File:** <repo-relative path, optional override when the first evidence bullet is not the correct primary file>
 **Evidence:**
 - <file:line, command output, or git diff excerpt that proves the issue>
 **Root Cause:** <1-2 sentences identifying the vulnerability class>

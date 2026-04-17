@@ -274,6 +274,8 @@ Each finding must follow this format exactly:
 ### Finding: <short_title>
 **Severity:** critical | major | minor | observation
 **Category:** regression | error-handling | data-quality | product-accuracy | missing-test | performance | security
+**Rule Key:** <stable rule id such as DATA-LOGGING-DRIFT or ERR-FLAT-SUCCESS>
+**Primary File:** <repo-relative path, optional override when the first evidence bullet is not the correct primary file>
 **Evidence:**
 - <file:line or SQL result that proves the issue>
 **Root Cause:** <1-2 sentences>

@@ -48,6 +48,10 @@ _agent_terminate_grace_seconds() {
     printf '%s\n' "${LAUREN_LOOP_AGENT_KILL_GRACE_SEC:-5}"
 }
 
+_active_job_terminate_grace_seconds() {
+    printf '%s\n' "${LAUREN_LOOP_ACTIVE_JOB_KILL_GRACE_SEC:-1}"
+}
+
 # Cross-platform timeout wrapper that works for shell functions and piped stdin.
 _timeout() {
     local duration="$1"
@@ -516,10 +520,17 @@ _validate_task_file_content() {
 
 _timeout_wrapped_verification_command() {
     local command_text="$1"
-    local helper_path inner_script=""
+    local helper_path="" inner_script="" split_rc=0
+
+    _split_supported_trailing_tail_consumer "$command_text" >/dev/null
+    split_rc=$?
+    case "$split_rc" in
+        0|1) ;;
+        *) return "$split_rc" ;;
+    esac
 
     helper_path="$(_lauren_loop_repo_root)/lib/lauren-loop-utils.sh"
-    printf -v inner_script 'source %q && _timeout 20m bash -lc %q' "$helper_path" "$command_text"
+    printf -v inner_script 'source %q && _run_timeout_wrapped_verification_command %q' "$helper_path" "$command_text"
     printf 'bash -lc %q\n' "$inner_script"
 }
 
@@ -575,6 +586,112 @@ _lauren_loop_repo_root() {
     fi
 }
 
+_split_supported_trailing_tail_consumer() {
+    local command_text="$1"
+    local producer_command=""
+    local tail_args=""
+    local trimmed_tail_args=""
+    local tail_description="tail"
+
+    if [[ ! "$command_text" =~ ^(.+[^[:space:]|])[[:space:]]*\|[[:space:]]*tail([[:space:]].*)?$ ]]; then
+        return 1
+    fi
+
+    producer_command="${BASH_REMATCH[1]}"
+    tail_args="${BASH_REMATCH[2]:-}"
+    trimmed_tail_args=$(_trim_verify_fragment "$tail_args")
+    [[ -n "$trimmed_tail_args" ]] && tail_description="tail ${trimmed_tail_args}"
+
+    if [[ -n "$trimmed_tail_args" ]]; then
+        if printf '%s\n' "$trimmed_tail_args" | grep -Eq '(^|[[:space:]])--follow($|=|[[:space:]])'; then
+            echo "ERROR: unsupported streaming verify tail consumer: ${tail_description}" >&2
+            return 2
+        fi
+        if printf '%s\n' "$trimmed_tail_args" | grep -Eq '(^|[[:space:]])-[^[:space:]]*f[^[:space:]]*($|[[:space:]])'; then
+            echo "ERROR: unsupported streaming verify tail consumer: ${tail_description}" >&2
+            return 2
+        fi
+        if ! printf '%s\n' "$trimmed_tail_args" | grep -Eq '^-[0-9]+$|^-n([[:space:]]+)?[0-9]+$|^--lines([[:space:]]+|=)[0-9]+$'; then
+            echo "ERROR: unsupported trailing verify tail consumer: ${tail_description}" >&2
+            return 2
+        fi
+    fi
+
+    printf '%s\n%s\n' "$producer_command" "$trimmed_tail_args"
+}
+
+_run_supported_tail_replay() {
+    local tail_args="$1"
+    local source_file="$2"
+    local trimmed_tail_args=""
+    local count=""
+
+    trimmed_tail_args=$(_trim_verify_fragment "$tail_args")
+
+    case "$trimmed_tail_args" in
+        "")
+            tail "$source_file"
+            ;;
+        -[0-9]*)
+            tail "$trimmed_tail_args" "$source_file"
+            ;;
+        -n*)
+            count="${trimmed_tail_args#-n}"
+            count=$(_trim_verify_fragment "$count")
+            tail -n "$count" "$source_file"
+            ;;
+        --lines=*)
+            count="${trimmed_tail_args#--lines=}"
+            tail --lines="$count" "$source_file"
+            ;;
+        --lines*)
+            count="${trimmed_tail_args#--lines}"
+            count=$(_trim_verify_fragment "$count")
+            tail --lines "$count" "$source_file"
+            ;;
+        *)
+            echo "ERROR: unsupported trailing verify tail consumer: tail ${trimmed_tail_args}" >&2
+            return 1
+            ;;
+    esac
+}
+
+_run_timeout_wrapped_verification_command() {
+    local command_text="$1"
+    local split_output=""
+    local producer_command=""
+    local tail_args=""
+    local temp_file=""
+    local exit_code=0
+    local split_rc=0
+
+    split_output=$(_split_supported_trailing_tail_consumer "$command_text")
+    split_rc=$?
+
+    case "$split_rc" in
+        0)
+            producer_command="${split_output%%$'\n'*}"
+            if [[ "$split_output" == *$'\n'* ]]; then
+                tail_args="${split_output#*$'\n'}"
+            fi
+
+            temp_file=$(mktemp "${TMPDIR:-/tmp}/lauren-loop-verify-tail.XXXXXX") || return 1
+            _timeout 20m bash -lc "$producer_command" >"$temp_file"
+            exit_code=$?
+            _run_supported_tail_replay "$tail_args" "$temp_file" || true
+            rm -f "$temp_file"
+            return "$exit_code"
+            ;;
+        1)
+            _timeout 20m bash -lc "$command_text"
+            return $?
+            ;;
+        *)
+            return "$split_rc"
+            ;;
+    esac
+}
+
 _command_requires_repo_pytest_timeout() {
     local command_text="$1"
 
@@ -589,16 +706,21 @@ _command_uses_timeout_wrapper() {
     local command_text="$1"
     local helper_path=""
     local helper_path_q=""
-    local plain_prefix=""
-    local escaped_prefix=""
+    local old_plain_prefix=""
+    local old_escaped_prefix=""
+    local new_plain_prefix=""
+    local new_escaped_prefix=""
 
     helper_path="$(_lauren_loop_repo_root)/lib/lauren-loop-utils.sh"
     printf -v helper_path_q '%q' "$helper_path"
-    plain_prefix="source ${helper_path} && _timeout 20m bash -lc "
-    escaped_prefix="source\\ ${helper_path_q}\\ \\&\\&\\ _timeout\\ 20m\\ bash\\ -lc\\ "
+    old_plain_prefix="source ${helper_path} && _timeout 20m bash -lc "
+    old_escaped_prefix="source\\ ${helper_path_q}\\ \\&\\&\\ _timeout\\ 20m\\ bash\\ -lc\\ "
+    new_plain_prefix="source ${helper_path} && _run_timeout_wrapped_verification_command "
+    new_escaped_prefix="source\\ ${helper_path_q}\\ \\&\\&\\ _run_timeout_wrapped_verification_command\\ "
 
     [[ "$command_text" == bash\ -lc\ * ]] || return 1
-    [[ "$command_text" == *"$plain_prefix"* || "$command_text" == *"$escaped_prefix"* ]]
+    [[ "$command_text" == *"$old_plain_prefix"* || "$command_text" == *"$old_escaped_prefix"* ||
+       "$command_text" == *"$new_plain_prefix"* || "$command_text" == *"$new_escaped_prefix"* ]]
 }
 
 _task_is_timeout_verification_retry_eligible() {
@@ -1442,26 +1564,102 @@ _promote_latest_valid_attempt() {
     return 1
 }
 
-_terminate_pid_tree() {
-    local pid="$1" grace="${2:-$(_agent_terminate_grace_seconds)}"
+_process_identity_token() {
+    local pid="$1"
+    local token=""
+
+    token=$(ps -Ao pid=,lstart= 2>/dev/null | awk -v target="$pid" '
+        $1 == target {
+            $1 = ""
+            sub(/^[[:space:]]+/, "")
+            print
+            exit
+        }
+    ' || true)
+    [[ -n "$token" ]] || return 1
+    printf '%s\n' "$token"
+}
+
+_pid_matches_identity() {
+    local pid="$1"
+    local token="$2"
+    local current_token=""
+
+    current_token=$(_process_identity_token "$pid") || return 1
+    [[ "$current_token" == "$token" ]]
+}
+
+_snapshot_pid_tree_lines() {
+    local pid="$1"
+    local depth="${2:-0}"
+    local token=""
+    local child=""
+    local children=""
+
     kill -0 "$pid" 2>/dev/null || return 0
+    token=$(_process_identity_token "$pid") || return 0
+    printf '%s|%s|%s\n' "$depth" "$pid" "$token"
 
-    # Snapshot descendants BEFORE TERM — they may reparent if parent exits
-    local descendants=""
-    descendants=$(pgrep -P "$pid" 2>/dev/null || true)
+    children=$(pgrep -P "$pid" 2>/dev/null || true)
+    for child in $children; do
+        _snapshot_pid_tree_lines "$child" "$((depth + 1))"
+    done
+}
 
-    # TERM pass
-    pkill -P "$pid" 2>/dev/null || true
-    kill "$pid" 2>/dev/null || true
+_dedupe_pid_snapshot_lines() {
+    awk -F'|' '!seen[$2]++'
+}
+
+_terminate_pid_snapshot_lines() {
+    local grace="$1"
+    local snapshot_file=""
+    local depth=""
+    local pid=""
+    local token=""
+
+    snapshot_file=$(mktemp "${TMPDIR:-/tmp}/lauren-loop-pid-tree.XXXXXX") || return 1
+    _dedupe_pid_snapshot_lines > "$snapshot_file"
+
+    if [[ ! -s "$snapshot_file" ]]; then
+        rm -f "$snapshot_file"
+        return 0
+    fi
+
+    while IFS='|' read -r depth pid token; do
+        [[ -n "$pid" && -n "$token" ]] || continue
+        _pid_matches_identity "$pid" "$token" || continue
+        kill "$pid" 2>/dev/null || true
+    done < <(sort -t '|' -k1,1nr -k2,2n "$snapshot_file")
+
     sleep "$grace"
 
-    # KILL pass — always fire on all recorded PIDs, even if parent exited
-    local dpid
-    for dpid in $pid $descendants; do
-        if kill -0 "$dpid" 2>/dev/null; then
-            kill -9 "$dpid" 2>/dev/null || true
-        fi
-    done
+    while IFS='|' read -r depth pid token; do
+        [[ -n "$pid" && -n "$token" ]] || continue
+        _pid_matches_identity "$pid" "$token" || continue
+        kill -9 "$pid" 2>/dev/null || true
+    done < <(sort -t '|' -k1,1nr -k2,2n "$snapshot_file")
+
+    rm -f "$snapshot_file"
+}
+
+_terminate_pid_tree_set() {
+    local grace="$1"
+    shift
+    local pid=""
+
+    {
+        for pid in "$@"; do
+            [[ -n "$pid" ]] || continue
+            _snapshot_pid_tree_lines "$pid"
+        done
+    } | _terminate_pid_snapshot_lines "$grace"
+}
+
+_terminate_pid_tree() {
+    local pid="$1"
+    local grace="${2:-$(_agent_terminate_grace_seconds)}"
+    [[ -n "$pid" ]] || return 0
+    _terminate_pid_tree_set "$grace" "$pid"
 }
 
 _watch_codex_artifact_for_static_invalid() {
@@ -1550,13 +1748,12 @@ section_bounds() {
     local header="$2"
 
     local matches
-    matches=$(grep -n -F -x "$header" "$task_file" | cut -d: -f1)
+    matches=$(grep -n -F -x "$header" "$task_file" | cut -d: -f1 || true)
     local count
     count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')
 
-    # FRAGILE: Case-insensitive fallback for heading variations. Full fix: Phase C, Item 20.
     if [ "$count" -eq 0 ]; then
-        matches=$(grep -in -F -x "$header" "$task_file" | cut -d: -f1)
+        matches=$(grep -in -F -x "$header" "$task_file" | cut -d: -f1 || true)
         count=$(printf '%s\n' "$matches" | sed '/^$/d' | wc -l | tr -d ' ')
         if [ "$count" -eq 1 ]; then
             echo "WARN: section_bounds: case-insensitive match for '$header'" >&2

@@ -32,6 +32,7 @@ PROTECTED_TUNABLES = (
     "NIGHTSHIFT_MAX_PR_FILES",
     "NIGHTSHIFT_MAX_PR_LINES",
     "NIGHTSHIFT_AGENT_TIMEOUT_SECONDS",
+    "NIGHTSHIFT_LAUREN_TIMEOUT_SECONDS",
     "NIGHTSHIFT_TOTAL_TIMEOUT_SECONDS",
     "NIGHTSHIFT_MIN_FREE_MB",
 )
@@ -48,6 +49,7 @@ protected=(
   NIGHTSHIFT_MAX_PR_FILES
   NIGHTSHIFT_MAX_PR_LINES
   NIGHTSHIFT_AGENT_TIMEOUT_SECONDS
+  NIGHTSHIFT_LAUREN_TIMEOUT_SECONDS
   NIGHTSHIFT_TOTAL_TIMEOUT_SECONDS
   NIGHTSHIFT_MIN_FREE_MB
 )
@@ -90,8 +92,8 @@ def _defaults_for(nightshift_dir: Path, home: Path) -> dict[str, str]:
     repo_dir = (nightshift_dir / "../..").resolve()
     log_dir = nightshift_dir / "logs"
     return {
-        "NIGHTSHIFT_CLAUDE_MODEL": "claude-opus-4-6",
-        "NIGHTSHIFT_MANAGER_MODEL": "claude-opus-4-6",
+        "NIGHTSHIFT_CLAUDE_MODEL": "claude-sonnet-4-6",
+        "NIGHTSHIFT_MANAGER_MODEL": "claude-opus-4-7",
         "NIGHTSHIFT_CODEX_MODEL": "azure54",
         "NIGHTSHIFT_COST_CAP_USD": "200",
         "NIGHTSHIFT_PER_CALL_CAP_USD": "25",
@@ -104,14 +106,16 @@ def _defaults_for(nightshift_dir: Path, home: Path) -> dict[str, str]:
         "NIGHTSHIFT_MAX_FINDINGS_PER_DETECTIVE": "10",
         "NIGHTSHIFT_MAX_TASK_FILES": "15",
         "NIGHTSHIFT_DETECTIVE_PLAYBOOKS": ",".join(DEFAULT_DETECTIVE_PLAYBOOKS),
+        "NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "false",
         "NIGHTSHIFT_BRIDGE_ENABLED": "false",
         "NIGHTSHIFT_BRIDGE_MIN_SEVERITY": "major",
         "NIGHTSHIFT_BRIDGE_AUTO_EXECUTE": "false",
         "NIGHTSHIFT_BRIDGE_MAX_TASKS": "3",
         "NIGHTSHIFT_BRIDGE_MAX_COST_PER_TASK": "25",
-        "NIGHTSHIFT_BACKLOG_ENABLED": "false",
+        "NIGHTSHIFT_BACKLOG_ENABLED": "true",
         "NIGHTSHIFT_BACKLOG_MAX_TASKS": "3",
         "NIGHTSHIFT_BACKLOG_MIN_BUDGET": "20",
+        "NIGHTSHIFT_MIN_TASKS_PER_RUN": "3",
         "NIGHTSHIFT_TASK_WRITER_MAX_TASKS": "5",
         "NIGHTSHIFT_TASK_WRITER_MIN_SEVERITY": "critical,major",
         "NIGHTSHIFT_TASK_WRITER_MIN_BUDGET": "20",
@@ -119,8 +123,9 @@ def _defaults_for(nightshift_dir: Path, home: Path) -> dict[str, str]:
         "NIGHTSHIFT_AUTOFIX_MAX_TASKS": "5",
         "NIGHTSHIFT_AUTOFIX_MIN_BUDGET": "20",
         "NIGHTSHIFT_AUTOFIX_SEVERITY": "critical,major",
-        "NIGHTSHIFT_AGENT_TIMEOUT_SECONDS": "600",
-        "NIGHTSHIFT_TOTAL_TIMEOUT_SECONDS": "7200",
+        "NIGHTSHIFT_AGENT_TIMEOUT_SECONDS": "1800",
+        "NIGHTSHIFT_LAUREN_TIMEOUT_SECONDS": "7200",
+        "NIGHTSHIFT_TOTAL_TIMEOUT_SECONDS": "28800",
         "NIGHTSHIFT_MAX_TURNS": "25",
         "NIGHTSHIFT_MIN_FREE_MB": "1024",
         "NIGHTSHIFT_DIR": str(nightshift_dir),
@@ -161,6 +166,16 @@ def _parse_bool(value: str) -> bool:
 
 def _parse_csv_tuple(value: str) -> tuple[str, ...]:
     return tuple(item.strip() for item in value.split(",") if item.strip())
+
+
+def _parse_int_in_range(name: str, value: str, *, lower: int, upper: int) -> int:
+    stripped = value.strip()
+    if not stripped.isdigit():
+        raise ConfigError(f"Invalid {name}: value={value!r} allowed range [{lower}, {upper}]")
+    parsed = int(stripped)
+    if parsed < lower or parsed > upper:
+        raise ConfigError(f"Invalid {name}: value={value!r} allowed range [{lower}, {upper}]")
+    return parsed
 
 
 def _capture_shell_env(
@@ -211,6 +226,7 @@ class NightshiftConfig:
     max_findings_per_detective: int
     max_task_files: int
     detective_playbooks: tuple[str, ...]
+    claude_detectives_enabled: bool
     bridge_enabled: bool
     bridge_min_severity: str
     bridge_auto_execute: bool
@@ -219,6 +235,7 @@ class NightshiftConfig:
     backlog_enabled: bool
     backlog_max_tasks: int
     backlog_min_budget: float
+    min_tasks_per_run: int
     task_writer_max_tasks: int
     task_writer_min_severity: str
     task_writer_min_budget: float
@@ -227,6 +244,7 @@ class NightshiftConfig:
     autofix_min_budget: float
     autofix_severity: str
     agent_timeout_seconds: int
+    lauren_timeout_seconds: int
     total_timeout_seconds: int
     max_turns: int
     min_free_mb: int
@@ -319,6 +337,7 @@ class NightshiftConfig:
             max_findings_per_detective=int(raw_values["NIGHTSHIFT_MAX_FINDINGS_PER_DETECTIVE"]),
             max_task_files=int(raw_values["NIGHTSHIFT_MAX_TASK_FILES"]),
             detective_playbooks=_parse_csv_tuple(raw_values["NIGHTSHIFT_DETECTIVE_PLAYBOOKS"]),
+            claude_detectives_enabled=_parse_bool(raw_values["NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED"]),
             bridge_enabled=_parse_bool(raw_values["NIGHTSHIFT_BRIDGE_ENABLED"]),
             bridge_min_severity=raw_values["NIGHTSHIFT_BRIDGE_MIN_SEVERITY"],
             bridge_auto_execute=_parse_bool(raw_values["NIGHTSHIFT_BRIDGE_AUTO_EXECUTE"]),
@@ -327,6 +346,12 @@ class NightshiftConfig:
             backlog_enabled=_parse_bool(raw_values["NIGHTSHIFT_BACKLOG_ENABLED"]),
             backlog_max_tasks=int(raw_values["NIGHTSHIFT_BACKLOG_MAX_TASKS"]),
             backlog_min_budget=float(raw_values["NIGHTSHIFT_BACKLOG_MIN_BUDGET"]),
+            min_tasks_per_run=_parse_int_in_range(
+                "NIGHTSHIFT_MIN_TASKS_PER_RUN",
+                raw_values["NIGHTSHIFT_MIN_TASKS_PER_RUN"],
+                lower=0,
+                upper=15,
+            ),
             task_writer_max_tasks=int(raw_values["NIGHTSHIFT_TASK_WRITER_MAX_TASKS"]),
             task_writer_min_severity=raw_values["NIGHTSHIFT_TASK_WRITER_MIN_SEVERITY"],
             task_writer_min_budget=float(raw_values["NIGHTSHIFT_TASK_WRITER_MIN_BUDGET"]),
@@ -335,6 +360,7 @@ class NightshiftConfig:
             autofix_min_budget=float(raw_values["NIGHTSHIFT_AUTOFIX_MIN_BUDGET"]),
             autofix_severity=raw_values["NIGHTSHIFT_AUTOFIX_SEVERITY"],
             agent_timeout_seconds=int(raw_values["NIGHTSHIFT_AGENT_TIMEOUT_SECONDS"]),
+            lauren_timeout_seconds=int(raw_values["NIGHTSHIFT_LAUREN_TIMEOUT_SECONDS"]),
             total_timeout_seconds=int(raw_values["NIGHTSHIFT_TOTAL_TIMEOUT_SECONDS"]),
             max_turns=int(raw_values["NIGHTSHIFT_MAX_TURNS"]),
             min_free_mb=int(raw_values["NIGHTSHIFT_MIN_FREE_MB"]),

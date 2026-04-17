@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import subprocess
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from nightshift.agents import (
     estimate_codex_cost,
     extract_claude_cost,
     extract_claude_result_text,
+    read_claude_result_text,
 )
 from nightshift.cost import CostTracker
 from nightshift.runtime import RunContext
@@ -314,7 +316,10 @@ exit 7
     assert partial.output_path.read_text(encoding="utf-8") == ""
 
 
-def test_stale_findings_not_leaked_to_next_slot(tmp_path: Path, config_factory) -> None:
+def test_detective_without_new_findings_artifact_fails_and_does_not_leak_stale_findings(
+    tmp_path: Path,
+    config_factory,
+) -> None:
     worktree, _remote = create_bare_remote_repo(tmp_path)
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -349,13 +354,298 @@ printf '{"usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_
     runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
 
     first_result = runner.run_claude("commit-detective")
-    second_result = runner.run_claude("commit-detective")
+    with pytest.raises(AgentExecutionError) as exc_info:
+        runner.run_claude("commit-detective")
 
     canonical_path = config.findings_dir / "commit-detective-findings.md"
     assert first_result.archived_findings_path is not None
-    assert second_result.status == "no_findings"
-    assert second_result.archived_findings_path is None
+    partial = exc_info.value.partial_result
+    assert partial is not None
+    assert partial.status == "error"
+    assert partial.return_code == 0
+    assert partial.archived_findings_path is None
+    assert "zero-exit but no usable output" in str(exc_info.value)
     assert not canonical_path.exists()
+
+
+def test_run_claude_error_max_turns_is_semantic_failure_and_archives_partial(
+    tmp_path: Path,
+    config_factory,
+) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$NIGHTSHIFT_FINDINGS_DIR"
+cat > "$NIGHTSHIFT_FINDINGS_DIR/commit-detective-findings.md" <<'EOF'
+### Finding: Partial semantic failure finding
+EOF
+printf '{"subtype":"error_max_turns","usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"result":"too many turns"}\n'
+""",
+    )
+    config = config_factory(repo_dir=worktree, path_prefix=fake_bin)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
+
+    with pytest.raises(AgentExecutionError) as exc_info:
+        runner.run_claude("commit-detective")
+
+    partial = exc_info.value.partial_result
+    assert partial is not None
+    assert partial.status == "error"
+    assert partial.return_code == 0
+    assert partial.archived_findings_path is not None
+    assert partial.archived_findings_path.name == "claude-commit-detective-partial.md"
+    assert "error_max_turns" in str(exc_info.value)
+
+
+@pytest.mark.parametrize("subtype", ["error_tool_use", "error_model"])
+def test_run_claude_other_error_subtypes_are_semantic_failures(
+    tmp_path: Path,
+    config_factory,
+    subtype: str,
+) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "claude",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '{{"subtype":"{subtype}","usage":{{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5}},"result":"semantic failure"}}\\n'
+""",
+    )
+    config = config_factory(repo_dir=worktree, path_prefix=fake_bin)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
+
+    with pytest.raises(AgentExecutionError) as exc_info:
+        runner.run_claude("commit-detective")
+
+    partial = exc_info.value.partial_result
+    assert partial is not None
+    assert partial.status == "error"
+    assert partial.return_code == 0
+    assert partial.archived_findings_path is None
+    assert subtype in str(exc_info.value)
+
+
+def test_run_claude_zero_exit_empty_stdout_is_failure(tmp_path: Path, config_factory) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -euo pipefail
+exit 0
+""",
+    )
+    config = config_factory(repo_dir=worktree, path_prefix=fake_bin)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
+
+    with pytest.raises(AgentExecutionError) as exc_info:
+        runner.run_claude("commit-detective")
+
+    partial = exc_info.value.partial_result
+    assert partial is not None
+    assert partial.status == "error"
+    assert partial.return_code == 0
+    assert partial.archived_findings_path is None
+    assert "zero-exit but no usable output" in str(exc_info.value)
+
+
+def test_run_claude_zero_exit_malformed_json_is_failure_and_logs_truncated_stdout(
+    tmp_path: Path,
+    config_factory,
+    caplog,
+) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    malformed_output = "not-json:" + ("x" * 520)
+    write_executable(
+        fake_bin / "claude",
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' '{malformed_output}'
+""",
+    )
+    config = config_factory(repo_dir=worktree, path_prefix=fake_bin)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
+
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(AgentExecutionError) as exc_info:
+            runner.run_claude("commit-detective")
+
+    partial = exc_info.value.partial_result
+    assert partial is not None
+    assert partial.status == "error"
+    assert partial.return_code == 0
+    assert partial.archived_findings_path is None
+    assert "zero-exit but no usable output" in str(exc_info.value)
+    assert malformed_output[:497] + "..." in caplog.text
+    assert malformed_output not in caplog.text
+
+
+def test_run_claude_zero_exit_empty_result_text_is_failure(tmp_path: Path, config_factory) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$NIGHTSHIFT_FINDINGS_DIR"
+cat > "$NIGHTSHIFT_FINDINGS_DIR/commit-detective-findings.md" <<'EOF'
+### Finding: Partial output still wrote findings
+EOF
+printf '{"usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"result":""}\n'
+""",
+    )
+    config = config_factory(repo_dir=worktree, path_prefix=fake_bin)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
+
+    with pytest.raises(AgentExecutionError) as exc_info:
+        runner.run_claude("commit-detective")
+
+    partial = exc_info.value.partial_result
+    assert partial is not None
+    assert partial.status == "error"
+    assert partial.return_code == 0
+    assert partial.archived_findings_path is not None
+    assert partial.archived_findings_path.name == "claude-commit-detective-partial.md"
+    assert "zero-exit but no usable output" in str(exc_info.value)
+
+
+def test_run_claude_zero_exit_meaningful_result_with_non_error_subtype_succeeds(
+    tmp_path: Path,
+    config_factory,
+) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -euo pipefail
+mkdir -p "$NIGHTSHIFT_FINDINGS_DIR"
+cat > "$NIGHTSHIFT_FINDINGS_DIR/commit-detective-findings.md" <<'EOF'
+### Finding: Healthy output with findings
+EOF
+printf '{"subtype":"message_stop","usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"result":"meaningful result"}\n'
+""",
+    )
+    config = config_factory(repo_dir=worktree, path_prefix=fake_bin)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
+
+    result = runner.run_claude("commit-detective")
+
+    assert result.status == "success"
+    assert result.findings_count == 1
+    assert result.archived_findings_path is not None
+    assert result.archived_findings_path.name == "claude-commit-detective-findings.md"
+
+
+def test_run_claude_artifact_suffix_preserves_task_writer_outputs(tmp_path: Path, config_factory) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '{"usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"result":"task output"}\n'
+""",
+    )
+    config = config_factory(repo_dir=worktree, path_prefix=fake_bin)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
+
+    first = runner.run_claude(
+        "task-writer",
+        model=config.manager_model,
+        finding_text="Rank: 1",
+        artifact_suffix="rank-1",
+    )
+    second = runner.run_claude(
+        "task-writer",
+        model=config.manager_model,
+        finding_text="Rank: 2",
+        artifact_suffix="rank-2",
+    )
+
+    assert first.output_path.name == "claude-task-writer-rank-1.json"
+    assert second.output_path.name == "claude-task-writer-rank-2.json"
+    assert first.output_path.exists()
+    assert second.output_path.exists()
+    assert read_claude_result_text(first.output_path) == "task output"
+    assert read_claude_result_text(second.output_path) == "task output"
+
+
+def test_run_claude_artifact_suffix_preserves_validation_outputs(tmp_path: Path, config_factory) -> None:
+    worktree, _remote = create_bare_remote_repo(tmp_path)
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    write_executable(
+        fake_bin / "claude",
+        """#!/usr/bin/env bash
+set -euo pipefail
+printf '{"usage":{"input_tokens":20,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"result":"### Validation Result: VALIDATED"}\n'
+""",
+    )
+    config = config_factory(repo_dir=worktree, path_prefix=fake_bin)
+    context = RunContext.create(config, dry_run=False, smoke=True)
+    tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
+    tracker.init(context.run_id)
+    runner = AgentRunner(config=config, context=context, cost_tracker=tracker)
+    task_a = worktree / "docs" / "tasks" / "open" / "nightshift-2026-04-13-auth" / "task.md"
+    task_b = worktree / "docs" / "tasks" / "open" / "nightshift-2026-04-13-coverage" / "task.md"
+    task_a.parent.mkdir(parents=True, exist_ok=True)
+    task_b.parent.mkdir(parents=True, exist_ok=True)
+    task_a.write_text("## Task: Auth\n", encoding="utf-8")
+    task_b.write_text("## Task: Coverage\n", encoding="utf-8")
+
+    first = runner.run_claude(
+        "validation-agent",
+        model=config.manager_model,
+        task_file_path=str(task_a),
+        artifact_suffix=task_a.parent.name,
+    )
+    second = runner.run_claude(
+        "validation-agent",
+        model=config.manager_model,
+        task_file_path=str(task_b),
+        artifact_suffix=task_b.parent.name,
+    )
+
+    assert first.output_path.name == "claude-validation-agent-nightshift-2026-04-13-auth.json"
+    assert second.output_path.name == "claude-validation-agent-nightshift-2026-04-13-coverage.json"
+    assert first.output_path.exists()
+    assert second.output_path.exists()
+    assert read_claude_result_text(first.output_path) == "### Validation Result: VALIDATED"
+    assert read_claude_result_text(second.output_path) == "### Validation Result: VALIDATED"
 
 
 def test_run_codex_command_shape(tmp_path: Path, config_factory) -> None:

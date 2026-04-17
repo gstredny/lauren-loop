@@ -52,6 +52,8 @@ RUN_BRANCH=""
 ORIGINAL_REF=""
 
 TOTAL_FINDINGS_AVAILABLE=0
+FINDINGS_ELIGIBLE_FOR_RANKING=0
+SUPPRESSED_FINDINGS_COUNT=0
 TASK_FILE_COUNT=0
 DIGEST_AVAILABLE=0
 DIGEST_STAGEABLE=0
@@ -64,6 +66,7 @@ BRIDGE_SKIPPED=0
 BACKLOG_STAGE_PATHS=()
 BACKLOG_RESULTS=()
 BACKLOG_LAST_OUTCOME=""
+AUTOFIX_ATTEMPTED_COUNT=0
 CREATED_TASKS=()
 NIGHTSHIFT_FINDING_TEXT=""
 VALIDATED_TASKS=()
@@ -394,6 +397,11 @@ source_required() {
     source "${path}"
     ns_log "Sourced: ${path}"
     return 0
+}
+
+ensure_task_context_helpers() {
+    declare -F task_context_existing_open_tasks_block >/dev/null 2>&1 && return 0
+    source_required "${SCRIPT_DIR}/lib/task-context.sh"
 }
 
 snapshot_protected_tunables() {
@@ -728,11 +736,13 @@ validate_nightshift_configuration() {
     validate_decimal_gt_le \
         "NIGHTSHIFT_BRIDGE_MAX_COST_PER_TASK" "${NIGHTSHIFT_BRIDGE_MAX_COST_PER_TASK:-25}" "0" "100" "(> 0 and <= 100)" || return 1
     validate_boolean_setting \
-        "NIGHTSHIFT_BACKLOG_ENABLED" "${NIGHTSHIFT_BACKLOG_ENABLED:-false}" || return 1
+        "NIGHTSHIFT_BACKLOG_ENABLED" "${NIGHTSHIFT_BACKLOG_ENABLED:-true}" || return 1
     validate_integer_gt_le \
         "NIGHTSHIFT_BACKLOG_MAX_TASKS" "${NIGHTSHIFT_BACKLOG_MAX_TASKS:-3}" "0" "15" "(> 0 and <= 15)" || return 1
     validate_decimal_gt_le \
         "NIGHTSHIFT_BACKLOG_MIN_BUDGET" "${NIGHTSHIFT_BACKLOG_MIN_BUDGET:-20}" "0" "500" "(> 0 and <= 500)" || return 1
+    validate_integer_ge_le \
+        "NIGHTSHIFT_MIN_TASKS_PER_RUN" "${NIGHTSHIFT_MIN_TASKS_PER_RUN:-3}" "0" "15" "(>= 0 and <= 15)" || return 1
     validate_boolean_setting \
         "NIGHTSHIFT_AUTOFIX_ENABLED" "${NIGHTSHIFT_AUTOFIX_ENABLED:-false}" || return 1
     validate_integer_gt_le \
@@ -1393,10 +1403,12 @@ task_writer_finding_context() {
     local severity="$2"
     local category="$3"
     local title="$4"
+    local existing_open_tasks_context="${5:-}"
     local digest_row=""
     local finding_context=""
     local finding_block=""
     local finding_block_status=0
+    local result=""
 
     digest_row="$(manager_digest_table_row_by_rank "${rank}" "${DIGEST_PATH:-}")"
     if [[ -z "${digest_row}" ]]; then
@@ -1410,22 +1422,28 @@ task_writer_finding_context() {
 
     finding_block=""
     if finding_block="$(task_writer_find_matching_block "${title}")"; then
-        printf '%s\n%s' "${finding_context}" "${finding_block}"
-        return 0
+        result="$(printf '%s\n%s' "${finding_context}" "${finding_block}")"
     else
         finding_block_status=$?
     fi
 
-    case "${finding_block_status}" in
-        1)
-            ns_err_log "WARN: Task writing could not match finding title '${title}' in ${NIGHTSHIFT_FINDINGS_DIR}; using manifest metadata only"
-            ;;
-        2)
-            ns_err_log "WARN: Task writing found multiple finding blocks matching title '${title}'; using manifest metadata only"
-            ;;
-    esac
+    if [[ -z "${result}" ]]; then
+        case "${finding_block_status}" in
+            1)
+                ns_err_log "WARN: Task writing could not match finding title '${title}' in ${NIGHTSHIFT_FINDINGS_DIR}; using manifest metadata only"
+                ;;
+            2)
+                ns_err_log "WARN: Task writing found multiple finding blocks matching title '${title}'; using manifest metadata only"
+                ;;
+        esac
+        result="${finding_context}"
+    fi
 
-    printf '%s' "${finding_context}"
+    if [[ -n "${existing_open_tasks_context}" ]]; then
+        result="${result}"$'\n\n'"${existing_open_tasks_context}"
+    fi
+
+    printf '%s' "${result}"
 }
 
 task_writer_result_line() {
@@ -3167,6 +3185,7 @@ rewrite_manager_digest() {
     local duplicates_merged=0
     local critical_tasks=0
     local major_tasks=0
+    local eligible_findings=0
 
     [[ -f "${path}" ]] || return 0
 
@@ -3174,9 +3193,10 @@ rewrite_manager_digest() {
     minor_rows="$(count_markdown_table_rows_in_section "${path}" "${NIGHTSHIFT_MANAGER_MINOR_FINDINGS_HEADING}")"
     critical_tasks="$(count_task_table_rows_by_severity "${path}" "critical" "${NIGHTSHIFT_MANAGER_TASK_FILES_HEADING}")"
     major_tasks="$(count_task_table_rows_by_severity "${path}" "major" "${NIGHTSHIFT_MANAGER_TASK_FILES_HEADING}")"
+    eligible_findings="${FINDINGS_ELIGIBLE_FOR_RANKING:-${TOTAL_FINDINGS_AVAILABLE}}"
 
     after_dedup=$(( task_rows + minor_rows ))
-    duplicates_merged=$(( TOTAL_FINDINGS_AVAILABLE - after_dedup ))
+    duplicates_merged=$(( eligible_findings - after_dedup ))
     if (( duplicates_merged < 0 )); then
         duplicates_merged=0
     fi
@@ -3190,14 +3210,23 @@ rewrite_manager_digest() {
 
         printf '\n%s\n' "${NIGHTSHIFT_MANAGER_SUMMARY_HEADING}"
         printf -- '- **Total findings received:** %s\n' "${TOTAL_FINDINGS_AVAILABLE}"
+        printf -- '- **Eligible after suppression:** %s\n' "${eligible_findings}"
         printf -- '- **After deduplication:** %s\n' "${after_dedup}"
         printf -- '- **Duplicates merged:** %s\n' "${duplicates_merged}"
+        printf -- '- **Ranked:** %s (%s suppressed)\n' "${task_rows}" "${SUPPRESSED_FINDINGS_COUNT:-0}"
         printf -- '- **Task files created:** %s (critical: %s, major: %s)\n' \
             "${TASK_FILE_COUNT}" "${critical_tasks}" "${major_tasks}"
         printf -- '- **Minor/observation findings:** %s (see digest below)\n' "${minor_rows}"
 
         printf '\n'
         manager_digest_body_without_shell_sections "${path}"
+        if declare -F nightshift_render_suppression_sections >/dev/null 2>&1; then
+            local suppression_sections=""
+            suppression_sections="$(nightshift_render_suppression_sections)"
+            if [[ -n "${suppression_sections}" ]]; then
+                printf '\n\n%s\n' "${suppression_sections}"
+            fi
+        fi
         printf '\n'
         render_detective_coverage_section
         printf '\n%s\n' "${NIGHTSHIFT_MANAGER_DETECTIVES_SKIPPED_HEADING}"
@@ -3704,6 +3733,11 @@ phase_manager_merge() {
 
     rebuild_manager_inputs
     TOTAL_FINDINGS_AVAILABLE="$(count_total_findings)"
+    FINDINGS_ELIGIBLE_FOR_RANKING="${TOTAL_FINDINGS_AVAILABLE}"
+    SUPPRESSED_FINDINGS_COUNT=0
+    if declare -F nightshift_apply_suppressions >/dev/null 2>&1; then
+        nightshift_apply_suppressions || true
+    fi
     ns_log "Total detective findings available for manager merge: ${TOTAL_FINDINGS_AVAILABLE}"
 
     if ! check_total_timeout; then
@@ -3763,12 +3797,18 @@ phase_manager_merge() {
         return 0
     fi
 
-    if agent_run_claude "${manager_playbook}" "${manager_output}" "${NIGHTSHIFT_MANAGER_MODEL}"; then
+    if [[ "${FINDINGS_ELIGIBLE_FOR_RANKING}" -eq 0 ]]; then
+        nightshift_write_empty_manager_digest_body "${DIGEST_PATH}"
         manager_completed=1
-        ns_log "Manager merge completed"
+        ns_log "Manager merge skipped because only suppressed findings remained"
     else
-        manager_exit=$?
-        append_failure "Manager merge failed with exit ${manager_exit}"
+        if agent_run_claude "${manager_playbook}" "${manager_output}" "${NIGHTSHIFT_MANAGER_MODEL}"; then
+            manager_completed=1
+            ns_log "Manager merge completed"
+        else
+            manager_exit=$?
+            append_failure "Manager merge failed with exit ${manager_exit}"
+        fi
     fi
 
     manager_result_preview="$(agent_output_preview "${manager_output}" 160 2>/dev/null || true)"
@@ -3822,8 +3862,10 @@ phase_manager_merge() {
     fi
 
     top_findings_count="$(count_top_findings_in_digest "${DIGEST_PATH}")"
-    if [[ "${TOTAL_FINDINGS_AVAILABLE}" -gt 0 && "${top_findings_count}" -eq 0 ]]; then
-        append_failure "Manager contract failure: findings available but digest top-findings table is empty"
+    local minor_findings_count=0
+    minor_findings_count="$(count_markdown_table_rows_in_section "${DIGEST_PATH}" "${NIGHTSHIFT_MANAGER_MINOR_FINDINGS_HEADING}")"
+    if [[ "${FINDINGS_ELIGIBLE_FOR_RANKING}" -gt 0 && $(( top_findings_count + minor_findings_count )) -eq 0 ]]; then
+        append_failure "Manager contract failure: findings available after suppression but digest has empty ranked findings table"
         DIGEST_STAGEABLE=0
         MANAGER_CONTRACT_FAILED=1
         phase_end "3" "Manager Merge" "FAILED"
@@ -3831,6 +3873,9 @@ phase_manager_merge() {
     fi
 
     rewrite_manager_digest "${DIGEST_PATH}"
+    if declare -F nightshift_annotate_digest_with_fingerprints >/dev/null 2>&1; then
+        nightshift_annotate_digest_with_fingerprints "${DIGEST_PATH}" || true
+    fi
 
     if ! write_findings_manifest "${DIGEST_PATH}"; then
         append_failure "Findings manifest write failed: $(findings_manifest_path)"
@@ -3870,6 +3915,11 @@ phase_task_writing() {
         return 0
     fi
 
+    if ! ensure_task_context_helpers; then
+        phase_end "3.5a" "Task Writing" "FAILED"
+        return 0
+    fi
+
     local findings_manifest_path_value=""
     local task_writer_playbook="${NIGHTSHIFT_PLAYBOOKS_DIR}/task-writer.md"
     findings_manifest_path_value="$(findings_manifest_path)"
@@ -3885,7 +3935,7 @@ phase_task_writing() {
         return 0
     fi
 
-    if [[ "${DRY_RUN}" -ne 1 && ! -r "${task_writer_playbook}" ]]; then
+    if [[ ! -r "${task_writer_playbook}" ]]; then
         append_failure "Task writer playbook missing or unreadable: ${task_writer_playbook}"
         phase_end "3.5a" "Task Writing" "FAILED"
         return 0
@@ -3919,9 +3969,11 @@ phase_task_writing() {
     local task_slug=""
     local task_path=""
     local task_writer_exit=0
+    local existing_open_tasks_context=""
 
     max_tasks="$(task_writer_max_tasks_setting)"
     min_budget="$(task_writer_min_budget_setting)"
+    existing_open_tasks_context="$(task_context_existing_open_tasks_block)"
 
     if smoke_mode_enabled && (( max_tasks > 1 )); then
         max_tasks=1
@@ -3976,13 +4028,21 @@ phase_task_writing() {
         IFS=$'\t' read -r rank severity category title <<< "${findings_row}"
         attempt_count=$(( attempt_count + 1 ))
 
+        export NIGHTSHIFT_FINDING_TEXT
+        NIGHTSHIFT_FINDING_TEXT="$(task_writer_finding_context "${rank}" "${severity}" "${category}" "${title}" "${existing_open_tasks_context}")"
+
+        if ! task_context_snapshot_task_writer_prompt "${rank}" "${task_writer_playbook}" >/dev/null; then
+            append_failure "Task writer prompt snapshot failed for: ${title}"
+            phase_end "3.5a" "Task Writing" "FAILED"
+            return 0
+        fi
+
         if [[ "${DRY_RUN}" -eq 1 ]]; then
             ns_log "DRY RUN: would write task for: ${title} (severity: ${severity}, remaining: \$${remaining_budget}, minimum reserve: \$${min_budget})"
+            unset NIGHTSHIFT_FINDING_TEXT
             continue
         fi
 
-        export NIGHTSHIFT_FINDING_TEXT
-        NIGHTSHIFT_FINDING_TEXT="$(task_writer_finding_context "${rank}" "${severity}" "${category}" "${title}")"
         task_writer_output="${AGENT_OUTPUT_DIR}/task-writer-rank-${rank}.json"
         task_writer_exit=0
 
@@ -4221,6 +4281,7 @@ phase_validation() {
 
 phase_autofix() {
     phase_start "3.5c" "Autofix"
+    AUTOFIX_ATTEMPTED_COUNT=0
 
     if smoke_mode_enabled; then
         ns_log "Smoke mode: skipping Autofix"
@@ -4510,6 +4571,7 @@ phase_autofix() {
     if (( skipped_count < 0 )); then
         skipped_count=0
     fi
+    AUTOFIX_ATTEMPTED_COUNT="${attempt_count}"
 
     ns_log "Autofix: ${fixed_count} fixed, ${failed_count} failed, ${blocked_count} blocked, ${skipped_count} skipped (budget/severity) out of ${total_validated} validated"
     phase_end "3.5c" "Autofix" "OK"
@@ -4605,8 +4667,22 @@ phase_backlog_burndown() {
         phase_end "3.7" "Backlog Burndown" "SKIPPED"
         return 0
     fi
+    if ! declare -F backlog_needed_tasks >/dev/null 2>&1; then
+        if ! source_required "${SCRIPT_DIR}/lib/backlog-floor.sh"; then
+            phase_end "3.7" "Backlog Burndown" "FAILED"
+            return 1
+        fi
+    fi
 
-    if [[ "${RUN_CLEAN:-0}" -eq 1 ]]; then
+    local attempted_autofix="${AUTOFIX_ATTEMPTED_COUNT:-0}"
+    local min_tasks_per_run="${NIGHTSHIFT_MIN_TASKS_PER_RUN:-3}"
+    local needed_tasks=0
+    local effective_max_tasks=0
+    needed_tasks="$(backlog_needed_tasks "${attempted_autofix}" "${min_tasks_per_run}")"
+    effective_max_tasks="$(backlog_effective_max_tasks "${attempted_autofix}" "${min_tasks_per_run}" "${NIGHTSHIFT_BACKLOG_MAX_TASKS:-3}")"
+    backlog_log "Backlog target: attempted autofix=${attempted_autofix}, min per run=${min_tasks_per_run}, needed=${needed_tasks}, effective max=${effective_max_tasks}"
+
+    if [[ "${RUN_CLEAN:-0}" -eq 1 ]] && backlog_clean_run_satisfied "${attempted_autofix}" "${min_tasks_per_run}"; then
         backlog_log "INFO: Night Shift: backlog skipped — clean run, no upstream findings"
         phase_end "3.7" "Backlog Burndown" "SKIPPED"
         return 0
@@ -4644,7 +4720,7 @@ phase_backlog_burndown() {
         local preview_rel_path=""
         local preview_slug=""
         local selected_preview=0
-        local max_preview_tasks="${NIGHTSHIFT_BACKLOG_MAX_TASKS:-3}"
+        local max_preview_tasks="${effective_max_tasks}"
 
         while IFS= read -r preview_task; do
             [[ -n "${preview_task}" ]] || continue
@@ -4672,7 +4748,7 @@ phase_backlog_burndown() {
     local ranked_output=""
     local ranked_entry=""
     local selected_candidates=()
-    local max_tasks="${NIGHTSHIFT_BACKLOG_MAX_TASKS:-3}"
+    local max_tasks="${effective_max_tasks}"
     local task_rank=""
     local task_path=""
     local task_goal=""
@@ -5145,7 +5221,15 @@ main() {
         phase_cleanup
         return 1
     fi
+    if ! source_required "${SCRIPT_DIR}/lib/backlog-floor.sh"; then
+        phase_cleanup
+        return 1
+    fi
     if ! source_required "${SCRIPT_DIR}/lib/lauren-bridge.sh"; then
+        phase_cleanup
+        return 1
+    fi
+    if ! source_required "${SCRIPT_DIR}/lib/suppression.sh"; then
         phase_cleanup
         return 1
     fi

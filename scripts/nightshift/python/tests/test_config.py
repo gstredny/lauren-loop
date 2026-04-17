@@ -99,6 +99,24 @@ def test_agent_timeout_protected_from_caller_env(tmp_path: Path) -> None:
     assert config.raw_values["NIGHTSHIFT_AGENT_TIMEOUT_SECONDS"] == "600"
 
 
+def test_lauren_timeout_protected_from_caller_env(tmp_path: Path) -> None:
+    conf_path = tmp_path / "nightshift.conf"
+    conf_path.write_text('NIGHTSHIFT_LAUREN_TIMEOUT_SECONDS="7200"\n', encoding="utf-8")
+
+    config = NightshiftConfig.load(
+        conf_path=conf_path,
+        env={
+            "HOME": str(tmp_path / "home"),
+            "PATH": "/usr/bin:/bin",
+            "NIGHTSHIFT_LAUREN_TIMEOUT_SECONDS": "99",
+        },
+        env_file=tmp_path / "home/.nightshift-env",
+    )
+
+    assert config.lauren_timeout_seconds == 7200
+    assert config.raw_values["NIGHTSHIFT_LAUREN_TIMEOUT_SECONDS"] == "7200"
+
+
 def test_conf_path_prepend_is_authoritative_for_subprocesses(tmp_path: Path) -> None:
     conf_path = tmp_path / "nightshift.conf"
     conf_path.write_text('export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"\n', encoding="utf-8")
@@ -150,8 +168,37 @@ def test_missing_conf_uses_defaults(tmp_path: Path) -> None:
     )
 
     assert config.base_branch == "main"
+    assert config.agent_timeout_seconds == 1800
+    assert config.claude_detectives_enabled is False
+    assert config.backlog_enabled is True
+    assert config.lauren_timeout_seconds == 7200
+    assert config.min_tasks_per_run == 3
     assert config.task_writer_max_tasks == 5
+    assert config.total_timeout_seconds == 28800
     assert config.max_turns == 25
+
+
+@pytest.mark.parametrize(
+    ("raw_value", "expected"),
+    [
+        ("TRUE", True),
+        ("1", True),
+        ("false", False),
+        ("False", False),
+        ("0", False),
+    ],
+)
+def test_claude_detectives_flag_loads_from_conf(tmp_path: Path, raw_value: str, expected: bool) -> None:
+    conf_path = tmp_path / "nightshift.conf"
+    conf_path.write_text(f'NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED="{raw_value}"\n', encoding="utf-8")
+
+    config = NightshiftConfig.load(
+        conf_path=conf_path,
+        env={"HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"},
+        env_file=tmp_path / "home/.nightshift-env",
+    )
+
+    assert config.claude_detectives_enabled is expected
 
 
 def test_conf_eval_timeout_raises_config_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -165,6 +212,22 @@ def test_conf_eval_timeout_raises_config_error(tmp_path: Path, monkeypatch: pyte
     monkeypatch.setattr(config_module.subprocess, "run", fake_run)
 
     with pytest.raises(ConfigError, match=f"Timed out while evaluating {conf_path.resolve()}"):
+        NightshiftConfig.load(
+            conf_path=conf_path,
+            env={"HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"},
+            env_file=tmp_path / "home/.nightshift-env",
+        )
+
+
+@pytest.mark.parametrize("raw_value", ["-1", "16", "abc"])
+def test_min_tasks_per_run_must_be_integer_in_range(tmp_path: Path, raw_value: str) -> None:
+    conf_path = tmp_path / "nightshift.conf"
+    conf_path.write_text(
+        f'NIGHTSHIFT_MIN_TASKS_PER_RUN="{raw_value}"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="NIGHTSHIFT_MIN_TASKS_PER_RUN"):
         NightshiftConfig.load(
             conf_path=conf_path,
             env={"HOME": str(tmp_path / "home"), "PATH": "/usr/bin:/bin"},

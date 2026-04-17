@@ -75,7 +75,13 @@ def _wait_for_text(path: Path, *, timeout_seconds: float = 5.0) -> str:
 
 def test_global_timeout_checked_after_detective(tmp_path: Path, config_factory) -> None:
     worktree, _remote = create_bare_remote_repo(tmp_path)
-    config = config_factory(repo_dir=worktree, extra_env={"NIGHTSHIFT_CODEX_MODEL": ""})
+    config = config_factory(
+        repo_dir=worktree,
+        extra_env={
+            "NIGHTSHIFT_CODEX_MODEL": "",
+            "NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true",
+        },
+    )
     context = RunContext.create(config, dry_run=False, smoke=False)
     tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
     tracker.init(context.run_id)
@@ -105,7 +111,13 @@ def test_global_timeout_checked_after_detective(tmp_path: Path, config_factory) 
 
 def test_global_timeout_aborts_remaining_detectives(tmp_path: Path, config_factory) -> None:
     worktree, _remote = create_bare_remote_repo(tmp_path)
-    config = config_factory(repo_dir=worktree, extra_env={"NIGHTSHIFT_CODEX_MODEL": ""})
+    config = config_factory(
+        repo_dir=worktree,
+        extra_env={
+            "NIGHTSHIFT_CODEX_MODEL": "",
+            "NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED": "true",
+        },
+    )
     context = RunContext.create(config, dry_run=False, smoke=False)
     tracker = CostTracker(state_file=context.cost_state_file, csv_file=config.cost_csv, config=config)
     tracker.init(context.run_id)
@@ -321,7 +333,8 @@ exit 0
     conf_path.write_text(
         f'source "{NIGHTSHIFT_DIR / "nightshift.conf"}"\n'
         'NIGHTSHIFT_AGENT_TIMEOUT_SECONDS="1"\n'
-        'NIGHTSHIFT_CODEX_MODEL=""\n',
+        'NIGHTSHIFT_CODEX_MODEL=""\n'
+        'NIGHTSHIFT_CLAUDE_DETECTIVES_ENABLED="true"\n',
         encoding="utf-8",
     )
     config = config_factory(repo_dir=worktree, conf_path=conf_path, path_prefix=fake_bin)

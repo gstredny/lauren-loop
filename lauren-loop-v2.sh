@@ -32,7 +32,7 @@ source "$SCRIPT_DIR/lib/lauren-loop-utils.sh"
 [[ -f "$SCRIPT_DIR/.lauren-loop.conf" ]] && source "$SCRIPT_DIR/.lauren-loop.conf"
 
 # Config-driven project values (fallback defaults if conf doesn't set them)
-PROJECT_NAME="${PROJECT_NAME:-MyProject}"
+PROJECT_NAME="${PROJECT_NAME:-AskGeorge}"
 TEST_CMD="${TEST_CMD:-.venv/bin/python -m pytest tests/ -x -q}"
 LINT_CMD="${LINT_CMD:-.venv/bin/python -m flake8 src/ --count --select=E9,F63,F7,F82 --show-source --statistics}"
 
@@ -105,6 +105,7 @@ _V2_EXEC_WORKTREE_PATH=""
 _V2_EXEC_WORKTREE_BRANCH=""
 _V2_EXEC_TARGET_REF=""
 _V2_EXEC_TARGET_HEAD_SHA=""
+_V2_EXEC_PREEXISTING_ROOT_DIRTY=""
 _V2_LAST_MERGE_RECOVERABLE=false
 _V2_PRESERVED_EXEC_WORKTREE_PATH=""
 _V2_PRESERVED_EXEC_WORKTREE_BRANCH=""
@@ -1360,6 +1361,7 @@ release_lock() {
 _v2_reset_merge_recovery_state() {
     _V2_EXEC_TARGET_REF=""
     _V2_EXEC_TARGET_HEAD_SHA=""
+    _V2_EXEC_PREEXISTING_ROOT_DIRTY=""
     _V2_LAST_MERGE_RECOVERABLE=false
     _V2_PRESERVED_EXEC_WORKTREE_PATH=""
     _V2_PRESERVED_EXEC_WORKTREE_BRANCH=""
@@ -1429,6 +1431,70 @@ _v2_has_recoverable_execution_commit() {
     [[ -n "$target_head_sha" && -n "$worktree_head" ]] || return 1
     [[ "$target_head_sha" != "$worktree_head" ]] || return 1
     git merge-base --is-ancestor "$target_head_sha" "$worktree_head" 2>/dev/null
+}
+
+_v2_short_sha() {
+    local sha="$1"
+
+    [[ -n "$sha" ]] || return 0
+    if [[ "${#sha}" -le 12 ]]; then
+        printf '%s\n' "$sha"
+    else
+        printf '%s\n' "${sha:0:12}"
+    fi
+}
+
+_v2_log_execution_target_drift() {
+    local target_ref="$1"
+    local original_target_head="$2"
+    local current_target_head="$3"
+    local counts=""
+    local original_only="unknown"
+    local current_only="unknown"
+    local original_short=""
+    local current_short=""
+
+    [[ -n "$original_target_head" && -n "$current_target_head" ]] || return 0
+    [[ "$original_target_head" != "$current_target_head" ]] || return 0
+
+    counts=$(git rev-list --left-right --count "${original_target_head}...${current_target_head}" 2>/dev/null || true)
+    if [[ "$counts" == *$'\t'* ]]; then
+        original_only="${counts%%$'\t'*}"
+        current_only="${counts##*$'\t'}"
+    elif [[ "$counts" == *" "* ]]; then
+        original_only="${counts%% *}"
+        current_only="${counts##* }"
+    fi
+
+    original_short=$(_v2_short_sha "$original_target_head")
+    current_short=$(_v2_short_sha "$current_target_head")
+    echo -e "${YELLOW}Execution target drift detected for ${target_ref:-HEAD}: ${original_short}...${current_short} (current-only=${current_only}, original-only=${original_only})${NC}"
+}
+
+_v2_rebase_execution_worktree_onto_target() {
+    local wt_path="$1"
+    local wt_branch="$2"
+    local original_target_head="$3"
+    local current_target_head="$4"
+    local original_short=""
+    local current_short=""
+
+    [[ -n "$wt_path" && -d "$wt_path" ]] || return 0
+    [[ -n "$wt_branch" && -n "$original_target_head" && -n "$current_target_head" ]] || return 0
+    [[ "$original_target_head" != "$current_target_head" ]] || return 0
+
+    original_short=$(_v2_short_sha "$original_target_head")
+    current_short=$(_v2_short_sha "$current_target_head")
+    echo -e "${YELLOW}Rebasing execution worktree branch ${wt_branch} from ${original_short} onto ${current_short}${NC}"
+
+    if git -C "$wt_path" rebase --onto "$current_target_head" "$original_target_head" "$wt_branch" >/dev/null 2>&1; then
+        echo -e "${GREEN}Rebased execution worktree branch ${wt_branch} onto ${current_short}${NC}"
+        return 0
+    fi
+
+    git -C "$wt_path" rebase --abort >/dev/null 2>&1 || true
+    echo -e "${RED}Rebase-based merge preparation failed for ${wt_branch}; aborted rebase and preserving recovery state${NC}" >&2
+    return 1
 }
 
 _v2_recovery_manifest_json() {
@@ -1603,6 +1669,7 @@ _v2_preserve_recoverable_merge_failure() {
     _V2_EXEC_WORKTREE_BRANCH=""
     _V2_EXEC_TARGET_REF=""
     _V2_EXEC_TARGET_HEAD_SHA=""
+    _V2_EXEC_PREEXISTING_ROOT_DIRTY=""
 }
 
 _v2_create_execution_worktree() {
@@ -1695,32 +1762,234 @@ _v2_prestage_baseline_diff_if_missing() {
     return 0
 }
 
+_v2_merge_lock_file() {
+    printf '%s\n' "${LAUREN_LOOP_V2_MERGE_LOCK_FILE:-/tmp/lauren-loop-v2-merge.lock}"
+}
+
+_v2_merge_lock_timeout_seconds() {
+    printf '%s\n' "${LAUREN_LOOP_V2_MERGE_LOCK_TIMEOUT_SEC:-300}"
+}
+
+_v2_release_merge_lock_fd() {
+    local lock_fd="$1"
+    [[ "$lock_fd" =~ ^[0-9]+$ ]] || return 0
+    eval "exec ${lock_fd}>&-" 2>/dev/null || true
+}
+
+_v2_acquire_global_merge_lock() {
+    local fd_var_name="$1"
+    local lock_file="${2:-$(_v2_merge_lock_file)}"
+    local timeout="${3:-$(_v2_merge_lock_timeout_seconds)}"
+    local lock_fd=219
+
+    mkdir -p "$(dirname "$lock_file")" 2>/dev/null || true
+    eval "exec ${lock_fd}>\"$lock_file\"" || {
+        echo -e "${RED}Failed to open Lauren Loop V2 global merge lock: ${lock_file}${NC}" >&2
+        return 1
+    }
+
+    if command -v flock >/dev/null 2>&1; then
+        flock -w "$timeout" "$lock_fd" || {
+            echo "ERROR: timed out acquiring Lauren Loop V2 global merge lock after ${timeout}s: ${lock_file}" >&2
+            _v2_release_merge_lock_fd "$lock_fd"
+            return 1
+        }
+    elif command -v lockf >/dev/null 2>&1; then
+        lockf -t "$timeout" "$lock_fd" || {
+            echo "ERROR: timed out acquiring Lauren Loop V2 global merge lock after ${timeout}s: ${lock_file}" >&2
+            _v2_release_merge_lock_fd "$lock_fd"
+            return 1
+        }
+    else
+        echo "ERROR: unable to acquire Lauren Loop V2 global merge lock because neither flock nor lockf is available" >&2
+        _v2_release_merge_lock_fd "$lock_fd"
+        return 1
+    fi
+
+    printf -v "$fd_var_name" '%s' "$lock_fd"
+}
+
+_v2_path_matches_any_glob() {
+    local path="$1"
+    shift
+
+    local pattern=""
+    for pattern in "$@"; do
+        [[ -n "$pattern" ]] || continue
+        if [[ "$path" == $pattern ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+_v2_merge_expected_root_dirty_globs() {
+    local task_file="${_CURRENT_TASK_FILE:-}"
+    local task_dir=""
+    local task_file_rel=""
+    local task_dir_rel=""
+
+    [[ -n "$task_file" ]] || return 0
+
+    task_file_rel=$(_v2_main_repo_relative_path "$task_file" 2>/dev/null || true)
+    if [[ -n "$task_file_rel" ]]; then
+        printf '%s\n' "$task_file_rel"
+    fi
+
+    task_dir=$(_v2_task_dir_for_task_file "$task_file" 2>/dev/null || true)
+    task_dir_rel=$(_v2_main_repo_relative_path "$task_dir" 2>/dev/null || true)
+    [[ -n "$task_dir_rel" && "$task_dir_rel" != "." ]] || return 0
+
+    printf '%s\n' \
+        "${task_dir_rel}/competitive/run-manifest.json" \
+        "${task_dir_rel}/competitive/.cycle-state.json" \
+        "${task_dir_rel}/competitive/execution-diff.patch" \
+        "${task_dir_rel}/competitive/execution-diff.numstat.tsv" \
+        "${task_dir_rel}/competitive/fix-diff-cycle*.patch" \
+        "${task_dir_rel}/competitive/fix-diff-cycle*.numstat.tsv" \
+        "${task_dir_rel}/competitive/fix-diff-cycle*.estimate.numstat.tsv" \
+        "${task_dir_rel}/competitive/traditional-dev-proxy.json" \
+        "${task_dir_rel}/logs/cost.csv" \
+        "${task_dir_rel}/logs/*.log" \
+        "${task_dir_rel}/logs/*.summary.txt"
+}
+
+_v2_root_dirty_paths() {
+    local status_line=""
+    local status_path=""
+
+    git -C "$SCRIPT_DIR" status --porcelain --untracked-files=all 2>/dev/null | while IFS= read -r status_line; do
+        [[ -n "$status_line" ]] || continue
+        status_path="${status_line#?? }"
+        case "$status_path" in
+            *" -> "*)
+                status_path="${status_path##* -> }"
+                ;;
+        esac
+        [[ -n "$status_path" ]] || continue
+        printf '%s\n' "$status_path"
+    done | _v2_unique_nonblank_lines
+}
+
+_v2_unexpected_root_dirty_paths_before_merge() {
+    local -a whitelist_globs=()
+    local path=""
+
+    _merge_cost_csvs || true
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        whitelist_globs+=("$path")
+    done < <(_v2_merge_expected_root_dirty_globs)
+
+    _v2_root_dirty_paths | while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if ! _v2_path_matches_any_glob "$path" "${whitelist_globs[@]}"; then
+            printf '%s\n' "$path"
+        fi
+    done | _v2_unique_nonblank_lines
+}
+
+_v2_execution_worktree_read_path_for() {
+    local path="$1"
+    local worktree_path=""
+
+    worktree_path=$(_v2_execution_worktree_path_for "$path" 2>/dev/null || true)
+    if [[ -n "$worktree_path" && -f "$worktree_path" ]]; then
+        printf '%s\n' "$worktree_path"
+    else
+        printf '%s\n' "$path"
+    fi
+}
+
 _v2_merge_execution_worktree() {
+    local -a post_merge_sync_targets=("$@")
+    local merge_lock_fd=""
+    local merge_lock_file=""
+    local merge_lock_timeout=""
+    local unexpected_dirty_paths=""
+    local unexpected_dirty_list=""
+    local worktree_head=""
+    local target_head=""
+    local target_ref=""
+    local saved_target_head=""
+
     [[ -n "$_V2_EXEC_WORKTREE_PATH" ]] || return 0
 
     cd "$SCRIPT_DIR"
     _V2_LAST_MERGE_RECOVERABLE=false
 
+    if [[ -z "${_CURRENT_TASK_FILE:-}" ]]; then
+        echo "ERROR: cannot run merge preflight without _CURRENT_TASK_FILE set to the active task file." >&2
+        return 1
+    fi
+    if [[ ! -f "$_CURRENT_TASK_FILE" ]]; then
+        echo "ERROR: cannot run merge preflight because _CURRENT_TASK_FILE is missing: ${_CURRENT_TASK_FILE}" >&2
+        return 1
+    fi
+
     _v2_commit_execution_worktree_pending_changes || return 1
 
-    # Check if the worktree branch has any commits beyond our starting point
-    local worktree_head=""
     worktree_head=$(git -C "$_V2_EXEC_WORKTREE_PATH" rev-parse HEAD 2>/dev/null || true)
-    local target_head=""
-    target_head=$(git rev-parse "${_V2_EXEC_TARGET_REF:-HEAD}" 2>/dev/null || true)
+    target_ref="${_V2_EXEC_TARGET_REF:-HEAD}"
+    saved_target_head="${_V2_EXEC_TARGET_HEAD_SHA:-}"
+
+    merge_lock_file=$(_v2_merge_lock_file)
+    merge_lock_timeout=$(_v2_merge_lock_timeout_seconds)
+    _v2_acquire_global_merge_lock merge_lock_fd "$merge_lock_file" "$merge_lock_timeout" || return 1
+
+    unexpected_dirty_paths=$(_v2_unexpected_root_dirty_paths_before_merge)
+    unexpected_dirty_paths=$(_v2_filter_out_paths_from_list "$unexpected_dirty_paths" "${_V2_EXEC_PREEXISTING_ROOT_DIRTY:-}")
+    if [[ -n "$unexpected_dirty_paths" ]]; then
+        unexpected_dirty_list=$(printf '%s\n' "$unexpected_dirty_paths" | paste -sd ',' -)
+        echo "ERROR: unexpected dirty files in root checkout before merge: ${unexpected_dirty_list}. This indicates a pre-merge sync that should be deferred to post-merge." >&2
+        if _v2_has_recoverable_execution_commit "$saved_target_head" "$worktree_head"; then
+            echo -e "${YELLOW}Dirty-root merge preflight blocked merge-back; preserving recoverable execution worktree state${NC}" >&2
+            _v2_preserve_recoverable_merge_failure "$_V2_EXEC_WORKTREE_PATH" "$_V2_EXEC_WORKTREE_BRANCH" "$worktree_head"
+        fi
+        _v2_release_merge_lock_fd "$merge_lock_fd"
+        return 1
+    fi
+
+    target_head=$(git rev-parse "$target_ref" 2>/dev/null || true)
     [[ -n "$target_head" ]] || target_head=$(git rev-parse HEAD 2>/dev/null || true)
+
+    if [[ -n "$saved_target_head" && -n "$target_head" && "$saved_target_head" != "$target_head" ]]; then
+        _v2_log_execution_target_drift "$target_ref" "$saved_target_head" "$target_head"
+        if [[ -n "$worktree_head" && "$worktree_head" != "$saved_target_head" ]]; then
+            if ! _v2_rebase_execution_worktree_onto_target "$_V2_EXEC_WORKTREE_PATH" "$_V2_EXEC_WORKTREE_BRANCH" "$saved_target_head" "$target_head"; then
+                worktree_head=$(git -C "$_V2_EXEC_WORKTREE_PATH" rev-parse HEAD 2>/dev/null || true)
+                if _v2_has_recoverable_execution_commit "$saved_target_head" "$worktree_head"; then
+                    _v2_preserve_recoverable_merge_failure "$_V2_EXEC_WORKTREE_PATH" "$_V2_EXEC_WORKTREE_BRANCH" "$worktree_head"
+                fi
+                _v2_release_merge_lock_fd "$merge_lock_fd"
+                return 1
+            fi
+            worktree_head=$(git -C "$_V2_EXEC_WORKTREE_PATH" rev-parse HEAD 2>/dev/null || true)
+        fi
+    fi
 
     if [[ -n "$worktree_head" && "$worktree_head" != "$target_head" ]]; then
         git merge --no-edit "$_V2_EXEC_WORKTREE_BRANCH" || {
-            if _v2_has_recoverable_execution_commit "${_V2_EXEC_TARGET_HEAD_SHA:-}" "$worktree_head"; then
+            if _v2_has_recoverable_execution_commit "$saved_target_head" "$worktree_head"; then
                 _v2_preserve_recoverable_merge_failure "$_V2_EXEC_WORKTREE_PATH" "$_V2_EXEC_WORKTREE_BRANCH" "$worktree_head"
             else
                 git merge --abort >/dev/null 2>&1 || true
             fi
+            _v2_release_merge_lock_fd "$merge_lock_fd"
             return 1
         }
     fi
 
+    if [[ "${#post_merge_sync_targets[@]}" -gt 0 ]]; then
+        _v2_sync_execution_worktree_files "${post_merge_sync_targets[@]}" || {
+            echo -e "${RED}Failed to sync post-merge execution artifacts from worktree${NC}" >&2
+            _v2_release_merge_lock_fd "$merge_lock_fd"
+            return 1
+        }
+    fi
+
+    _v2_release_merge_lock_fd "$merge_lock_fd"
     _v2_cleanup_execution_worktree
 }
 
@@ -1734,6 +2003,7 @@ _v2_cleanup_execution_worktree() {
     _V2_EXEC_WORKTREE_BRANCH=""
     _V2_EXEC_TARGET_REF=""
     _V2_EXEC_TARGET_HEAD_SHA=""
+    _V2_EXEC_PREEXISTING_ROOT_DIRTY=""
     _V2_LAST_MERGE_RECOVERABLE=false
 
     # Ensure we're not inside the worktree being removed
@@ -1877,6 +2147,24 @@ _v2_sync_execution_worktree_files() {
     done
 }
 
+_v2_finalize_halt_without_merge() {
+    local sync_rc=0
+
+    [[ -n "$_V2_EXEC_WORKTREE_PATH" ]] || return 0
+
+    _v2_save_worktree_diff || true
+
+    if [[ "$#" -gt 0 ]]; then
+        _v2_sync_execution_worktree_files "$@" || sync_rc=$?
+        if [[ "$sync_rc" -ne 0 ]]; then
+            echo -e "${YELLOW}WARN: Failed to sync halt artifacts from execution worktree${NC}" >&2
+        fi
+    fi
+
+    _v2_cleanup_execution_worktree || true
+    return "$sync_rc"
+}
+
 _phase7_handoff_poll_interval_seconds() {
     printf '%s\n' "${LAUREN_LOOP_PHASE7_HANDOFF_POLL_INTERVAL_SEC:-30}"
 }
@@ -1910,9 +2198,12 @@ _phase7_normalize_status_token() {
 
 _phase7_read_sidecar_status() {
     local artifact="$1"
-    local sidecar="${artifact%.*}.contract.json"
+    local artifact_path=""
+    local sidecar=""
     local raw=""
 
+    artifact_path=$(_v2_execution_worktree_read_path_for "$artifact")
+    sidecar="${artifact_path%.*}.contract.json"
     [[ -f "$sidecar" ]] || return 0
 
     if command -v jq >/dev/null 2>&1; then
@@ -1928,6 +2219,7 @@ _phase7_read_sidecar_status() {
 
 _phase7_read_status_signal() {
     local artifact="$1"
+    local artifact_path=""
     local status=""
 
     status=$(_phase7_read_sidecar_status "$artifact")
@@ -1936,7 +2228,8 @@ _phase7_read_status_signal() {
         return 0
     fi
 
-    _parse_contract "$artifact" "status"
+    artifact_path=$(_v2_execution_worktree_read_path_for "$artifact")
+    _parse_contract "$artifact_path" "status"
 }
 
 _phase7_sync_fix_execution_artifacts() {
@@ -1954,25 +2247,59 @@ _phase7_poll_fix_execution_handoff() {
     : > "$result_file"
 
     while kill -0 "$fix_executor_pid" 2>/dev/null; do
-        if _phase7_sync_fix_execution_artifacts "$comp_dir"; then
-            terminal_status=$(_phase7_read_sidecar_status "$artifact")
-            case "$terminal_status" in
-                COMPLETE|FAILED)
-                    printf '%s\n' "$terminal_status" > "$result_file"
-                    if [[ -n "$log_file" ]]; then
-                        printf '[phase7-handoff] synced status=%s -> terminating fix executor pid=%s\n' \
-                            "$terminal_status" "$fix_executor_pid" >> "$log_file"
-                    fi
-                    _terminate_pid_tree "$fix_executor_pid" "$(_phase7_handoff_grace_seconds)"
-                    return 0
-                    ;;
-            esac
-        elif [[ -n "$log_file" ]]; then
-            printf '[phase7-handoff] WARN: failed to sync fix execution artifacts\n' >> "$log_file"
-        fi
+        terminal_status=$(_phase7_read_sidecar_status "$artifact")
+        case "$terminal_status" in
+            COMPLETE|FAILED)
+                printf '%s\n' "$terminal_status" > "$result_file"
+                if [[ -n "$log_file" ]]; then
+                    printf '[phase7-handoff] worktree status=%s -> terminating fix executor pid=%s\n' \
+                        "$terminal_status" "$fix_executor_pid" >> "$log_file"
+                fi
+                _terminate_pid_tree "$fix_executor_pid" "$(_phase7_handoff_grace_seconds)"
+                return 0
+                ;;
+        esac
 
         sleep "$poll_interval"
     done
+}
+
+_mark_fix_execution_handoff() {
+    local fix_execution_file="${1:-${comp_dir}/fix-execution.md}"
+    local handoff_file="${comp_dir}/human-review-handoff.md"
+
+    if [[ ! -f "$fix_execution_file" ]]; then
+        return 0
+    fi
+
+    if grep -q '^## Final Status' "$fix_execution_file"; then
+        if grep -q '^\*\*STATUS:\*\* ' "$fix_execution_file"; then
+            _sed_i 's/^\*\*STATUS:\*\* .*/**STATUS:** BLOCKED/' "$fix_execution_file" || return 1
+        else
+            printf '\n**STATUS:** BLOCKED\n' >> "$fix_execution_file"
+        fi
+
+        if grep -q '^\*\*Remaining findings:\*\* ' "$fix_execution_file"; then
+            _sed_i "s|^\*\*Remaining findings:\*\* .*|**Remaining findings:** See ${comp_dir}/review-synthesis.md and ${handoff_file}.|" "$fix_execution_file" || return 1
+        else
+            printf '**Remaining findings:** See %s and %s.\n' "${comp_dir}/review-synthesis.md" "$handoff_file" >> "$fix_execution_file"
+        fi
+
+        if grep -q '^\*\*Follow-up:\*\* ' "$fix_execution_file"; then
+            _sed_i "s|^\*\*Follow-up:\*\* .*|**Follow-up:** Human review required before any further fix planning or task closeout. See ${handoff_file}.|" "$fix_execution_file" || return 1
+        else
+            printf '**Follow-up:** Human review required before any further fix planning or task closeout. See %s.\n' "$handoff_file" >> "$fix_execution_file"
+        fi
+    else
+        cat >> "$fix_execution_file" <<EOF
+
+## Final Status
+
+**STATUS:** BLOCKED
+**Remaining findings:** See ${comp_dir}/review-synthesis.md and ${handoff_file}.
+**Follow-up:** Human review required before any further fix planning or task closeout. See ${handoff_file}.
+EOF
+    fi
 }
 
 _v2_file_size_bytes() {
@@ -2062,28 +2389,19 @@ _list_active_job_pids() {
 }
 _terminate_active_jobs() {
     stop_agent_monitor || true
-    local active_jobs
-    active_jobs=$(_list_active_job_pids)
-    [[ -n "$active_jobs" ]] || return 0
+    local active_jobs=()
+    local p=""
 
-    local p
-    for p in $active_jobs; do
-        if kill -0 "$p" 2>/dev/null; then
-            pkill -P "$p" 2>/dev/null || true
-            kill "$p" 2>/dev/null || true
-        fi
-    done
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        active_jobs[${#active_jobs[@]}]="$p"
+    done < <(_list_active_job_pids)
 
-    sleep 1
+    [[ ${#active_jobs[@]} -gt 0 ]] || return 0
 
-    for p in $active_jobs; do
-        if kill -0 "$p" 2>/dev/null; then
-            pkill -P "$p" 2>/dev/null || true
-            kill -9 "$p" 2>/dev/null || true
-        fi
-    done
+    _terminate_pid_tree_set "$(_active_job_terminate_grace_seconds)" "${active_jobs[@]}" || true
 
-    for p in $active_jobs; do
+    for p in "${active_jobs[@]}"; do
         wait "$p" 2>/dev/null || true
     done
 }
@@ -3375,6 +3693,171 @@ extract_markdown_section_to_file() {
     mv "$tmp_file" "$output_file"
 }
 
+_list_markdown_headings_outside_fences() {
+    local source_file="$1"
+    awk '
+        function ltrim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            return value
+        }
+        BEGIN { in_fence=0 }
+        {
+            line = $0
+            stripped = ltrim(line)
+            if (stripped ~ /^```/) {
+                in_fence = !in_fence
+                next
+            }
+            if (!in_fence && stripped ~ /^#{1,6}[[:space:]]+/) {
+                printf "%d:%s\n", NR, stripped
+            }
+        }
+    ' "$source_file"
+}
+
+_selected_plan_heading_line() {
+    local source_file="$1"
+    awk '
+        function ltrim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            return value
+        }
+        function rtrim(value) {
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        function heading_level(line, stripped) {
+            stripped = ltrim(line)
+            if (stripped ~ /^#{1,6}[[:space:]]+/) {
+                match(stripped, /^#+/)
+                return RLENGTH
+            }
+            return 0
+        }
+        function heading_text(line, stripped) {
+            stripped = ltrim(line)
+            sub(/^#{1,6}[[:space:]]+/, "", stripped)
+            return rtrim(stripped)
+        }
+        BEGIN { in_fence=0; found=0 }
+        {
+            line = $0
+            stripped = ltrim(line)
+            is_fence = (stripped ~ /^```/)
+            if (!in_fence) {
+                level = heading_level(line)
+                if (level >= 2 && level <= 3 && tolower(heading_text(line)) == "selected plan") {
+                    print NR
+                    found = 1
+                    exit 0
+                }
+            }
+            if (is_fence) {
+                in_fence = !in_fence
+            }
+        }
+        END {
+            if (!found) {
+                exit 1
+            }
+        }
+    ' "$source_file"
+}
+
+_selected_plan_extraction_diagnostics() {
+    local source_file="$1"
+    local matched_line=""
+    local headings=""
+
+    matched_line=$(_selected_plan_heading_line "$source_file" 2>/dev/null || true)
+    headings=$(_list_markdown_headings_outside_fences "$source_file" 2>/dev/null || true)
+
+    printf 'matched Selected Plan heading line: %s\n' "${matched_line:-none}"
+    printf 'all headings in %s:\n' "$(basename "$source_file")"
+    if [[ -n "$headings" ]]; then
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            printf 'heading: %s\n' "$line"
+        done <<< "$headings"
+    else
+        printf 'heading: (none)\n'
+    fi
+}
+
+_extract_selected_plan_to_file() {
+    local source_file="$1" output_file="$2"
+    local tmp_file
+    tmp_file=$(mktemp)
+
+    awk '
+        function ltrim(value) {
+            sub(/^[[:space:]]+/, "", value)
+            return value
+        }
+        function rtrim(value) {
+            sub(/[[:space:]]+$/, "", value)
+            return value
+        }
+        function heading_level(line, stripped) {
+            stripped = ltrim(line)
+            if (stripped ~ /^#{1,6}[[:space:]]+/) {
+                match(stripped, /^#+/)
+                return RLENGTH
+            }
+            return 0
+        }
+        function heading_text(line, stripped) {
+            stripped = ltrim(line)
+            sub(/^#{1,6}[[:space:]]+/, "", stripped)
+            return rtrim(stripped)
+        }
+        BEGIN {
+            in_fence = 0
+            matched = 0
+            matched_level = 0
+            saw_body = 0
+        }
+        {
+            line = $0
+            stripped = ltrim(line)
+            is_fence = (stripped ~ /^```/)
+
+            if (!in_fence) {
+                level = heading_level(line)
+                if (!matched && level >= 2 && level <= 3 && tolower(heading_text(line)) == "selected plan") {
+                    matched = 1
+                    matched_level = level
+                    next
+                }
+                if (matched && level > 0 && level <= matched_level) {
+                    exit 0
+                }
+            }
+
+            if (matched) {
+                print line
+                if (line ~ /[^[:space:]]/) {
+                    saw_body = 1
+                }
+            }
+
+            if (is_fence) {
+                in_fence = !in_fence
+            }
+        }
+        END {
+            if (!matched || !saw_body) {
+                exit 1
+            }
+        }
+    ' "$source_file" > "$tmp_file" || {
+        rm -f "$tmp_file"
+        return 1
+    }
+
+    mv "$tmp_file" "$output_file"
+}
+
 clear_markdown_section() {
     local target_file="$1" header="$2"
     local blank_file
@@ -3515,15 +3998,69 @@ _v2_is_untracked_path() {
 
 _v2_is_pipeline_owned_phase4_noise() {
     local path="$1"
+    local task_file="${_CURRENT_TASK_FILE:-}"
+    local task_dir=""
+    local task_file_rel=""
+    local task_dir_rel=""
+
+    if [[ -n "$task_file" ]]; then
+        task_file_rel=$(_v2_main_repo_relative_path "$task_file" 2>/dev/null || true)
+        task_dir=$(_v2_task_dir_for_task_file "$task_file" 2>/dev/null || true)
+        task_dir_rel=$(_v2_main_repo_relative_path "$task_dir" 2>/dev/null || true)
+    fi
+
     case "$path" in
-        "docs/tasks/open/${SLUG}/task.md"|\
-        "docs/tasks/open/${SLUG}/competitive/"*|\
-        "docs/tasks/open/${SLUG}/logs/"*|\
         ".lauren-loop-runtime/${SLUG}/"*)
             return 0
             ;;
     esac
+
+    if [[ -n "$task_file_rel" && "$path" == "$task_file_rel" ]]; then
+        return 0
+    fi
+
+    if [[ -n "$task_dir_rel" ]]; then
+        case "$path" in
+            "${task_dir_rel}/competitive/"*|\
+            "${task_dir_rel}/logs/"*)
+                return 0
+                ;;
+        esac
+    fi
+
+    case "$path" in
+        "docs/tasks/open/${SLUG}/task.md"|\
+        "docs/tasks/open/${SLUG}/competitive/"*|\
+        "docs/tasks/open/${SLUG}/logs/"*)
+            return 0
+            ;;
+    esac
+
     return 1
+}
+
+_v2_filter_pipeline_owned_task_artifact_paths() {
+    local source_paths="$1"
+    local path=""
+
+    [[ -n "$source_paths" ]] || return 0
+
+    while IFS= read -r path; do
+        [[ -n "$path" ]] || continue
+        if _v2_is_pipeline_owned_phase4_noise "$path"; then
+            printf '%s\n' "$path"
+        fi
+    done <<< "$source_paths" | _v2_unique_nonblank_lines
+}
+
+_v2_capture_preexisting_pipeline_owned_root_dirty() {
+    local current_dirty="${1:-}"
+
+    if [[ -z "$current_dirty" ]]; then
+        current_dirty=$(_v2_snapshot_dirty_files)
+    fi
+
+    _V2_EXEC_PREEXISTING_ROOT_DIRTY=$(_v2_filter_pipeline_owned_task_artifact_paths "$current_dirty")
 }
 
 _v2_collect_out_of_scope_untracked_paths_for_triage() {
@@ -4560,44 +5097,6 @@ lauren_loop_competitive() {
         grep -Eqi 'WARN: Codex (capacity|stream) failure .*retrying' "$role_log"
     }
 
-    _mark_fix_execution_handoff() {
-        local handoff_file="${comp_dir}/human-review-handoff.md"
-        local fix_execution_file="${comp_dir}/fix-execution.md"
-
-        if [[ ! -f "$fix_execution_file" ]]; then
-            return 0
-        fi
-
-        if grep -q '^## Final Status' "$fix_execution_file"; then
-            if grep -q '^\*\*STATUS:\*\* ' "$fix_execution_file"; then
-                _sed_i 's/^\*\*STATUS:\*\* .*/**STATUS:** BLOCKED/' "$fix_execution_file" || return 1
-            else
-                printf '\n**STATUS:** BLOCKED\n' >> "$fix_execution_file"
-            fi
-
-            if grep -q '^\*\*Remaining findings:\*\* ' "$fix_execution_file"; then
-                _sed_i "s|^\*\*Remaining findings:\*\* .*|**Remaining findings:** See ${comp_dir}/review-synthesis.md and ${handoff_file}.|" "$fix_execution_file" || return 1
-            else
-                printf '**Remaining findings:** See %s and %s.\n' "${comp_dir}/review-synthesis.md" "$handoff_file" >> "$fix_execution_file"
-            fi
-
-            if grep -q '^\*\*Follow-up:\*\* ' "$fix_execution_file"; then
-                _sed_i "s|^\*\*Follow-up:\*\* .*|**Follow-up:** Human review required before any further fix planning or task closeout. See ${handoff_file}.|" "$fix_execution_file" || return 1
-            else
-                printf '**Follow-up:** Human review required before any further fix planning or task closeout. See %s.\n' "$handoff_file" >> "$fix_execution_file"
-            fi
-        else
-            cat >> "$fix_execution_file" <<EOF
-
-## Final Status
-
-**STATUS:** BLOCKED
-**Remaining findings:** See ${comp_dir}/review-synthesis.md and ${handoff_file}.
-**Follow-up:** Human review required before any further fix planning or task closeout. See ${handoff_file}.
-EOF
-        fi
-    }
-
     _fail_phase() {
         local phase_status="$1" error_message="$2" recovery_hint="${3:-}" error_class="${4:-unknown}" error_detail="${5:-}"
         local task_log_dir="${TASK_LOG_DIR:-${_CURRENT_TASK_LOG_DIR:-}}"
@@ -5309,13 +5808,11 @@ Do NOT modify the task file."
                 fi
             fi
 
-            if ! extract_markdown_section_to_file "${comp_dir}/plan-evaluation.md" "## Selected Plan" "${comp_dir}/revised-plan.md"; then
-                grep -i 'selected.plan' "${comp_dir}/plan-evaluation.md" | head -5 | while IFS= read -r _line; do
-                    log_execution "$task_file" "  diagnostic: found heading: $_line"
-                done
+            if ! _extract_selected_plan_to_file "${comp_dir}/plan-evaluation.md" "${comp_dir}/revised-plan.md"; then
+                _log_diagnostic_lines "$task_file" "$(_selected_plan_extraction_diagnostics "${comp_dir}/plan-evaluation.md")"
                 _fail_phase \
                     "evaluating" \
-                    "Phase 3: Evaluator failed to produce ## Selected Plan" \
+                    "Phase 3: Evaluator failed to produce ## Selected Plan (case-insensitive, level 2-3)" \
                     "Check ${comp_dir}/plan-evaluation.md and ${log_dir}/evaluator.log, then retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
                     "invalid_artifact" \
                     "artifact=${comp_dir}/plan-evaluation.md; section=## Selected Plan; state=missing_or_empty" || true
@@ -5427,6 +5924,7 @@ Do NOT modify the task file."
                 "unknown" "step=_v2_create_execution_worktree"
             return 1
         }
+        _v2_capture_preexisting_pipeline_owned_root_dirty "$pre_exec_dirty"
         _v2_stage_execution_runtime_task_file "$task_file" || {
             _fail_phase "executing" "Failed to stage runtime task file into worktree" "Check worktree path permissions and task artifacts, then retry" \
                 "unknown" "artifact=${task_file}; step=_v2_stage_execution_runtime_task_file"
@@ -5512,6 +6010,7 @@ All repo file reads and writes must stay inside the current working directory. D
         local pre_exec_timeout_blocks=0
         local post_exec_timeout_blocks=0
         local exec_timeout_block_line=""
+        local exec_log_read_path=""
         pre_exec_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/execution-log.md")
         touch "${log_dir}/executor.log"
         start_agent_monitor "${log_dir}/executor.log" "$task_file"
@@ -5522,26 +6021,21 @@ All repo file reads and writes must stay inside the current working directory. D
         if [[ "$_effective_executor_engine" == "codex" ]]; then
             _v2_record_codex_outcome "$_effective_executor_engine" "$exit_exec"
         fi
-        _v2_sync_execution_worktree_files "${comp_dir}/execution-log.md" || {
-            _fail_phase "executing" "Failed to sync execution log from worktree" "Inspect worktree task artifacts, then retry" \
-                "unknown" "artifact=${comp_dir}/execution-log.md; step=_v2_sync_execution_worktree_files"
-            _v2_save_worktree_diff || true
-            _v2_cleanup_execution_worktree || true
-            return 1
-        }
-        post_exec_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/execution-log.md")
-        post_exec_log_bytes=$(_v2_file_size_bytes "${comp_dir}/execution-log.md")
+        exec_log_read_path=$(_v2_execution_worktree_read_path_for "${comp_dir}/execution-log.md")
+        post_exec_timeout_blocks=$(_timeout_block_count_in_file "$exec_log_read_path")
+        post_exec_log_bytes=$(_v2_file_size_bytes "$exec_log_read_path")
         if [[ "${post_exec_log_bytes:-0}" -gt "${pre_exec_log_bytes:-0}" ]]; then
             exec_log_activity="true"
         fi
         if [[ "${post_exec_timeout_blocks:-0}" -gt "${pre_exec_timeout_blocks:-0}" ]]; then
-            exec_timeout_block_line=$(_latest_timeout_block_line "${comp_dir}/execution-log.md" || true)
+            exec_timeout_block_line=$(_latest_timeout_block_line "$exec_log_read_path" || true)
             echo -e "${YELLOW}$(_verification_timeout_message)${NC}"
             log_execution "$task_file" "Phase 4: $(_verification_timeout_message)"
             set_task_status "$task_file" "blocked"
             if [[ -n "$exec_timeout_block_line" ]]; then
                 echo "  Reason: $exec_timeout_block_line"
             fi
+            _v2_sync_execution_worktree_files "${comp_dir}/execution-log.md" || true
             _print_cost_summary
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
@@ -5563,6 +6057,7 @@ All repo file reads and writes must stay inside the current working directory. D
                 "Check agent log at ${log_dir}/executor.log. Retry: bash lauren-loop-v2.sh ${SLUG} '${goal}'" \
                 "$exec_error_class" \
                 "role=executor; engine=${_effective_executor_engine}; exit_code=${exit_exec}; log=${log_dir}/executor.log" || true
+            _v2_sync_execution_worktree_files "${comp_dir}/execution-log.md" || true
             _print_cost_summary
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
@@ -5578,7 +6073,7 @@ All repo file reads and writes must stay inside the current working directory. D
         if git diff --quiet 2>/dev/null && git diff --cached --quiet 2>/dev/null && [[ -z "${_V2_LAST_CAPTURE_UNTRACKED_FILES:-}" ]]; then
             local phase4_worktree_error_message=""
             local phase4_worktree_error_detail=""
-            _log_diagnostic_lines "$task_file" "$(_v2_phase_execution_diagnostic_lines "$exec_log_activity" "${comp_dir}/execution-log.md" "$baseline_diff")"
+            _log_diagnostic_lines "$task_file" "$(_v2_phase_execution_diagnostic_lines "$exec_log_activity" "$exec_log_read_path" "$baseline_diff")"
             if [[ "$exec_log_activity" == "true" ]]; then
                 echo -e "${RED}Execution activity detected but execution worktree is clean${NC}"
                 log_execution "$task_file" "Phase 4: Execution activity detected but execution worktree is clean — suspected out-of-worktree write or non-persisted executor change"
@@ -5596,6 +6091,7 @@ All repo file reads and writes must stay inside the current working directory. D
                 "Inspect ${comp_dir}/execution-log.md and ${comp_dir}/revised-plan.md, then retry after keeping executor writes inside the execution worktree" \
                 "scope_violation" \
                 "$phase4_worktree_error_detail" || true
+            _v2_sync_execution_worktree_files "${comp_dir}/execution-log.md" || true
             _print_cost_summary
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
@@ -5625,7 +6121,7 @@ All repo file reads and writes must stay inside the current working directory. D
         cd "$SCRIPT_DIR"
         local phase4_merge_branch=""
         phase4_merge_branch=$(_v2_execution_merge_branch_label)
-        _v2_merge_execution_worktree || {
+        _v2_merge_execution_worktree "${comp_dir}/execution-log.md" || {
             _fail_phase "executing" "Failed to merge execution worktree" "Check for merge conflicts; resolve manually then retry" \
                 "merge_failure" "phase=phase-4; step=_v2_merge_execution_worktree; branch=${phase4_merge_branch}"
             _v2_cleanup_after_failed_merge true
@@ -6621,6 +7117,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
                 "unknown" "step=_v2_create_execution_worktree"
             return 1
         }
+        _v2_capture_preexisting_pipeline_owned_root_dirty "$pre_fix_dirty"
         _v2_stage_execution_runtime_task_file "$task_file" || {
             _fail_phase "executing-fixes" "Failed to stage runtime task file into worktree" "Check worktree path permissions and task artifacts, then retry" \
                 "unknown" "artifact=${task_file}; step=_v2_stage_execution_runtime_task_file"
@@ -6655,6 +7152,8 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local pre_fix_execution_bytes=0
         local post_fix_execution_bytes=0
         local fix_execution_activity="false"
+        local fix_execution_worktree_path=""
+        local fix_execution_contract_worktree_path=""
         pre_fix_execution_bytes=$(_v2_file_size_bytes "${comp_dir}/fix-execution.md")
         fix_task_rel=$(_v2_execution_runtime_task_rel_path)
         fix_review_rel=$(_v2_main_repo_relative_path "${comp_dir}/review-synthesis.md") || {
@@ -6674,6 +7173,20 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         fix_execution_rel=$(_v2_main_repo_relative_path "${comp_dir}/fix-execution.md") || {
             _fail_phase "executing-fixes" "Failed to resolve worktree-local fix execution path" "Check fix artifact location, then retry" \
                 "unknown" "artifact=${comp_dir}/fix-execution.md; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        fix_execution_worktree_path=$(_v2_execution_worktree_path_for "${comp_dir}/fix-execution.md") || {
+            _fail_phase "executing-fixes" "Failed to resolve worktree-local fix execution path" "Check fix artifact location, then retry" \
+                "unknown" "artifact=${comp_dir}/fix-execution.md; step=_v2_execution_worktree_path_for"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        fix_execution_contract_worktree_path=$(_v2_execution_worktree_path_for "${comp_dir}/fix-execution.contract.json") || {
+            _fail_phase "executing-fixes" "Failed to resolve worktree-local fix execution contract path" "Check fix artifact location, then retry" \
+                "unknown" "artifact=${comp_dir}/fix-execution.contract.json; step=_v2_execution_worktree_path_for"
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
@@ -6703,6 +7216,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         local phase7_handoff_status_file=""
         local phase7_handoff_status=""
         local phase7_handoff_poll_pid=""
+        local fix_execution_read_path=""
         rm -f "${comp_dir}/fix-execution.contract.json"
         pre_fix_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/fix-execution.md")
         touch "${log_dir}/${fix_executor_role}.log"
@@ -6735,23 +7249,16 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         if [[ "$_effective_fix_executor_engine" == "codex" ]]; then
             _v2_record_codex_outcome "$_effective_fix_executor_engine" "$exit_fix_exec"
         fi
-        _phase7_sync_fix_execution_artifacts "$comp_dir" || {
-            rm -f "$phase7_handoff_status_file"
-            _fail_phase "executing-fixes" "Failed to sync fix execution artifacts from worktree" "Inspect worktree fix artifacts, then retry" \
-                "unknown" "artifact=${comp_dir}/fix-execution.md; step=_phase7_sync_fix_execution_artifacts"
-            _v2_save_worktree_diff || true
-            _v2_cleanup_execution_worktree || true
-            return 1
-        }
         rm -f "$phase7_handoff_status_file"
-        post_fix_timeout_blocks=$(_timeout_block_count_in_file "${comp_dir}/fix-execution.md")
-        post_fix_execution_bytes=$(_v2_file_size_bytes "${comp_dir}/fix-execution.md")
+        fix_execution_read_path=$(_v2_execution_worktree_read_path_for "${comp_dir}/fix-execution.md")
+        post_fix_timeout_blocks=$(_timeout_block_count_in_file "$fix_execution_read_path")
+        post_fix_execution_bytes=$(_v2_file_size_bytes "$fix_execution_read_path")
         if [[ "${post_fix_execution_bytes:-0}" -gt "${pre_fix_execution_bytes:-0}" ]]; then
             fix_execution_activity="true"
         fi
         if [[ "${post_fix_timeout_blocks:-0}" -gt "${pre_fix_timeout_blocks:-0}" ]]; then
             fix_timeout_block_detected=true
-            printf '{"status":"BLOCKED"}\n' > "${comp_dir}/fix-execution.contract.json"
+            printf '{"status":"BLOCKED"}\n' > "$fix_execution_contract_worktree_path"
             echo -e "${YELLOW}$(_verification_timeout_message)${NC}"
             log_execution "$task_file" "Phase 7: $(_verification_timeout_message)"
         fi
@@ -6774,6 +7281,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
                 "Check ${comp_dir}/fix-execution.md and fix-execution.contract.json, then retry" \
                 "invalid_artifact" \
                 "artifact=${comp_dir}/fix-execution.contract.json; field=status; value=${fix_exec_status:-empty}" || true
+            _phase7_sync_fix_execution_artifacts "$comp_dir" || true
             _print_cost_summary
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
@@ -6793,18 +7301,10 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             set_task_status "$task_file" "needs verification"
             log_execution "$task_file" "Phase 7: Fix executor STATUS: BLOCKED — human review required"
             _write_human_review_handoff "BLOCKED" "$((fix_cycle + 1))" || true
-            _mark_fix_execution_handoff || true
-            # Merge partial work back for human review
+            _mark_fix_execution_handoff "$fix_execution_worktree_path" || true
+            # Sync human-facing artifacts back for human review without merging partial code.
             cd "$SCRIPT_DIR"
-            _v2_save_worktree_diff || true
-            if ! _v2_merge_execution_worktree 2>/dev/null; then
-                if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then
-                    phase7_blocked_recovery_json=$(_v2_recovery_manifest_json)
-                    _v2_log_recovery_details "$task_file"
-                else
-                    _v2_cleanup_after_failed_merge false
-                fi
-            fi
+            _v2_finalize_halt_without_merge "${comp_dir}/fix-execution.md" "${comp_dir}/fix-execution.contract.json" || true
             # TODO: refine error_class when non-timeout Phase 7 BLOCKED signals split into stable categories.
             _append_manifest_phase \
                 "${_FAIL_PHASE_PHASE_ID:-phase-7}" \
@@ -6828,6 +7328,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
                 "Check ${comp_dir}/fix-execution.md and fix-execution.contract.json, then retry" \
                 "invalid_artifact" \
                 "status_signal=FAILED; handoff_status=${phase7_handoff_status:-none}" || true
+            _phase7_sync_fix_execution_artifacts "$comp_dir" || true
             _print_cost_summary
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
@@ -6836,7 +7337,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
 
         if [[ "$phase7_handoff_status" == "COMPLETE" ]]; then
             exit_fix_exec=0
-            log_execution "$task_file" "Phase 7: Early handoff detected from synced fix-execution.contract.json (STATUS: COMPLETE)"
+            log_execution "$task_file" "Phase 7: Early handoff detected from worktree fix-execution.contract.json (STATUS: COMPLETE)"
         fi
 
         if [[ "$exit_fix_exec" -ne 0 ]]; then
@@ -6854,6 +7355,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
                 "Check ${log_dir}/${fix_executor_role}.log and retry the fix execution step" \
                 "$fix_exec_error_class" \
                 "role=${fix_executor_role}; engine=${_effective_fix_executor_engine}; exit_code=${exit_fix_exec}; log=${log_dir}/${fix_executor_role}.log" || true
+            _phase7_sync_fix_execution_artifacts "$comp_dir" || true
             _print_cost_summary
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
@@ -6883,7 +7385,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
             "$((fix_cycle + 1))"
         _v2_log_capture_scope_details "$task_file" "Phase 7"
         if [[ ! -s "$latest_fix_diff" ]]; then
-            _log_diagnostic_lines "$task_file" "$(_v2_phase_execution_diagnostic_lines "$fix_execution_activity" "${comp_dir}/fix-execution.md" "$latest_fix_diff")"
+            _log_diagnostic_lines "$task_file" "$(_v2_phase_execution_diagnostic_lines "$fix_execution_activity" "$fix_execution_read_path" "$latest_fix_diff")"
             if _strict_contract_mode; then
                 local phase7_strict_empty_diff_message=""
                 if [[ "$fix_execution_activity" == "true" ]]; then
@@ -6901,6 +7403,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
                     "Inspect ${comp_dir}/fix-execution.md and the phase-7 scope plan, then retry after keeping fix writes in scope" \
                     "scope_violation" \
                     "phase=phase-7; strict_mode=true; activity_detected=${fix_execution_activity}; diff=${latest_fix_diff}" || true
+                _phase7_sync_fix_execution_artifacts "$comp_dir" || true
                 _print_cost_summary
                 _v2_save_worktree_diff || true
                 _v2_cleanup_execution_worktree || true
@@ -6925,16 +7428,9 @@ ${review_inputs}Synthesize only the review files that exist and write the result
                 log_execution "$task_file" "Phase 7: HALTED — fix execution activity detected but execution worktree is clean after cycle $((fix_cycle + 1)). Suspected out-of-worktree write or non-persisted fix change."
                 set_task_status "$task_file" "needs verification"
                 _write_human_review_handoff "BLOCKED" "$((fix_cycle + 1))" || true
-                _mark_fix_execution_handoff || true
+                _mark_fix_execution_handoff "$fix_execution_worktree_path" || true
                 cd "$SCRIPT_DIR"
-                _v2_save_worktree_diff || true
-                if ! _v2_merge_execution_worktree 2>/dev/null; then
-                    if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then
-                        _v2_log_recovery_details "$task_file"
-                    else
-                        _v2_cleanup_after_failed_merge false
-                    fi
-                fi
+                _v2_finalize_halt_without_merge "${comp_dir}/fix-execution.md" "${comp_dir}/fix-execution.contract.json" || true
                 pipeline_finished=true
                 pipeline_human_review_halt=true
                 break
@@ -6957,7 +7453,7 @@ ${review_inputs}Synthesize only the review files that exist and write the result
         cd "$SCRIPT_DIR"
         local phase7_merge_branch=""
         phase7_merge_branch=$(_v2_execution_merge_branch_label)
-        _v2_merge_execution_worktree || {
+        _v2_merge_execution_worktree "${comp_dir}/fix-execution.md" "${comp_dir}/fix-execution.contract.json" || {
             _fail_phase "executing-fixes" "Failed to merge fix execution worktree" "Check for merge conflicts; resolve manually then retry" \
                 "merge_failure" "phase=phase-7; step=_v2_merge_execution_worktree; branch=${phase7_merge_branch}"
             _v2_cleanup_after_failed_merge true
@@ -7357,6 +7853,7 @@ Write the falsification artifact to ${comp_dir}/final-falsify.md and the contrac
                 "unknown" "step=_v2_create_execution_worktree"
             return 1
         }
+        _v2_capture_preexisting_pipeline_owned_root_dirty
         _v2_stage_execution_runtime_task_file "$task_file" || {
             _fail_phase "executing-final-fix" "Failed to stage runtime task file into worktree" "Check worktree path permissions and retry" \
                 "unknown" "artifact=${task_file}; step=_v2_stage_execution_runtime_task_file"
@@ -7391,6 +7888,8 @@ Write the falsification artifact to ${comp_dir}/final-falsify.md and the contrac
         local final_fix_falsify_contract_rel=""
         local final_fix_artifact_rel=""
         local final_fix_contract_rel=""
+        local final_fix_worktree_path=""
+        local final_fix_contract_worktree_path=""
         final_fix_task_rel=$(_v2_main_repo_relative_path "$task_file") || {
             _fail_phase "executing-final-fix" "Failed to resolve worktree-local task path" "Check task artifact location and retry" \
                 "unknown" "artifact=${task_file}; step=_v2_main_repo_relative_path"
@@ -7439,6 +7938,20 @@ Write the falsification artifact to ${comp_dir}/final-falsify.md and the contrac
         final_fix_contract_rel=$(_v2_main_repo_relative_path "${comp_dir}/final-fix.contract.json") || {
             _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-fix contract path" "Check task artifact location and retry" \
                 "unknown" "artifact=${comp_dir}/final-fix.contract.json; step=_v2_main_repo_relative_path"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        final_fix_worktree_path=$(_v2_execution_worktree_path_for "${comp_dir}/final-fix.md") || {
+            _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-fix artifact path" "Check task artifact location and retry" \
+                "unknown" "artifact=${comp_dir}/final-fix.md; step=_v2_execution_worktree_path_for"
+            _v2_save_worktree_diff || true
+            _v2_cleanup_execution_worktree || true
+            return 1
+        }
+        final_fix_contract_worktree_path=$(_v2_execution_worktree_path_for "${comp_dir}/final-fix.contract.json") || {
+            _fail_phase "executing-final-fix" "Failed to resolve worktree-local final-fix contract path" "Check task artifact location and retry" \
+                "unknown" "artifact=${comp_dir}/final-fix.contract.json; step=_v2_execution_worktree_path_for"
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
@@ -7498,6 +8011,7 @@ All repo file reads and writes must stay inside the current working directory. D
                 "Check ${log_dir}/final-fix.log and retry the final-fix step" \
                 "$phase8c_error_class" \
                 "role=${phase8_fix_role}; engine=${_effective_final_fix_engine}; exit_code=${exit_phase8c}; log=${log_dir}/final-fix.log" || true
+            _v2_sync_execution_worktree_files "${comp_dir}/final-fix.md" "${comp_dir}/final-fix.contract.json" || true
             _print_cost_summary
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
@@ -7505,18 +8019,12 @@ All repo file reads and writes must stay inside the current working directory. D
         fi
 
         cd "$SCRIPT_DIR"
-        _v2_sync_execution_worktree_files "${comp_dir}/final-fix.md" "${comp_dir}/final-fix.contract.json" || {
-            _fail_phase "executing-final-fix" "Failed to sync final-fix artifacts from worktree" "Inspect worktree final-fix artifacts and retry" \
-                "unknown" "artifacts=${comp_dir}/final-fix.md,${comp_dir}/final-fix.contract.json; step=_v2_sync_execution_worktree_files"
-            _v2_save_worktree_diff || true
-            _v2_cleanup_execution_worktree || true
-            return 1
-        }
         _require_valid_artifact \
-            "${comp_dir}/final-fix.md" \
+            "$final_fix_worktree_path" \
             "executing-final-fix" \
             "Phase 8c final-fix produced an invalid final-fix artifact" \
             "Check ${comp_dir}/final-fix.md and ${log_dir}/final-fix.log, then retry" || {
+            _v2_sync_execution_worktree_files "${comp_dir}/final-fix.md" "${comp_dir}/final-fix.contract.json" || true
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
             return 1
@@ -7524,8 +8032,8 @@ All repo file reads and writes must stay inside the current working directory. D
 
         local phase8_fix_status=""
         local phase8_requires_reverification=""
-        phase8_fix_status=$(_parse_contract "${comp_dir}/final-fix.md" "status")
-        phase8_requires_reverification=$(_parse_contract "${comp_dir}/final-fix.md" "requires_reverification")
+        phase8_fix_status=$(_parse_contract "$final_fix_worktree_path" "status")
+        phase8_requires_reverification=$(_parse_contract "$final_fix_worktree_path" "requires_reverification")
         if [[ "$phase8_fix_status" != "COMPLETE" && "$phase8_fix_status" != "BLOCKED" ]]; then
             _fail_phase \
                 "executing-final-fix" \
@@ -7533,6 +8041,7 @@ All repo file reads and writes must stay inside the current working directory. D
                 "Check ${comp_dir}/final-fix.md and final-fix.contract.json, then retry" \
                 "invalid_artifact" \
                 "artifact=${comp_dir}/final-fix.contract.json; field=status; value=${phase8_fix_status:-empty}" || true
+            _v2_sync_execution_worktree_files "${comp_dir}/final-fix.md" "${comp_dir}/final-fix.contract.json" || true
             _print_cost_summary
             _v2_save_worktree_diff || true
             _v2_cleanup_execution_worktree || true
@@ -7552,15 +8061,7 @@ All repo file reads and writes must stay inside the current working directory. D
             _write_cycle_state "$comp_dir" "$fix_cycle" "phase-8c" "" "initial" "BLOCKED" || true
             echo -e "${YELLOW}Phase 8c: Final fixer signaled BLOCKED — halting for human review${NC}"
             cd "$SCRIPT_DIR"
-            _v2_save_worktree_diff || true
-            if ! _v2_merge_execution_worktree 2>/dev/null; then
-                if [[ "$_V2_LAST_MERGE_RECOVERABLE" == true ]]; then
-                    phase8c_blocked_recovery_json=$(_v2_recovery_manifest_json)
-                    _v2_log_recovery_details "$task_file"
-                else
-                    _v2_cleanup_after_failed_merge false
-                fi
-            fi
+            _v2_finalize_halt_without_merge "${comp_dir}/final-fix.md" "${comp_dir}/final-fix.contract.json" || true
             _append_manifest_phase \
                 "${_FAIL_PHASE_PHASE_ID:-phase-8c}" \
                 "${_FAIL_PHASE_PHASE_NAME:-final-fix-cycle-$((fix_cycle + 1))}" \
@@ -7589,7 +8090,7 @@ All repo file reads and writes must stay inside the current working directory. D
         cd "$SCRIPT_DIR"
         local phase8c_merge_branch=""
         phase8c_merge_branch=$(_v2_execution_merge_branch_label)
-        _v2_merge_execution_worktree || {
+        _v2_merge_execution_worktree "${comp_dir}/final-fix.md" "${comp_dir}/final-fix.contract.json" || {
             _fail_phase "executing-final-fix" "Failed to merge final-fix execution worktree" "Check for merge conflicts; resolve manually then retry" \
                 "merge_failure" "phase=phase-8c; step=_v2_merge_execution_worktree; branch=${phase8c_merge_branch}"
             _v2_cleanup_after_failed_merge true

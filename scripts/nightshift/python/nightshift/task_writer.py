@@ -200,6 +200,7 @@ def build_finding_text(
     digest_path: Path,
     findings_dir: Path,
     repo_dir: Path | None = None,
+    existing_open_tasks_context: str = "",
 ) -> str:
     digest_row = _manager_digest_table_row_by_rank(digest_path, rank)
     if digest_row is None:
@@ -227,6 +228,9 @@ def build_finding_text(
             source_block = read_source_context(file_refs, repo_dir=repo_dir)
             if source_block:
                 result = f"{result}\n\n{source_block}"
+
+    if existing_open_tasks_context:
+        result = f"{result}\n\n{existing_open_tasks_context}"
 
     return result
 

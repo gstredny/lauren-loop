@@ -35,9 +35,12 @@ class RunContext:
     cost_cap_hit: bool = False
     branch_created: bool = False
     total_findings_available: int = 0
+    findings_eligible_for_ranking: int = 0
+    suppressed_finding_count: int = 0
     task_file_count: int = 0
     manager_contract_failed: bool = False
     digest_stageable: bool = False
+    run_clean: bool = False
     validated_tasks: list[Path] = field(default_factory=list)
     autofix_results: list[dict[str, object]] = field(default_factory=list)
     bridge_results: list[dict[str, object]] = field(default_factory=list)
@@ -159,6 +162,10 @@ class RunContext:
     @property
     def manager_task_manifest_path(self) -> Path:
         return self.run_tmp_dir / "manager-task-manifest.txt"
+
+    @property
+    def suppression_artifacts_dir(self) -> Path:
+        return self.run_tmp_dir / "suppression"
 
     @property
     def dry_run_digest_path(self) -> Path:

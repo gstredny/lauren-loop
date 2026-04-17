@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from nightshift.task_context import build_existing_open_tasks_context, collect_existing_open_tasks
 from nightshift.task_writer import (
     build_finding_text,
     extract_file_references,
@@ -14,6 +15,12 @@ from nightshift.task_writer import (
     write_task_file,
     write_task_manifest,
 )
+
+
+def _write_open_doc(path: Path, body: str) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(body.rstrip() + "\n", encoding="utf-8")
+    return path
 
 
 def test_parse_findings_manifest(tmp_path: Path) -> None:
@@ -107,6 +114,98 @@ def test_write_task_manifest(tmp_path: Path) -> None:
     assert manifest_path.read_text(encoding="utf-8") == f"{paths[0]}\n{paths[1]}\n"
 
 
+def test_collect_existing_open_tasks_filters_by_shape_and_status(tmp_path: Path) -> None:
+    tasks_dir = tmp_path / "docs" / "tasks" / "open"
+    _write_open_doc(
+        tasks_dir / "alpha.md",
+        "## Task: Alpha\n## Status: not started\n",
+    )
+    _write_open_doc(
+        tasks_dir / "beta" / "task.md",
+        "## Status: blocked\n## Goal\nUse task.md fallback title.\n",
+    )
+    _write_open_doc(
+        tasks_dir / "gamma-roadmap.md",
+        "# Gamma Roadmap\n**Status:** active\n",
+    )
+    _write_open_doc(
+        tasks_dir / "delta.md",
+        "# Delta    Task\n## Status: in progress\n\n## Done Criteria\n- Still a real task.\n",
+    )
+    _write_open_doc(
+        tasks_dir / "00-roadmap.md",
+        "# Zero Roadmap\n\nPlanning notes only.\n",
+    )
+    _write_open_doc(
+        tasks_dir / "notes.md",
+        "## Status: not started\nNo heading here.\n",
+    )
+    _write_open_doc(
+        tasks_dir / "reverted.md",
+        "## Task: Reverted task\n## Status: reverted - replaced elsewhere\n",
+    )
+
+    rows = collect_existing_open_tasks(tasks_dir)
+
+    assert rows == [
+        ("docs/tasks/open/alpha.md", "Alpha", "not started"),
+        ("docs/tasks/open/beta/task.md", "beta", "blocked"),
+        ("docs/tasks/open/delta.md", "Delta Task", "in progress"),
+    ]
+
+
+def test_build_existing_open_tasks_context_is_stable_and_sorted(tmp_path: Path) -> None:
+    tasks_dir = tmp_path / "docs" / "tasks" / "open"
+    _write_open_doc(tasks_dir / "zeta.md", "## Task: Zeta\n## Status: in progress\n")
+    _write_open_doc(tasks_dir / "alpha.md", "## Task: Alpha\n## Status: not started\n")
+
+    context = build_existing_open_tasks_context(tasks_dir)
+
+    assert context == (
+        "## Existing Open Tasks\n\n"
+        "docs/tasks/open/alpha.md: Alpha [not started]\n"
+        "docs/tasks/open/zeta.md: Zeta [in progress]"
+    )
+
+
+def test_build_existing_open_tasks_context_caps_rows_and_truncates_titles(tmp_path: Path) -> None:
+    tasks_dir = tmp_path / "docs" / "tasks" / "open"
+    long_title = (
+        "Alpha   beta   gamma   delta   epsilon   zeta   eta   theta   iota   "
+        "kappa   lambda   mu   nu   xi   omicron   pi   rho   sigma   tau   "
+        "upsilon   phi   chi   psi   omega   alpha2   beta2"
+    )
+    for index in range(1, 53):
+        title = long_title if index == 1 else f"Task {index:02d}"
+        _write_open_doc(
+            tasks_dir / f"task-{index:02d}.md",
+            f"## Task: {title}\n## Status: not started\n",
+        )
+
+    context = build_existing_open_tasks_context(tasks_dir)
+    lines = context.splitlines()
+    task_lines = [line for line in lines if line.startswith("docs/tasks/open/")]
+    first_title = task_lines[0].removeprefix("docs/tasks/open/task-01.md: ").removesuffix(" [not started]")
+
+    assert len(task_lines) == 50
+    assert task_lines[0].startswith("docs/tasks/open/task-01.md: ")
+    assert first_title.endswith("...")
+    assert "  " not in first_title
+    assert len(first_title) == 120
+    assert task_lines[-1] == "docs/tasks/open/task-50.md: Task 50 [not started]"
+    assert "docs/tasks/open/task-51.md" not in context
+    assert "docs/tasks/open/task-52.md" not in context
+    assert lines[-1] == "(... and 2 more)"
+
+
+def test_task_writer_playbook_includes_duplicate_guidance() -> None:
+    playbook_path = Path(__file__).resolve().parents[2] / "playbooks" / "task-writer.md"
+    playbook_text = playbook_path.read_text(encoding="utf-8")
+
+    assert "### Step 1.5: Check for Duplicate Tasks" in playbook_text
+    assert "When uncertain whether two findings share a fix, DO NOT reject as duplicate" in playbook_text
+
+
 def test_build_finding_text_includes_digest_row_and_matched_block(tmp_path: Path) -> None:
     digest_path = tmp_path / "docs" / "nightshift" / "digests" / "2026-04-08.md"
     digest_path.parent.mkdir(parents=True, exist_ok=True)
@@ -140,6 +239,29 @@ def test_build_finding_text_includes_digest_row_and_matched_block(tmp_path: Path
 
     assert "Full table row: | 1 | critical | regression | Auth regression |" in finding_text
     assert "### Finding: Auth regression" in finding_text
+
+
+def test_build_finding_text_appends_existing_open_tasks_context(tmp_path: Path) -> None:
+    digest_path = tmp_path / "digest.md"
+    digest_path.write_text("", encoding="utf-8")
+    findings_dir = tmp_path / "findings"
+    findings_dir.mkdir()
+    existing_open_tasks_context = (
+        "## Existing Open Tasks\n\n"
+        "docs/tasks/open/existing.md: Existing task [not started]"
+    )
+
+    finding_text = build_finding_text(
+        "1",
+        "major",
+        "regression",
+        "Fresh finding",
+        digest_path=digest_path,
+        findings_dir=findings_dir,
+        existing_open_tasks_context=existing_open_tasks_context,
+    )
+
+    assert finding_text.endswith(existing_open_tasks_context)
 
 
 # --- extract_file_references tests ---

@@ -159,6 +159,22 @@ setup_task_writer_fixture() {
         "${NIGHTSHIFT_RENDERED_DIR}"
 }
 
+extract_existing_open_tasks_block_from_prompt() {
+    local prompt_path="$1"
+
+    awk '
+        /^## Existing Open Tasks$/ {
+            capture = 1
+        }
+        capture {
+            if ($0 == "```") {
+                exit
+            }
+            print
+        }
+    ' "${prompt_path}"
+}
+
 # ── Test 1: CREATED writes task, manifest, and CREATED_TASKS only ────────────
 (
     setup_task_writer_fixture "created"
@@ -877,6 +893,206 @@ EOF
 ) && pass "21. main() calls phase_task_writing before phase_validation before phase_autofix" \
   || fail "21. main() calls phase_task_writing before phase_validation before phase_autofix" "phase order regressed"
 
+# ── Test 22: collector uses task-shape allowlist and terminal status filter ──
+(
+    setup_task_writer_fixture "existing-task-collector"
+    ensure_task_context_helpers >/dev/null 2>&1
+
+    cat > "${REPO_ROOT}/docs/tasks/open/alpha.md" <<'EOF'
+## Task: Alpha
+## Status: not started
+EOF
+    mkdir -p "${REPO_ROOT}/docs/tasks/open/beta"
+    cat > "${REPO_ROOT}/docs/tasks/open/beta/task.md" <<'EOF'
+## Status: blocked
+## Goal
+Task.md fallback title.
+EOF
+    cat > "${REPO_ROOT}/docs/tasks/open/gamma-roadmap.md" <<'EOF'
+# Gamma Roadmap
+**Status:** active
+EOF
+    cat > "${REPO_ROOT}/docs/tasks/open/delta.md" <<'EOF'
+# Delta    Task
+## Status: in progress
+
+## Done Criteria
+- Still a real task.
+EOF
+    cat > "${REPO_ROOT}/docs/tasks/open/00-roadmap.md" <<'EOF'
+# Zero Roadmap
+
+Planning notes only.
+EOF
+    cat > "${REPO_ROOT}/docs/tasks/open/notes.md" <<'EOF'
+## Status: not started
+No heading here.
+EOF
+    cat > "${REPO_ROOT}/docs/tasks/open/reverted.md" <<'EOF'
+## Task: Reverted
+## Status: reverted — replaced elsewhere
+EOF
+    mkdir -p "${REPO_ROOT}/docs/tasks/open/logs"
+    cat > "${REPO_ROOT}/docs/tasks/open/logs/output.md" <<'EOF'
+log payload only
+EOF
+
+    context_block="$(task_context_existing_open_tasks_block)"
+
+    ok=true
+    [[ "${context_block}" == *"docs/tasks/open/alpha.md: Alpha [not started]"* ]] || ok=false
+    [[ "${context_block}" == *"docs/tasks/open/beta/task.md: beta [blocked]"* ]] || ok=false
+    [[ "${context_block}" == *"docs/tasks/open/delta.md: Delta Task [in progress]"* ]] || ok=false
+    [[ "${context_block}" != *"docs/tasks/open/gamma-roadmap.md"* ]] || ok=false
+    [[ "${context_block}" != *"docs/tasks/open/00-roadmap.md"* ]] || ok=false
+    [[ "${context_block}" != *"docs/tasks/open/notes.md"* ]] || ok=false
+    [[ "${context_block}" != *"docs/tasks/open/reverted.md"* ]] || ok=false
+    [[ "${context_block}" != *"docs/tasks/open/logs/output.md"* ]] || ok=false
+    [[ "${ok}" == "true" ]]
+) && pass "22. existing-task collection uses task shape allowlisting and excludes terminal statuses" \
+  || fail "22. existing-task collection uses task shape allowlisting and excludes terminal statuses" "task-context collector regressed"
+
+# ── Test 23: existing-task context caps rows and truncates long titles ───────
+(
+    setup_task_writer_fixture "existing-task-cap"
+    ensure_task_context_helpers >/dev/null 2>&1
+
+    long_title="Alpha   beta   gamma   delta   epsilon   zeta   eta   theta   iota   kappa   lambda   mu   nu   xi   omicron   pi   rho   sigma   tau   upsilon   phi   chi   psi   omega   alpha2   beta2"
+    for index in $(seq -w 1 52); do
+        title="Task ${index}"
+        if [[ "${index}" == "01" ]]; then
+            title="${long_title}"
+        fi
+        cat > "${REPO_ROOT}/docs/tasks/open/task-${index}.md" <<EOF
+## Task: ${title}
+## Status: not started
+EOF
+    done
+
+    context_block="$(task_context_existing_open_tasks_block)"
+    task_row_count="$(printf '%s\n' "${context_block}" | awk '/^docs\/tasks\/open\// {count++} END {print count + 0}')"
+    first_task_line="$(printf '%s\n' "${context_block}" | sed -n '3p')"
+    overflow_line="$(printf '%s\n' "${context_block}" | tail -n 1)"
+    displayed_title="${first_task_line#docs/tasks/open/task-01.md: }"
+    displayed_title="${displayed_title% \[not started\]}"
+
+    ok=true
+    [[ "${task_row_count}" == "50" ]] || ok=false
+    [[ "${first_task_line}" == docs/tasks/open/task-01.md:* ]] || ok=false
+    [[ "${displayed_title}" == *... ]] || ok=false
+    [[ "${displayed_title}" != *"  "* ]] || ok=false
+    [[ "${#displayed_title}" == "120" ]] || ok=false
+    [[ "${context_block}" == *"docs/tasks/open/task-50.md: Task 50 [not started]"* ]] || ok=false
+    [[ "${context_block}" != *"docs/tasks/open/task-51.md"* ]] || ok=false
+    [[ "${context_block}" != *"docs/tasks/open/task-52.md"* ]] || ok=false
+    [[ "${overflow_line}" == "(... and 2 more)" ]] || ok=false
+    [[ "${ok}" == "true" ]]
+) && pass "23. existing-task context is capped at 50 rows, keeps path sort order, and truncates long titles" \
+  || fail "23. existing-task context is capped at 50 rows, keeps path sort order, and truncates long titles" "task-context cap regressed"
+
+# ── Test 24: prompt includes existing-task context and Step 1.5 is present ───
+(
+    setup_task_writer_fixture "existing-task-context"
+    cat > "${REPO_ROOT}/docs/tasks/open/existing-auth.md" <<'EOF'
+## Task: Existing auth regression
+## Status: not started
+EOF
+    write_findings_manifest_fixture \
+        $'1\tcritical\tregression\tAuth regression'
+    write_digest_fixture \
+        '| 1 | critical | regression | Auth regression |'
+
+    agent_run_claude() {
+        local output_path="$2"
+        write_task_writer_result_json "${output_path}" "$(task_writer_created_result_text "Auth regression")"
+        return 0
+    }
+
+    phase_task_writing >/dev/null 2>&1
+
+    prompt_path="${NIGHTSHIFT_RENDERED_DIR}/task-writer-rank-1.md"
+    context_block="$(extract_existing_open_tasks_block_from_prompt "${prompt_path}")"
+    ok=true
+    [[ -f "${prompt_path}" ]] || ok=false
+    [[ "${context_block}" == *"docs/tasks/open/existing-auth.md: Existing auth regression [not started]"* ]] || ok=false
+    grep -Fq '### Step 1.5: Check for Duplicate Tasks' "${NIGHTSHIFT_PLAYBOOKS_DIR}/task-writer.md" || ok=false
+    grep -Fq 'When uncertain whether two findings share a fix, DO NOT reject as duplicate' "${NIGHTSHIFT_PLAYBOOKS_DIR}/task-writer.md" || ok=false
+    [[ "${ok}" == "true" ]]
+) && pass "24. task-writer prompts include existing-task context and the playbook carries Step 1.5 guidance" \
+  || fail "24. task-writer prompts include existing-task context and the playbook carries Step 1.5 guidance" "task-writer duplicate guidance regressed"
+
+# ── Test 25: unrelated existing task does not block creation ─────────────────
+(
+    setup_task_writer_fixture "false-positive-guard"
+    cat > "${REPO_ROOT}/docs/tasks/open/unrelated-task.md" <<'EOF'
+## Task: Unrelated analytics cleanup
+## Status: not started
+EOF
+    write_findings_manifest_fixture \
+        $'1\tcritical\tregression\tAuth regression'
+    write_digest_fixture \
+        '| 1 | critical | regression | Auth regression |'
+
+    agent_run_claude() {
+        local output_path="$2"
+        write_task_writer_result_json "${output_path}" "$(task_writer_created_result_text "Auth regression")"
+        return 0
+    }
+
+    phase_task_writing >/dev/null 2>&1
+
+    prompt_path="${NIGHTSHIFT_RENDERED_DIR}/task-writer-rank-1.md"
+    context_block="$(extract_existing_open_tasks_block_from_prompt "${prompt_path}")"
+    expected_path="${REPO_ROOT}/docs/tasks/open/nightshift/${RUN_DATE}-auth-regression.md"
+    ok=true
+    [[ -f "${expected_path}" ]] || ok=false
+    [[ "${context_block}" == *"docs/tasks/open/unrelated-task.md: Unrelated analytics cleanup [not started]"* ]] || ok=false
+    [[ "${ok}" == "true" ]]
+) && pass "25. unrelated existing open tasks stay in context without suppressing new task creation" \
+  || fail "25. unrelated existing open tasks stay in context without suppressing new task creation" "false-positive duplicate guard regressed"
+
+# ── Test 26: every finding snapshot carries the identical existing-task block ─
+(
+    setup_task_writer_fixture "multi-finding-context"
+    cat > "${REPO_ROOT}/docs/tasks/open/existing-task.md" <<'EOF'
+## Task: Existing task
+## Status: not started
+EOF
+    write_findings_manifest_fixture \
+        $'1\tcritical\tregression\tAlpha outage' \
+        $'2\tmajor\terror-handling\tBeta failure'
+    write_digest_fixture \
+        '| 1 | critical | regression | Alpha outage |' \
+        '| 2 | major | error-handling | Beta failure |'
+
+    call_count=0
+    agent_run_claude() {
+        local output_path="$2"
+        call_count=$(( call_count + 1 ))
+        if [[ "${call_count}" -eq 1 ]]; then
+            write_task_writer_result_json "${output_path}" "$(task_writer_created_result_text "Alpha outage")"
+        else
+            write_task_writer_result_json "${output_path}" "$(task_writer_created_result_text "Beta failure")"
+        fi
+        return 0
+    }
+
+    phase_task_writing >/dev/null 2>&1
+
+    prompt_one="${NIGHTSHIFT_RENDERED_DIR}/task-writer-rank-1.md"
+    prompt_two="${NIGHTSHIFT_RENDERED_DIR}/task-writer-rank-2.md"
+    block_one="$(extract_existing_open_tasks_block_from_prompt "${prompt_one}")"
+    block_two="$(extract_existing_open_tasks_block_from_prompt "${prompt_two}")"
+    ok=true
+    [[ -f "${prompt_one}" ]] || ok=false
+    [[ -f "${prompt_two}" ]] || ok=false
+    [[ -n "${block_one}" ]] || ok=false
+    [[ "${block_one}" == "${block_two}" ]] || ok=false
+    [[ "${block_one}" == *"docs/tasks/open/existing-task.md: Existing task [not started]"* ]] || ok=false
+    [[ "${ok}" == "true" ]]
+) && pass "26. every finding snapshot includes the same existing-task block across the full loop" \
+  || fail "26. every finding snapshot includes the same existing-task block across the full loop" "multi-finding context snapshot regressed"
+
 echo ""
-echo "=== Results: $PASS passed, $FAIL failed (21 tests) ==="
+echo "=== Results: $PASS passed, $FAIL failed (26 tests) ==="
 [[ "${FAIL}" -eq 0 ]]

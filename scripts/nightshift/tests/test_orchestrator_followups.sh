@@ -1594,13 +1594,15 @@ EOF
 ) && pass "26. phase_task_writing patches the digest before validation skips on RUN_COST_CAP" \
   || fail "26. phase_task_writing patches the digest before validation skips on RUN_COST_CAP" "cost-cap validation skip left stale digest task counts"
 
-# ── Test 27: clean runs skip backlog before any Lauren Loop call ─────────────
+# ── Test 27: clean runs skip backlog only after meeting the task floor ───────
 (
     setup_manager_merge_fixture "$TMP_DIR/backlog-clean-run" "2026-01-19" "backlog-clean-run"
 
     CURRENT_PHASE="3.7"
     NIGHTSHIFT_BACKLOG_ENABLED="true"
+    NIGHTSHIFT_MIN_TASKS_PER_RUN="3"
     NIGHTSHIFT_BACKLOG_MIN_BUDGET="20"
+    AUTOFIX_ATTEMPTED_COUNT=3
     RUN_CLEAN=1
     RUN_COST_CAP=0
     SETUP_FAILED=0
@@ -1620,13 +1622,14 @@ EOF
     ok=true
     [[ "$phase_rc" -eq 0 ]] || ok=false
     [[ "$bash_calls" -eq 0 ]] || ok=false
+    grep -Fq 'Backlog target: attempted autofix=3, min per run=3, needed=0, effective max=3' "$backlog_log_path" || ok=false
     grep -Fq 'INFO: Night Shift: backlog skipped — clean run, no upstream findings' "$backlog_log_path" || ok=false
     grep -Fq '===== Phase 3.7: Backlog Burndown SKIPPED =====' "$backlog_log_path" || ok=false
     [[ "${#BACKLOG_STAGE_PATHS[@]}" -eq 0 ]] || ok=false
     [[ "${#BACKLOG_RESULTS[@]}" -eq 0 ]] || ok=false
     [[ "$ok" == "true" ]]
-) && pass "27. RUN_CLEAN skips backlog before Lauren Loop ranking can run" \
-  || fail "27. RUN_CLEAN skips backlog before Lauren Loop ranking can run" "clean-run backlog guard regressed"
+) && pass "27. RUN_CLEAN skips backlog after autofix meets the minimum task floor" \
+  || fail "27. RUN_CLEAN skips backlog after autofix meets the minimum task floor" "clean-run backlog guard regressed"
 
 # ── Test 28: smoke mode dispatches only commit-detective ────────────────────
 (
